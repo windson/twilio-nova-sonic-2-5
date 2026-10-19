@@ -23,6 +23,7 @@ def _settings(**overrides) -> Settings:
     base = dict(
         nova_model_id="amazon.nova-2-5-sonic",
         aws_region="us-east-1",
+        app_log_group="/ecs/ar-collections-nova-sonic/app",
         twilio_account_sid="AC_test_sid",
         twilio_auth_token="test_token_value",
         twilio_from_number="+15005550006",

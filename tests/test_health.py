@@ -25,5 +25,8 @@ def test_config_summary_has_no_secret_values():
     body = resp.json()
     assert body["nova_model_id"] == "amazon.nova-2-5-sonic"
     assert body["aws_region"]
+    # The CloudWatch log group name is exposed (non-secret) so the UI can build
+    # a per-call Logs Insights deep link client-side.
+    assert body["app_log_group"] == "/ecs/ar-collections-nova-sonic/app"
     # Only booleans / safe strings are exposed, never raw secrets.
     assert isinstance(body["twilio_configured"], bool)

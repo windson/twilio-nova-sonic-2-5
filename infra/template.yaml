@@ -469,6 +469,11 @@ Resources:
               Value: !Ref DuesTable
             - Name: CALLS_TABLE
               Value: !Ref CallsTable
+            # APP_LOG_GROUP is surfaced to the dashboard UI (via /api/config) so
+            # it can build a per-call CloudWatch Logs Insights deep link filtered
+            # by call_sid. Keep in sync with the awslogs-group below.
+            - Name: APP_LOG_GROUP
+              Value: !Ref AppLogGroup
             # PUBLIC_BASE_URL drives the TwiML wss://<host>/media URL.
             # Precedence: (1) CloudFront domain when Option 1 is enabled (free
             # managed TLS); (2) the ACM-covered TLS hostname when PublicHostname
@@ -522,6 +527,12 @@ Resources:
           TargetGroupArn: !Ref TargetGroup
 
   # --- CloudWatch dashboard --------------------------------------------------
+  # Observability note (POC approach A): the per-call drill-down link rendered
+  # in the dashboard UI is a client-side CloudWatch Logs Insights deep link
+  # filtered by call_sid against AppLogGroup. It needs no new IAM and no
+  # cloudwatch:PutMetricData, so none is added here. The ARCollections/TTFTms
+  # widget below remains an aspirational custom-metric placeholder (nothing
+  # emits it yet); wiring it live would be POC approach B (PutMetricData).
   Dashboard:
     Type: AWS::CloudWatch::Dashboard
     Properties:

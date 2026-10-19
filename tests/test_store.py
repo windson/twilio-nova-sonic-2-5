@@ -13,6 +13,14 @@ def test_seeded_dues_present():
     assert len(dues) >= 2
     ids = {d["account_id"] for d in dues}
     assert "ACC-1001" in ids
+    assert "ACC-1002" in ids
+
+
+def test_seeded_acc_1002_debtor_name():
+    store = InMemoryStore()
+    rec = store.get_due("ACC-1002")
+    assert rec is not None
+    assert rec["debtor_name"] == "Pavan Navule"
 
 
 def test_update_due_changes_status_and_fields_and_persists():

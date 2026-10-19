@@ -303,7 +303,35 @@ Sonic model ARN, DynamoDB RW on just the two tables, and CloudWatch Logs write.
 
 - **CloudWatch Dashboard** (`<stack>-observability`): call volume (ALB request
   count), average TTFT, request latency, and a live log widget. Open the
-  `DashboardUrl` stack output in the console.
+  `DashboardUrl` stack output in the console. The dashboard's
+  `ARCollections/TTFTms` widget is an aspirational custom-metric placeholder:
+  nothing emits that metric yet, so it reads empty. Wiring it live would mean
+  emitting per-call custom metrics via `cloudwatch:PutMetricData` (POC approach
+  B, which would also add that IAM action to the task role).
+
+- **Per-call CloudWatch deep link (POC approach A).** Each row in the dashboard
+  "Past calls" table has a **Logs** link that opens the app log group's
+  CloudWatch Logs "Log events" view pre-filtered to that call's `call_sid`. It
+  is built entirely client-side from `aws_region` + `app_log_group` (both
+  surfaced by `GET /api/config`, with `APP_LOG_GROUP` set on the task), so it
+  needs no extra IAM and no metrics pipeline.
+
+- **Conversation (chat) view.** The call detail panel reconstructs the call as a
+  chat transcript (caller vs Nova Sonic, ordered by start time, in text),
+  showing the time each turn took and, for Sonic turns, TTFT and latency. It is
+  driven by the `conversation_turns` field from `GET /api/calls/{id}` and falls
+  back to the raw `transcripts` for older records. The raw per-event JSON log
+  remains available under the collapsible "In-depth event log" panel.
+
+- **Model invocation logging is intentionally NOT enabled.** Bedrock model
+  invocation logging only captures `Converse`/`ConverseStream`/`InvokeModel`/
+  `InvokeModelWithResponseStream`. Nova Sonic bi-directional streaming uses
+  `InvokeModelWithBidirectionalStream`, which that feature does not cover, so it
+  would not record any turn/TTFT ground truth here (and there is no
+  CloudFormation resource for it — it is an account-level API). Turn semantics
+  are therefore derived from the Strands `BidiTranscriptStreamEvent`
+  user/assistant alternation plus response-start/first-audio timing. See the
+  comment near the turn-counting logic in `app/metrics.py`.
 
 - **CloudTrail.** A multi-region management-event trail writes to the encrypted,
   private S3 bucket created by the stack. Use it (and CloudWatch) to diagnose

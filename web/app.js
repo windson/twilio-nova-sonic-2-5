@@ -13,6 +13,10 @@ const POLL_INTERVAL_MS = 3000;
 const state = {
   selectedCallId: null,
   pollTimer: null,
+  // Populated from GET /api/config so the per-call CloudWatch link uses the
+  // region + log group the running service actually reports.
+  awsRegion: "us-east-1",
+  appLogGroup: "/ecs/ar-collections-nova-sonic/app",
 };
 
 // --- helpers ---------------------------------------------------------------
@@ -40,6 +44,36 @@ function fmtMoney(amount, currency) {
   } catch (e) {
     return `${Number(amount).toFixed(2)} ${cur}`;
   }
+}
+
+// Build a CloudWatch Logs Insights console deep link scoped to a single call.
+//
+// POC approach A (no new IAM, built entirely client-side): we link to the log
+// group's "Log events" search view with a filterPattern on the call_sid. The
+// CloudWatch console uses a custom fragment encoding where object keys/values
+// are joined with ~ and sub-objects are introduced with $25... escapes; the
+// log-group path is double-URL-encoded (each "/" -> %2F -> $252F). The log
+// events search URL is the most reliable shape to construct correctly:
+//
+//   https://<region>.console.aws.amazon.com/cloudwatch/home?region=<region>
+//     #logsV2:log-groups/log-group/<enc log group>/log-events$3FfilterPattern$3D<call_sid>
+//
+// where <enc log group> is encodeURIComponent(logGroup) with each "%" further
+// encoded to "$25" (the console's fragment escape), and "$3F"/"$3D" stand in
+// for "?"/"=" inside the fragment.
+function cloudwatchLogsUrl(callSid) {
+  const region = state.awsRegion || "us-east-1";
+  const logGroup = state.appLogGroup || "/ecs/ar-collections-nova-sonic/app";
+  // Double-encode the log group: URL-encode, then turn "%" into the console's
+  // "$25" fragment escape (so "/" -> "%2F" -> "$252F").
+  const encGroup = encodeURIComponent(logGroup).replace(/%/g, "$25");
+  // filterPattern value: a quoted string so the SID is matched literally.
+  const filter = encodeURIComponent(`"${callSid}"`).replace(/%/g, "$25");
+  const base = `https://${region}.console.aws.amazon.com/cloudwatch/home?region=${region}`;
+  return (
+    `${base}#logsV2:log-groups/log-group/${encGroup}/log-events` +
+    `$3FfilterPattern$3D${filter}`
+  );
 }
 
 function showToast(message, isError) {
@@ -150,7 +184,7 @@ async function loadCalls() {
     const data = await apiGet("/api/calls");
     const calls = data.calls || [];
     if (calls.length === 0) {
-      body.innerHTML = '<tr><td colspan="4" class="empty">No calls yet.</td></tr>';
+      body.innerHTML = '<tr><td colspan="5" class="empty">No calls yet.</td></tr>';
       return;
     }
     body.innerHTML = "";
@@ -162,12 +196,26 @@ async function loadCalls() {
         <td class="mono">${call.call_sid || ""}</td>
         <td>${call.account_id || ""}</td>
         <td>${call.turn_count != null ? call.turn_count : "\u2013"}</td>
-        <td>${fmtMs(call.total_e2e_ms)}</td>`;
+        <td>${fmtMs(call.total_e2e_ms)}</td>
+        <td></td>`;
       tr.addEventListener("click", () => selectCall(call.call_sid, false));
+      // Per-call CloudWatch Logs Insights deep link (observation #3). Clicking
+      // it must not also select the row, so stop propagation.
+      if (call.call_sid) {
+        const link = document.createElement("a");
+        link.href = cloudwatchLogsUrl(call.call_sid);
+        link.target = "_blank";
+        link.rel = "noopener";
+        link.className = "cw-link";
+        link.textContent = "Logs \u2197";
+        link.title = "Open CloudWatch Logs filtered to this call";
+        link.addEventListener("click", (ev) => ev.stopPropagation());
+        tr.lastElementChild.appendChild(link);
+      }
       body.appendChild(tr);
     }
   } catch (e) {
-    body.innerHTML = `<tr><td colspan="4" class="empty">Failed to load calls: ${e.message}</td></tr>`;
+    body.innerHTML = `<tr><td colspan="5" class="empty">Failed to load calls: ${e.message}</td></tr>`;
   }
 }
 
@@ -215,6 +263,7 @@ async function renderDetail() {
   $("m-turns").textContent = record.turn_count != null ? record.turn_count : "\u2013";
   $("m-barge").textContent = record.barge_in_count != null ? record.barge_in_count : "\u2013";
 
+  renderChat(record);
   renderTurns(record.turns || [], record.transcripts || []);
   $("log-pre").textContent = JSON.stringify(record.events_log || [], null, 2);
 
@@ -257,6 +306,83 @@ function transcriptForTurn(turn, turnIndex, turns, transcripts) {
   return texts.join(" ");
 }
 
+// Build an ordered chat model from the full call record. Prefer the
+// conversation_turns list produced by the backend (FEAT-002); fall back to
+// deriving an ordered chat from the raw transcripts for older records that
+// predate that field.
+function chatSegments(record) {
+  const turns = record.conversation_turns;
+  if (Array.isArray(turns) && turns.length) {
+    return turns
+      .slice()
+      .sort((a, b) => (a.start_ms || 0) - (b.start_ms || 0))
+      .map((t) => ({
+        speaker: t.speaker === "assistant" ? "assistant" : "user",
+        text: t.text || "",
+        totalMs: t.total_ms,
+        ttftMs: t.ttft_ms,
+        latencyMs: t.latency_ms,
+      }));
+  }
+  // Fallback: order finals (preferred) by t_ms; if no finals exist for a role,
+  // keep whatever transcripts we have.
+  const transcripts = Array.isArray(record.transcripts) ? record.transcripts : [];
+  const finals = transcripts.filter((t) => t.is_final);
+  const source = finals.length ? finals : transcripts;
+  return source
+    .slice()
+    .sort((a, b) => (a.t_ms || 0) - (b.t_ms || 0))
+    .map((t) => ({
+      speaker: t.role === "assistant" ? "assistant" : "user",
+      text: t.text || "",
+      totalMs: null,
+      ttftMs: null,
+      latencyMs: null,
+    }))
+    .filter((s) => s.text);
+}
+
+function renderChat(record) {
+  const body = $("chat-body");
+  const segments = chatSegments(record);
+  if (!segments.length) {
+    body.innerHTML = '<p class="empty">No conversation recorded.</p>';
+    return;
+  }
+  body.innerHTML = "";
+  for (const seg of segments) {
+    const row = document.createElement("div");
+    row.className = `chat-row chat-${seg.speaker}`;
+
+    const bubble = document.createElement("div");
+    bubble.className = "chat-bubble";
+
+    const who = document.createElement("div");
+    who.className = "chat-who";
+    who.textContent = seg.speaker === "assistant" ? "Nova Sonic" : "Caller";
+
+    const text = document.createElement("div");
+    text.className = "chat-text";
+    text.textContent = seg.text;
+
+    const meta = document.createElement("div");
+    meta.className = "chat-meta";
+    const parts = [];
+    if (seg.totalMs != null) parts.push(`turn ${fmtMs(seg.totalMs)}`);
+    if (seg.speaker === "assistant") {
+      if (seg.ttftMs != null) parts.push(`TTFT ${fmtMs(seg.ttftMs)}`);
+      if (seg.latencyMs != null) parts.push(`latency ${fmtMs(seg.latencyMs)}`);
+    }
+    meta.textContent = parts.join(" \u00b7 ");
+
+    bubble.appendChild(who);
+    bubble.appendChild(text);
+    if (parts.length) bubble.appendChild(meta);
+    row.appendChild(bubble);
+    body.appendChild(row);
+  }
+}
+
 function renderTurns(turns, transcripts) {
   const body = $("turns-body");
   if (!turns.length) {
@@ -282,6 +408,8 @@ function renderTurns(turns, transcripts) {
 async function loadConfig() {
   try {
     const cfg = await apiGet("/api/config");
+    if (cfg.aws_region) state.awsRegion = cfg.aws_region;
+    if (cfg.app_log_group) state.appLogGroup = cfg.app_log_group;
     const parts = [
       `model: ${cfg.nova_model_id}`,
       `region: ${cfg.aws_region}`,

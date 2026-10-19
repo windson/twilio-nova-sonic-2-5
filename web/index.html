@@ -48,10 +48,11 @@
               <th>Account</th>
               <th>Turns</th>
               <th>Total e2e</th>
+              <th>CloudWatch</th>
             </tr>
           </thead>
           <tbody id="calls-body">
-            <tr><td colspan="4" class="empty">No calls yet.</td></tr>
+            <tr><td colspan="5" class="empty">No calls yet.</td></tr>
           </tbody>
         </table>
       </section>
@@ -81,6 +82,16 @@
         is a separate per-frame measurement (mean, not a share of total), so it
         is shown on its own rather than as a half of the end-to-end split.
       </p>
+
+      <h3>Conversation</h3>
+      <p class="muted metrics-note">
+        Chat reconstruction of the call: caller utterances and Nova Sonic
+        (assistant) replies in text, ordered by start time. Each bubble shows
+        the time that turn took; assistant bubbles also show TTFT and latency.
+      </p>
+      <div class="chat" id="chat-body">
+        <p class="empty">No conversation recorded.</p>
+      </div>
 
       <h3>Per-turn timeline</h3>
       <table class="data-table" id="turns-table">

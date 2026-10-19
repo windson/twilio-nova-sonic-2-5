@@ -206,6 +206,79 @@ body {
   line-height: 1.4;
 }
 
+.cw-link {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 0.8rem;
+  white-space: nowrap;
+}
+
+.cw-link:hover {
+  text-decoration: underline;
+}
+
+/* --- chat conversation view --- */
+.chat {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 8px 0 4px;
+}
+
+.chat .empty {
+  text-align: left;
+}
+
+.chat-row {
+  display: flex;
+}
+
+.chat-row.chat-user {
+  justify-content: flex-start;
+}
+
+.chat-row.chat-assistant {
+  justify-content: flex-end;
+}
+
+.chat-bubble {
+  max-width: 72%;
+  background: var(--bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  padding: 8px 12px;
+}
+
+.chat-row.chat-assistant .chat-bubble {
+  background: rgba(70, 192, 141, 0.1);
+  border-color: var(--accent-2);
+}
+
+.chat-row.chat-user .chat-bubble {
+  background: rgba(91, 141, 239, 0.1);
+  border-color: var(--accent);
+}
+
+.chat-who {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--muted);
+  margin-bottom: 2px;
+}
+
+.chat-text {
+  font-size: 0.9rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.chat-meta {
+  margin-top: 4px;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
 .log-viewer {
   margin-top: 20px;
   background: var(--bg);

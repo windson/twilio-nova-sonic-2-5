@@ -97,7 +97,7 @@ def _seed_dues() -> dict[str, dict[str, Any]]:
         },
         {
             "account_id": "ACC-1002",
-            "debtor_name": "Priya Narayan",
+            "debtor_name": "Pavan Navule",
             "amount_due": 1250.00,
             "currency": "USD",
             "due_date": "2024-06-01",
