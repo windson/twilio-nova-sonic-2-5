@@ -1,0 +1,29 @@
+# AWS CodeBuild buildspec for the AR Collections Nova Sonic 2.5 agent image.
+#
+# Why this exists: the sandbox's local container runtime (podman/docker shim)
+# has a broken conmon and cannot run `docker build`, so the image is built
+# remotely by AWS CodeBuild, which provides its own Docker daemon, and pushed
+# to ECR. Driven by scripts/codebuild_image.sh (S3-zip source).
+#
+# Required environment variables (set on the CodeBuild project):
+#   AWS_DEFAULT_REGION - e.g. us-east-1
+#   AWS_ACCOUNT_ID     - the target account id
+#   ECR_REPO           - ECR repository name (ar-collections-nova-sonic)
+#   IMAGE_TAG          - image tag to push (e.g. latest or a git sha)
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - echo "Logging in to Amazon ECR in ${AWS_DEFAULT_REGION}"
+      - REPO_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_REPO}"
+      - aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+  build:
+    commands:
+      - echo "Building image ${REPO_URI}:${IMAGE_TAG}"
+      - docker build -t "${REPO_URI}:${IMAGE_TAG}" .
+  post_build:
+    commands:
+      - echo "Pushing ${REPO_URI}:${IMAGE_TAG}"
+      - docker push "${REPO_URI}:${IMAGE_TAG}"
+      - echo "Pushed ${REPO_URI}:${IMAGE_TAG}"
