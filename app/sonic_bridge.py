@@ -40,6 +40,7 @@ from strands.experimental.bidi.types.events import (
     BidiAudioStreamEvent,
     BidiInterruptionEvent,
     BidiOutputEvent,
+    BidiTextInputEvent,
 )
 
 from app.audio import (
@@ -59,6 +60,17 @@ DEFAULT_VOICE = "tiffany"
 DEFAULT_SYSTEM_PROMPT = (
     "You are a professional, courteous Accounts Receivable collections voice "
     "agent making an outbound call. Speak naturally and concisely."
+)
+
+# Priming turn that makes the agent speak FIRST (AI-initiated conversation).
+# Nova Sonic does not produce speech from a system prompt alone; it needs an
+# initial input turn to trigger the opening response. We send this short
+# instruction as a user turn right after the connection starts so Nova greets
+# the debtor and states the amount due without waiting for the caller to talk.
+DEFAULT_KICKOFF_TEXT = (
+    "The call is now connected to the debtor. Begin immediately: greet them by "
+    "name, identify yourself as an AI assistant from Accounts Receivable, and "
+    "state the exact outstanding amount and due date."
 )
 
 
@@ -159,6 +171,36 @@ class _QueueAudioInput:
         )
 
 
+class _KickoffInput:
+    """Strands ``BidiInput`` that makes the agent open the conversation.
+
+    Nova Sonic only speaks once it receives an input turn; a system prompt by
+    itself produces no audio. This input emits a single priming
+    :class:`BidiTextInputEvent` (role ``user``) on its first call -- right after
+    ``agent.run`` has started the connection -- which triggers Nova's opening
+    turn (the greeting + amount due). After that one event it blocks forever so
+    it never injects any further input into the stream.
+    """
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self._sent = False
+
+    async def start(self, agent: BidiAgent) -> None:  # noqa: D401 - protocol hook
+        return None
+
+    async def stop(self) -> None:  # noqa: D401 - protocol hook
+        return None
+
+    async def __call__(self) -> BidiTextInputEvent:
+        if self._sent:
+            # Priming turn already delivered; never emit again.
+            await asyncio.Future()
+        self._sent = True
+        logger.info("priming AI-first opening turn")
+        return BidiTextInputEvent(text=self._text, role="user")
+
+
 class _TwilioAudioOutput:
     """Strands ``BidiOutput``: transcode Nova audio to u-law and send to Twilio.
 
@@ -229,6 +271,7 @@ class SonicSession:
         settings: Settings | None = None,
         voice: str = DEFAULT_VOICE,
         model: Any | None = None,
+        kickoff_text: str | None = DEFAULT_KICKOFF_TEXT,
     ) -> None:
         self._settings = settings or get_settings()
         self._metrics = metrics
@@ -236,6 +279,9 @@ class SonicSession:
         self._queue: "asyncio.Queue[bytes | None]" = asyncio.Queue()
         self._input = _QueueAudioInput(self._queue)
         self._output = _TwilioAudioOutput(send_media, on_interrupt=on_interrupt, metrics=metrics)
+        # AI-first conversation: a kickoff input primes Nova to speak first.
+        # ``kickoff_text=None`` disables it (e.g. for a caller-initiated flow).
+        self._kickoff = _KickoffInput(kickoff_text) if kickoff_text else None
         self._agent = build_agent(
             model=model,
             tools=tools,
@@ -249,6 +295,11 @@ class SonicSession:
     @property
     def agent(self) -> BidiAgent:
         return self._agent
+
+    @property
+    def kickoff(self) -> "_KickoffInput | None":
+        """The AI-first priming input (``None`` when kickoff is disabled)."""
+        return self._kickoff
 
     async def feed_twilio_audio(self, b64_ulaw_payload: str) -> None:
         """Transcode one Twilio ``media`` payload and enqueue it for Nova."""
@@ -266,7 +317,12 @@ class SonicSession:
             except Exception:  # pragma: no cover
                 logger.exception("metrics on_session_start raised; ignoring")
         try:
-            await self._agent.run(inputs=[self._input], outputs=[self._output])
+            inputs: list[Any] = [self._input]
+            if self._kickoff is not None:
+                # Kickoff first so the opening turn is sent as soon as the
+                # connection is up, before any caller audio arrives.
+                inputs.insert(0, self._kickoff)
+            await self._agent.run(inputs=inputs, outputs=[self._output])
         finally:
             if self._metrics is not None:
                 try:

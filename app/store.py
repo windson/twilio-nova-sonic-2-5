@@ -298,15 +298,43 @@ class DynamoDbStore:
         return rec
 
     def update_due(self, account_id: str, **changes: Any) -> dict[str, Any]:
-        current = self.get_due(account_id)
-        if current is None:
-            raise KeyError(f"unknown account_id: {account_id}")
-        for key, value in changes.items():
-            if value is not None:
-                current[key] = value
-        current["last_updated"] = _utcnow_iso()
-        self._dues_table().put_item(Item=_to_dynamo(current))
-        return current
+        """Atomically update a due record with a conditional UpdateExpression.
+
+        Uses a single ``update_item`` call with ``attribute_exists(account_id)``
+        as the condition, so the record must already exist and concurrent
+        updates to different attributes do not clobber each other (unlike a
+        read-then-full-put). Raises ``KeyError`` when the account is unknown.
+        """
+        applied = {k: v for k, v in changes.items() if v is not None}
+        applied["last_updated"] = _utcnow_iso()
+
+        # Build a SET expression with placeholders so reserved words / dotted
+        # names are always safe.
+        set_parts: list[str] = []
+        expr_names: dict[str, str] = {"#pk": "account_id"}
+        expr_values: dict[str, Any] = {}
+        for i, (key, value) in enumerate(applied.items()):
+            name_ph = f"#n{i}"
+            value_ph = f":v{i}"
+            set_parts.append(f"{name_ph} = {value_ph}")
+            expr_names[name_ph] = key
+            expr_values[value_ph] = _to_dynamo(value)
+        update_expr = "SET " + ", ".join(set_parts)
+
+        try:
+            resp = self._dues_table().update_item(
+                Key={"account_id": account_id},
+                UpdateExpression=update_expr,
+                ConditionExpression="attribute_exists(#pk)",
+                ExpressionAttributeNames=expr_names,
+                ExpressionAttributeValues=expr_values,
+                ReturnValues="ALL_NEW",
+            )
+        except Exception as exc:  # noqa: BLE001 - map the conditional failure
+            if type(exc).__name__ == "ConditionalCheckFailedException":
+                raise KeyError(f"unknown account_id: {account_id}") from exc
+            raise
+        return _from_dynamo(resp.get("Attributes", {}))
 
     def list_dues(self) -> list[dict[str, Any]]:
         resp = self._dues_table().scan()

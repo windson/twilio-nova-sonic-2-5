@@ -179,11 +179,38 @@ Sonic model ARN, DynamoDB RW on just the two tables, and CloudWatch Logs write.
    scripts/deploy.sh deploy
    ```
 
-5. **`PUBLIC_BASE_URL` is set automatically to the ALB DNS name.** The template
-   injects `PUBLIC_BASE_URL=<ALB DNSName>` into the container environment (via
-   `Fn::GetAtt LoadBalancer.DNSName`) and also exports it as the `PublicBaseUrl`
-   stack output, so TwiML emits `wss://<alb-dns>/media`. `DUES_TABLE` and
-   `CALLS_TABLE` are injected too, which flips the app to the DynamoDB store.
+5. **Enable TLS for live calls (required by Twilio).** Twilio Media Streams
+   only connect over `wss://` (TLS); a plaintext `ws://` endpoint is refused.
+   The raw ALB DNS name has **no certificate**, so you must terminate TLS on the
+   ALB with an ACM certificate on a real hostname:
+
+   - Request/import an ACM certificate (in the stack's region, `us-east-1`) for
+     a hostname you control, e.g. `collections.example.com`.
+   - Create a DNS record (CNAME, or an alias/A-ALIAS) pointing that hostname at
+     the ALB. The raw ALB DNS is exported as the `AlbDnsName` stack output.
+   - Pass both parameters so the template adds an **HTTPS:443 listener** and
+     points `PUBLIC_BASE_URL` at the TLS hostname:
+
+     ```bash
+     export CERTIFICATE_ARN=arn:aws:acm:us-east-1:920487201358:certificate/XXXX
+     export PUBLIC_HOSTNAME=collections.example.com
+     scripts/deploy.sh deploy   # pass CertificateArn / PublicHostname params
+     ```
+
+   With `CertificateArn` set the stack creates an HTTPS:443 listener
+   (`ELBSecurityPolicy-TLS13-1-2-2021-06`) forwarding to the app, and with
+   `PublicHostname` set `PUBLIC_BASE_URL` becomes that hostname so TwiML emits
+   `wss://<hostname>/media`. The `HttpsEnabled` stack output reports whether TLS
+   was provisioned.
+
+   > **Do not use the raw ALB DNS as `PUBLIC_BASE_URL` for a live call.** It has
+   > no TLS certificate, so `wss://<alb-dns>/media` will fail the Twilio
+   > handshake. Omitting `CertificateArn`/`PublicHostname` yields an HTTP:80-only
+   > ALB that is fine for `/healthz` and internal testing but cannot accept the
+   > Twilio WebSocket.
+
+   `DUES_TABLE` and `CALLS_TABLE` are injected automatically either way, which
+   flips the app to the DynamoDB store.
 
 > If you prefer AWS CDK, you can author an equivalent stack; this project ships
 > a CloudFormation template because it validates cleanly with `cfn-lint`

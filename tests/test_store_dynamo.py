@@ -15,6 +15,10 @@ import app.store as store_mod
 from app.store import DynamoDbStore, InMemoryStore, Store
 
 
+class ConditionalCheckFailedException(Exception):
+    """Mimics botocore's ConditionalCheckFailedException by class name."""
+
+
 class _FakeTable:
     """Minimal in-memory stand-in for a boto3 DynamoDB Table resource."""
 
@@ -31,6 +35,41 @@ class _FakeTable:
         key = Key[self._key_name]
         item = self.items.get(key)
         return {"Item": dict(item)} if item is not None else {}
+
+    def update_item(
+        self,
+        Key,  # noqa: N803 - match boto3 kwarg name
+        UpdateExpression,  # noqa: N803
+        ConditionExpression=None,  # noqa: N803
+        ExpressionAttributeNames=None,  # noqa: N803
+        ExpressionAttributeValues=None,  # noqa: N803
+        ReturnValues=None,  # noqa: N803
+    ):
+        """Apply a SET UpdateExpression with an attribute_exists condition.
+
+        Supports exactly the shape :meth:`DynamoDbStore.update_due` emits:
+        ``SET #n0 = :v0, #n1 = :v1`` with an ``attribute_exists(#pk)``
+        condition. Raises a ConditionalCheckFailedException-named error when the
+        item is absent, matching real DynamoDB behavior.
+        """
+        key = Key[self._key_name]
+        names = ExpressionAttributeNames or {}
+        values = ExpressionAttributeValues or {}
+
+        if ConditionExpression and "attribute_exists" in ConditionExpression:
+            if key not in self.items:
+                raise ConditionalCheckFailedException("item does not exist")
+
+        item = self.items.get(key, {self._key_name: key})
+        assignments = UpdateExpression[len("SET ") :].split(",")
+        for assignment in assignments:
+            name_ph, value_ph = (part.strip() for part in assignment.split("="))
+            attr = names[name_ph]
+            item[attr] = values[value_ph]
+        self.items[key] = item
+        if ReturnValues == "ALL_NEW":
+            return {"Attributes": dict(item)}
+        return {}
 
     def scan(self):
         return {"Items": [dict(v) for v in self.items.values()]}

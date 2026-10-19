@@ -21,7 +21,7 @@ from pydantic import BaseModel
 from app.collections_agent import build_tools, get_system_prompt
 from app.config import get_settings
 from app.metrics import CallMetrics, configure_json_logging
-from app.sonic_bridge import SonicSession
+from app.sonic_bridge import DEFAULT_KICKOFF_TEXT, SonicSession
 from app.store import get_default_store
 from app.twilio_client import place_outbound_call
 
@@ -261,6 +261,10 @@ async def media_stream(websocket: WebSocket) -> None:
                     tools=tools,
                     system_prompt=system_prompt,
                     metrics=metrics,
+                    # AI-first: prime Nova to open the conversation (greet the
+                    # debtor and state the amount due) without waiting for the
+                    # caller to speak. Uses the default kickoff instruction.
+                    kickoff_text=DEFAULT_KICKOFF_TEXT,
                 )
                 session.start()
 

@@ -66,12 +66,21 @@
 
       <div class="metrics-grid" id="metrics-grid">
         <div class="metric"><span class="metric-label">Total end-to-end</span><span class="metric-value" id="m-total">&ndash;</span></div>
-        <div class="metric"><span class="metric-label">Twilio latency (transport)</span><span class="metric-value" id="m-twilio">&ndash;</span></div>
         <div class="metric"><span class="metric-label">Nova Sonic total time</span><span class="metric-value" id="m-nova">&ndash;</span></div>
+        <div class="metric"><span class="metric-label">Non-Nova time (= total &minus; Nova)</span><span class="metric-value" id="m-nonnova">&ndash;</span></div>
+        <div class="metric"><span class="metric-label">Twilio mean transport delay</span><span class="metric-value" id="m-twilio">&ndash;</span></div>
         <div class="metric"><span class="metric-label">TTFT</span><span class="metric-value" id="m-ttft">&ndash;</span></div>
         <div class="metric"><span class="metric-label">Turn count</span><span class="metric-value" id="m-turns">&ndash;</span></div>
         <div class="metric"><span class="metric-label">Barge-ins</span><span class="metric-value" id="m-barge">&ndash;</span></div>
       </div>
+      <p class="muted metrics-note">
+        End-to-end time partitions into <strong>Nova Sonic total time</strong>
+        (sum of active response windows) and its true complement
+        <strong>non-Nova time</strong> (everything else: caller speech,
+        silence, and transport). <strong>Twilio mean transport delay</strong>
+        is a separate per-frame measurement (mean, not a share of total), so it
+        is shown on its own rather than as a half of the end-to-end split.
+      </p>
 
       <h3>Per-turn timeline</h3>
       <table class="data-table" id="turns-table">

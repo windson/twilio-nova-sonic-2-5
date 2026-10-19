@@ -292,8 +292,16 @@ class CallMetrics:
         )
 
     def _on_audio(self, event: BidiAudioStreamEvent, now: float) -> None:
-        # First audio for the most-recently-started still-open turn => TTFT.
-        for turn in self._open_turns.values():
+        # Attribute first audio to the most-recently-started still-open turn.
+        #
+        # The installed BidiAudioStreamEvent carries no response_id (only
+        # ``audio``/``format``/``sample_rate``/``channels``), so audio cannot be
+        # matched to its turn by id. Under normal sequencing only one turn is
+        # open at a time. Under a barge-in that opens turn N+1 while turn N is
+        # still finishing, the freshest audio belongs to the newest turn, so we
+        # scan open turns newest-first (``reversed`` over the insertion-ordered
+        # dict) and assign TTFT to the newest turn that has not yet seen audio.
+        for turn in reversed(list(self._open_turns.values())):
             if turn["first_audio"] is None:
                 turn["first_audio"] = now
                 ttft_ms = round((now - turn["start"]) * 1000.0, 3)

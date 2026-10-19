@@ -19,6 +19,7 @@ from strands.experimental.bidi.types.events import (
     BidiAudioInputEvent,
     BidiAudioStreamEvent,
     BidiInterruptionEvent,
+    BidiTextInputEvent,
 )
 
 
@@ -196,3 +197,97 @@ async def test_session_feeds_audio_and_runs_with_stub_agent(monkeypatch):
 
     await session.close()
     assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_kickoff_input_emits_priming_turn_then_blocks():
+    """The AI-first kickoff input returns one text turn, then blocks forever."""
+    kickoff = sonic_bridge._KickoffInput("say hello first")
+
+    event = await kickoff()
+    assert isinstance(event, BidiTextInputEvent)
+    assert event.text == "say hello first"
+    assert event.role == "user"
+
+    # Second call must not emit again (it blocks until cancelled).
+    second = asyncio.ensure_future(kickoff())
+    await asyncio.sleep(0.02)
+    assert not second.done(), "kickoff should only emit the priming turn once"
+    second.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await second
+
+
+@pytest.mark.asyncio
+async def test_session_sends_ai_first_opening_turn_without_caller_audio(monkeypatch):
+    """SonicSession primes Nova to speak first: the agent receives a text turn
+    (the opening instruction) with NO caller audio fed in, proving the AI
+    initiates the conversation. Uses a fake agent so no Bedrock call happens.
+    """
+    sent_inputs: list = []
+
+    class StubAgent:
+        def __init__(self, *a, **k):
+            pass
+
+        async def run(self, inputs, outputs, invocation_state=None):
+            for inp in inputs:
+                await inp.start(self)
+            for out in outputs:
+                await out.start(self)
+            # Drive each input once (mirrors agent.run's run_inputs loop) and
+            # record what the agent would be sent.
+            async def pump(inp):
+                while True:
+                    sent_inputs.append(await inp())
+
+            tasks = [asyncio.ensure_future(pump(inp)) for inp in inputs]
+            await asyncio.sleep(0.03)
+            for t in tasks:
+                t.cancel()
+            await asyncio.Future()
+
+    monkeypatch.setattr(sonic_bridge, "build_agent", lambda **kwargs: StubAgent())
+
+    async def send_media(payload: str) -> None:  # pragma: no cover - not used here
+        pass
+
+    session = sonic_bridge.SonicSession(
+        send_media=send_media,
+        settings=_settings(),
+        kickoff_text="greet the debtor and state the amount due",
+    )
+    assert session.kickoff is not None
+
+    task = session.start()
+    await asyncio.sleep(0.05)
+
+    # The opening text turn was sent even though no caller audio was ever fed.
+    text_turns = [e for e in sent_inputs if isinstance(e, BidiTextInputEvent)]
+    assert len(text_turns) == 1
+    assert text_turns[0].text == "greet the debtor and state the amount due"
+    assert text_turns[0].role == "user"
+    # And no audio input was produced (debtor never spoke).
+    assert not any(isinstance(e, BidiAudioInputEvent) for e in sent_inputs)
+
+    await session.close()
+    assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_session_kickoff_disabled_when_text_none(monkeypatch):
+    """kickoff_text=None disables the AI-first priming input."""
+
+    class StubAgent:
+        def __init__(self, *a, **k):
+            pass
+
+    monkeypatch.setattr(sonic_bridge, "build_agent", lambda **kwargs: StubAgent())
+
+    async def send_media(payload: str) -> None:  # pragma: no cover
+        pass
+
+    session = sonic_bridge.SonicSession(
+        send_media=send_media, settings=_settings(), kickoff_text=None
+    )
+    assert session.kickoff is None

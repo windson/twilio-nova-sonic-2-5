@@ -45,6 +45,30 @@ Parameters:
     Type: Number
     Default: 30
     Description: CloudWatch log retention (days) for the app log group.
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: >-
+      ACM certificate ARN for the HTTPS:443 listener. REQUIRED for live Twilio
+      Media Streams, which only connect over wss:// (TLS). Leave empty to
+      provision an HTTP:80-only ALB (health checks / internal testing only -
+      Twilio will refuse a plaintext ws:// endpoint).
+  PublicHostname:
+    Type: String
+    Default: ""
+    Description: >-
+      Public DNS hostname that resolves (via a CNAME/alias) to the ALB and that
+      the ACM certificate in CertificateArn is issued for, e.g.
+      collections.example.com. When set, PUBLIC_BASE_URL is this hostname so
+      TwiML emits wss://<hostname>/media. Must be used together with
+      CertificateArn for a live call.
+
+Conditions:
+  # HTTPS/WSS is enabled only when an ACM certificate ARN is supplied, so the
+  # template still validates and deploys (HTTP:80 only) without a real cert.
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, ""]]
+  # Prefer the real TLS hostname for PUBLIC_BASE_URL when provided.
+  HasPublicHostname: !Not [!Equals [!Ref PublicHostname, ""]]
 
 Resources:
   # --- DynamoDB persistence --------------------------------------------------
@@ -185,7 +209,12 @@ Resources:
           FromPort: 80
           ToPort: 80
           CidrIp: 0.0.0.0/0
-          Description: HTTP (also carries the WebSocket upgrade for wss).
+          Description: HTTP (health checks; also redirected to HTTPS when TLS is on).
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS/WSS - Twilio Media Streams WebSocket (wss://).
       SecurityGroupEgress:
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
@@ -249,12 +278,33 @@ Resources:
         - Key: stickiness.type
           Value: lb_cookie
 
+  # HTTP:80 listener. Always present (ALB health checks + a reachable endpoint
+  # when no cert is configured). It forwards to the app so plaintext testing
+  # works; for a live Twilio call the HTTPS:443 listener below carries the wss
+  # WebSocket.
   Listener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
       LoadBalancerArn: !Ref LoadBalancer
       Port: 80
       Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # HTTPS:443 listener with an ACM certificate - required for Twilio Media
+  # Streams (wss://). Only created when CertificateArn is supplied so the
+  # template still validates/deploys without a real certificate.
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
       DefaultActions:
         - Type: forward
           TargetGroupArn: !Ref TargetGroup
@@ -292,9 +342,15 @@ Resources:
               Value: !Ref DuesTable
             - Name: CALLS_TABLE
               Value: !Ref CallsTable
-            # PUBLIC_BASE_URL is the ALB DNS so TwiML emits wss://<alb>/media.
+            # PUBLIC_BASE_URL drives the TwiML wss://<host>/media URL. For a
+            # live call this MUST be the TLS hostname the ACM cert covers (not
+            # the raw ALB DNS, which has no certificate). Falls back to the ALB
+            # DNS for HTTP-only/internal testing when no hostname is set.
             - Name: PUBLIC_BASE_URL
-              Value: !GetAtt LoadBalancer.DNSName
+              Value: !If
+                - HasPublicHostname
+                - !Ref PublicHostname
+                - !GetAtt LoadBalancer.DNSName
           # Twilio credentials are injected from Secrets Manager/SSM by ARN;
           # no secret value appears in this template.
           Secrets:
@@ -438,9 +494,21 @@ Resources:
 Outputs:
   PublicBaseUrl:
     Description: >-
-      ALB DNS name. Set PUBLIC_BASE_URL to this so TwiML emits
-      wss://<this>/media for Twilio Media Streams.
+      Host used for PUBLIC_BASE_URL (TwiML emits wss://<this>/media). The TLS
+      hostname when PublicHostname is set, otherwise the raw ALB DNS. A live
+      Twilio call REQUIRES the TLS hostname (CertificateArn + PublicHostname);
+      the raw ALB DNS has no certificate and Twilio will refuse wss:// to it.
+    Value: !If
+      - HasPublicHostname
+      - !Ref PublicHostname
+      - !GetAtt LoadBalancer.DNSName
+  AlbDnsName:
+    Description: >-
+      Raw ALB DNS name. Point your PublicHostname CNAME/alias record at this.
     Value: !GetAtt LoadBalancer.DNSName
+  HttpsEnabled:
+    Description: Whether the HTTPS:443 (wss) listener was provisioned.
+    Value: !If [HasCertificate, "true", "false"]
   DashboardUrl:
     Description: CloudWatch dashboard console URL.
     Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${Dashboard}"

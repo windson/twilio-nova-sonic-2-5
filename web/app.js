@@ -208,8 +208,9 @@ async function renderDetail() {
   }
 
   $("m-total").textContent = fmtMs(record.total_e2e_ms);
-  $("m-twilio").textContent = fmtMs(record.twilio_latency_ms);
   $("m-nova").textContent = fmtMs(record.nova_total_ms);
+  $("m-nonnova").textContent = fmtMs(record.non_nova_ms);
+  $("m-twilio").textContent = fmtMs(record.twilio_latency_ms);
   $("m-ttft").textContent = fmtMs(record.ttft_ms);
   $("m-turns").textContent = record.turn_count != null ? record.turn_count : "\u2013";
   $("m-barge").textContent = record.barge_in_count != null ? record.barge_in_count : "\u2013";
@@ -224,13 +225,36 @@ async function renderDetail() {
   }
 }
 
-function transcriptForTurn(turnIndex, transcripts) {
-  // Best-effort: show the assistant transcript lines roughly aligned to a turn.
-  const assistant = transcripts.filter((t) => t.role === "assistant" && t.is_final);
-  if (assistant.length > turnIndex) return assistant[turnIndex].text || "";
-  const anyFinal = transcripts.filter((t) => t.is_final);
-  if (anyFinal.length > turnIndex) return anyFinal[turnIndex].text || "";
-  return "";
+function transcriptForTurn(turn, turnIndex, turns, transcripts) {
+  // Align final assistant transcripts to a turn by timestamp rather than by
+  // position. Each turn has a start time (start_ms); the turn's window runs
+  // from its start to the next turn's start (or the end of the call). We join
+  // every final assistant transcript whose t_ms falls inside that window, so
+  // barge-ins and tool-only turns no longer shift transcripts off by one.
+  const start = turn.start_ms;
+  if (start === null || start === undefined) {
+    // Fall back to positional alignment when timing is unavailable.
+    const assistant = transcripts.filter((t) => t.role === "assistant" && t.is_final);
+    return assistant.length > turnIndex ? assistant[turnIndex].text || "" : "";
+  }
+  const next = turns[turnIndex + 1];
+  const end =
+    next && next.start_ms !== null && next.start_ms !== undefined
+      ? next.start_ms
+      : Infinity;
+  const texts = transcripts
+    .filter(
+      (t) =>
+        t.role === "assistant" &&
+        t.is_final &&
+        t.t_ms !== null &&
+        t.t_ms !== undefined &&
+        t.t_ms >= start &&
+        t.t_ms < end
+    )
+    .map((t) => t.text || "")
+    .filter(Boolean);
+  return texts.join(" ");
 }
 
 function renderTurns(turns, transcripts) {
@@ -242,7 +266,7 @@ function renderTurns(turns, transcripts) {
   body.innerHTML = "";
   turns.forEach((turn, i) => {
     const tr = document.createElement("tr");
-    const text = transcriptForTurn(i, transcripts);
+    const text = transcriptForTurn(turn, i, turns, transcripts);
     tr.innerHTML = `
       <td>${turn.index != null ? turn.index + 1 : i + 1}</td>
       <td>${fmtMs(turn.duration_ms)}</td>

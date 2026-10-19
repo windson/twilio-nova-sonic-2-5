@@ -201,6 +201,11 @@ body {
   font-weight: 400;
 }
 
+.metrics-note {
+  margin: 10px 2px 0;
+  line-height: 1.4;
+}
+
 .log-viewer {
   margin-top: 20px;
   background: var(--bg);

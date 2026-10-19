@@ -193,6 +193,39 @@ def test_metrics_emits_json_log_lines_for_lifecycle(caplog):
     assert "call_end_summary" in logged_types
 
 
+def test_ttft_attributed_to_newest_open_turn_under_overlap():
+    """When a barge-in opens turn 2 while turn 1 is still open, the next audio
+    first-token is attributed to the newest (turn 2) turn, not the stale one.
+    """
+    clock = FakeClock()
+    m = CallMetrics(clock=clock)
+    clock.set(0.0)
+    m.on_session_start()
+
+    # Turn 1 starts and (in this overlap scenario) never gets its own audio
+    # before turn 2 opens.
+    clock.set(1.0)
+    m.record_event(BidiResponseStartEvent(response_id="r1"))
+    # Barge-in opens turn 2 at t=1.2 while r1 is still open.
+    clock.set(1.2)
+    m.record_event(BidiResponseStartEvent(response_id="r2"))
+    # First audio at t=1.5 -> should be TTFT for r2 (newest open turn) = 300ms,
+    # NOT r1 (which would wrongly read 500ms).
+    clock.set(1.5)
+    m.record_event(_audio_event())
+
+    clock.set(2.0)
+    m.record_event(BidiResponseCompleteEvent(response_id="r2", stop_reason="complete"))
+    clock.set(2.1)
+    m.record_event(BidiResponseCompleteEvent(response_id="r1", stop_reason="interrupted"))
+    clock.set(3.0)
+    m.on_session_end()
+
+    by_id = {t["response_id"]: t for t in m.turns}
+    assert by_id["r2"]["ttft_ms"] == 300.0
+    assert by_id["r1"]["ttft_ms"] is None
+
+
 def test_unmatched_response_complete_without_start_is_safe():
     clock = FakeClock()
     m = CallMetrics(clock=clock)

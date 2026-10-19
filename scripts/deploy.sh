@@ -78,6 +78,25 @@ cmd_deploy() {
 
   local uri
   uri="$(image_uri)"
+
+  # Optional TLS overrides. For a LIVE Twilio call both are required: Twilio
+  # Media Streams only connect over wss:// (TLS), and the raw ALB DNS has no
+  # certificate. Set CERTIFICATE_ARN (ACM) and PUBLIC_HOSTNAME (a DNS name that
+  # points at the ALB and that the cert covers) to add an HTTPS:443 listener
+  # and make PUBLIC_BASE_URL the TLS hostname.
+  local tls_overrides=()
+  if [[ -n "${CERTIFICATE_ARN:-}" ]]; then
+    tls_overrides+=("CertificateArn=${CERTIFICATE_ARN}")
+  fi
+  if [[ -n "${PUBLIC_HOSTNAME:-}" ]]; then
+    tls_overrides+=("PublicHostname=${PUBLIC_HOSTNAME}")
+  fi
+  if [[ ${#tls_overrides[@]} -eq 0 ]]; then
+    echo "==> WARNING: no CERTIFICATE_ARN/PUBLIC_HOSTNAME set - deploying an" \
+         "HTTP:80-only ALB. Twilio (wss://) will NOT connect to this; set both" \
+         "for a live call." >&2
+  fi
+
   echo "==> Deploying stack ${STACK_NAME} with image ${uri}"
   aws cloudformation deploy \
     --region "${AWS_REGION}" \
@@ -91,9 +110,10 @@ cmd_deploy() {
       TwilioAccountSidArn="${TWILIO_ACCOUNT_SID_ARN}" \
       TwilioAuthTokenArn="${TWILIO_AUTH_TOKEN_ARN}" \
       TwilioFromNumberArn="${TWILIO_FROM_NUMBER_ARN}" \
-      TwilioVerifiedCallerIdArn="${TWILIO_VERIFIED_CALLER_ID_ARN}"
+      TwilioVerifiedCallerIdArn="${TWILIO_VERIFIED_CALLER_ID_ARN}" \
+      "${tls_overrides[@]}"
 
-  echo "==> Stack outputs (PUBLIC_BASE_URL is the ALB DNS)"
+  echo "==> Stack outputs (PUBLIC_BASE_URL is the TLS hostname when set, else ALB DNS)"
   aws cloudformation describe-stacks \
     --region "${AWS_REGION}" \
     --stack-name "${STACK_NAME}" \
