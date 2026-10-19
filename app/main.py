@@ -15,10 +15,16 @@ from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
+from app.collections_agent import build_tools, get_system_prompt
 from app.config import get_settings
+from app.metrics import CallMetrics, configure_json_logging
 from app.sonic_bridge import SonicSession
+from app.store import get_default_store
 
 logger = logging.getLogger(__name__)
+
+# Emit CloudWatch-friendly JSON-line logs for call lifecycle/metrics events.
+configure_json_logging()
 
 app = FastAPI(
     title="AR Collections Nova Sonic 2.5 Agent",
@@ -91,6 +97,8 @@ async def media_stream(websocket: WebSocket) -> None:
 
     stream_sid: str | None = None
     session: SonicSession | None = None
+    metrics: CallMetrics | None = None
+    store = get_default_store()
 
     async def send_media(payload: str) -> None:
         if stream_sid is None:
@@ -125,17 +133,29 @@ async def media_stream(websocket: WebSocket) -> None:
                     call_sid,
                     account_id,
                 )
-                # FEAT-003 will inject tools + the collections system prompt and a
-                # metrics sink here; defaults are used for FEAT-002.
+                # Inject the collections brain: system prompt built from the due
+                # record, the update-due tool bound to the store, and a per-call
+                # metrics collector tagged to this call/account.
+                due_record = store.get_due(account_id) if account_id else None
+                system_prompt = get_system_prompt(due_record) if due_record else None
+                tools = build_tools(store)
+                metrics = CallMetrics(call_sid=call_sid, account_id=account_id)
+
                 session = SonicSession(
                     send_media=send_media,
                     on_interrupt=clear_playback,
+                    tools=tools,
+                    system_prompt=system_prompt,
+                    metrics=metrics,
                 )
                 session.start()
 
             elif event == "media":
                 if session is not None:
-                    payload = message.get("media", {}).get("payload")
+                    media = message.get("media", {}) or {}
+                    payload = media.get("payload")
+                    if metrics is not None:
+                        metrics.record_inbound_media(media.get("timestamp"))
                     if payload:
                         await session.feed_twilio_audio(payload)
 
@@ -153,3 +173,9 @@ async def media_stream(websocket: WebSocket) -> None:
     finally:
         if session is not None:
             await session.close()
+        # Persist post-call analytics so the UI/API (FEAT-004) can read history.
+        if metrics is not None:
+            try:
+                store.save_call_analytics(metrics.to_call_analytics())
+            except Exception:  # noqa: BLE001 - persistence must not crash teardown
+                logger.exception("stream_sid=<%s> | failed to persist analytics", stream_sid)
