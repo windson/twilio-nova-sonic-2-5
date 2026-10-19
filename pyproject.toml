@@ -1,0 +1,36 @@
+[project]
+name = "ar-collections-nova-sonic"
+version = "0.1.0"
+description = "AI-first-initiated outbound Accounts Receivable Collections voice agent bridging Twilio Media Streams to Amazon Bedrock Nova Sonic 2.5 via Strands bi-di agents."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "strands-agents[bidi]",
+    # strands-agents 1.53.0 bidi (strands.experimental.bidi.models.nova_sonic)
+    # imports BedrockRuntimeClient and config.Config from aws-sdk-bedrock-runtime.
+    # Those symbols were renamed/removed in 0.10.0+, so pin below 0.10.0.
+    "aws-sdk-bedrock-runtime>=0.4.0,<0.10.0",
+    "boto3",
+    "fastapi",
+    "uvicorn[standard]",
+    "twilio",
+    "pydantic>=2",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "httpx",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
