@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AR Collections Nova Sonic 2.5 Agent</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div id="app">
+    <header class="app-header">
+      <h1>AR Collections &middot; Nova Sonic 2.5</h1>
+      <p class="subtitle">
+        AI-first-initiated outbound collections calling.
+        Twilio is telephony transport only; Amazon Bedrock Nova Sonic 2.5 does
+        speech understanding, reasoning, and speech generation in the female
+        voice <strong>tiffany</strong>.
+      </p>
+      <div id="toast" class="toast" hidden></div>
+    </header>
+
+    <main class="layout">
+      <section class="panel" id="dues-panel">
+        <h2>Due records</h2>
+        <table class="data-table" id="dues-table">
+          <thead>
+            <tr>
+              <th>Account</th>
+              <th>Debtor</th>
+              <th>Amount due</th>
+              <th>Due date</th>
+              <th>Status</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="dues-body">
+            <tr><td colspan="6" class="empty">Loading&hellip;</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel" id="calls-panel">
+        <h2>Past calls</h2>
+        <table class="data-table" id="calls-table">
+          <thead>
+            <tr>
+              <th>Call SID</th>
+              <th>Account</th>
+              <th>Turns</th>
+              <th>Total e2e</th>
+            </tr>
+          </thead>
+          <tbody id="calls-body">
+            <tr><td colspan="4" class="empty">No calls yet.</td></tr>
+          </tbody>
+        </table>
+      </section>
+    </main>
+
+    <section class="panel" id="detail-panel" hidden>
+      <h2>
+        Call analytics
+        <span id="detail-call-id" class="muted"></span>
+        <span id="live-badge" class="badge" hidden>live</span>
+      </h2>
+
+      <div class="metrics-grid" id="metrics-grid">
+        <div class="metric"><span class="metric-label">Total end-to-end</span><span class="metric-value" id="m-total">&ndash;</span></div>
+        <div class="metric"><span class="metric-label">Twilio latency (transport)</span><span class="metric-value" id="m-twilio">&ndash;</span></div>
+        <div class="metric"><span class="metric-label">Nova Sonic total time</span><span class="metric-value" id="m-nova">&ndash;</span></div>
+        <div class="metric"><span class="metric-label">TTFT</span><span class="metric-value" id="m-ttft">&ndash;</span></div>
+        <div class="metric"><span class="metric-label">Turn count</span><span class="metric-value" id="m-turns">&ndash;</span></div>
+        <div class="metric"><span class="metric-label">Barge-ins</span><span class="metric-value" id="m-barge">&ndash;</span></div>
+      </div>
+
+      <h3>Per-turn timeline</h3>
+      <table class="data-table" id="turns-table">
+        <thead>
+          <tr>
+            <th>Turn #</th>
+            <th>Duration</th>
+            <th>Latency</th>
+            <th>TTFT</th>
+            <th>Speaker transcript</th>
+          </tr>
+        </thead>
+        <tbody id="turns-body">
+          <tr><td colspan="5" class="empty">No turns recorded.</td></tr>
+        </tbody>
+      </table>
+
+      <details class="log-viewer" id="log-viewer">
+        <summary>In-depth event log</summary>
+        <pre id="log-pre"></pre>
+      </details>
+    </section>
+
+    <footer class="app-footer">
+      <span id="config-summary" class="muted"></span>
+    </footer>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

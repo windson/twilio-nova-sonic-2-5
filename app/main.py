@@ -11,15 +11,19 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from app.collections_agent import build_tools, get_system_prompt
 from app.config import get_settings
 from app.metrics import CallMetrics, configure_json_logging
 from app.sonic_bridge import SonicSession
 from app.store import get_default_store
+from app.twilio_client import place_outbound_call
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +76,116 @@ async def index() -> HTMLResponse:
 async def config_summary() -> dict[str, object]:
     """Return a non-secret summary of the active configuration."""
     return get_settings().safe_summary()
+
+
+# --- REST API: due records, call initiation, analytics -----------------------
+
+
+class PlaceCallRequest(BaseModel):
+    """Body for POST /api/calls."""
+
+    account_id: str
+
+
+def _call_summary(record: dict[str, Any]) -> dict[str, Any]:
+    """Project a CallAnalytics record to a compact list summary."""
+    return {
+        "call_sid": record.get("call_sid"),
+        "account_id": record.get("account_id"),
+        "total_e2e_ms": record.get("total_e2e_ms"),
+        "nova_total_ms": record.get("nova_total_ms"),
+        "twilio_latency_ms": record.get("twilio_latency_ms"),
+        "ttft_ms": record.get("ttft_ms"),
+        "turn_count": record.get("turn_count"),
+        "barge_in_count": record.get("barge_in_count"),
+    }
+
+
+@app.get("/api/dues")
+async def list_dues() -> dict[str, Any]:
+    """List all due/account records."""
+    return {"dues": get_default_store().list_dues()}
+
+
+@app.post("/api/calls")
+async def create_call(body: PlaceCallRequest) -> dict[str, Any]:
+    """Initiate an AI-first outbound collections call for a due record.
+
+    Looks up the due record, then places an outbound call via
+    :func:`app.twilio_client.place_outbound_call`. For a Twilio trial/verified
+    setup the callee is ``TWILIO_VERIFIED_CALLER_ID``.
+
+    Returns a clear 4xx/503 JSON error (not a 500 traceback) when the account
+    is unknown or when Twilio credentials / ``PUBLIC_BASE_URL`` are missing.
+    """
+    store = get_default_store()
+    settings = get_settings()
+
+    due_record = store.get_due(body.account_id)
+    if due_record is None:
+        raise HTTPException(status_code=404, detail=f"Unknown account_id: {body.account_id}")
+
+    # Pre-flight config checks so we can return a clear, actionable error.
+    missing: list[str] = []
+    if not settings.twilio_configured:
+        missing.append("TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN")
+    if not settings.twilio_from_number:
+        missing.append("TWILIO_FROM_NUMBER")
+    if not settings.public_base_url:
+        missing.append("PUBLIC_BASE_URL")
+    callee = settings.twilio_verified_caller_id
+    if not callee:
+        missing.append("TWILIO_VERIFIED_CALLER_ID")
+    if missing:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "twilio_not_configured",
+                "message": (
+                    "Outbound calling is not configured. Set the following "
+                    "environment variables and restart: " + ", ".join(missing) + ". "
+                    "PUBLIC_BASE_URL must point at a publicly reachable host/tunnel "
+                    "so Twilio can open the /media WebSocket."
+                ),
+                "missing": missing,
+            },
+        )
+
+    try:
+        result = place_outbound_call(callee, due_record, settings=settings)
+    except ValueError as exc:
+        # Defensive: config validation inside the client.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - surface as 502, not an unhandled 500
+        logger.exception("account_id=<%s> | failed to place outbound call", body.account_id)
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "twilio_call_failed", "message": str(exc)},
+        ) from exc
+
+    return {
+        "call_sid": result.call_sid,
+        "session_id": result.call_sid,
+        "account_id": result.account_id,
+        "to": result.to,
+        "from": result.from_number,
+    }
+
+
+@app.get("/api/calls")
+async def list_calls() -> dict[str, Any]:
+    """List post-call analytics summaries (most recent flavor last)."""
+    calls = [_call_summary(r) for r in get_default_store().list_calls()]
+    return {"calls": calls}
+
+
+@app.get("/api/calls/{call_id}")
+async def get_call(call_id: str) -> dict[str, Any]:
+    """Return the full CallAnalytics record (turns, transcripts, events_log)."""
+    record = get_default_store().get_call(call_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Unknown call_id: {call_id}")
+    return record
 
 
 @app.websocket("/media")
@@ -179,3 +293,10 @@ async def media_stream(websocket: WebSocket) -> None:
                 store.save_call_analytics(metrics.to_call_analytics())
             except Exception:  # noqa: BLE001 - persistence must not crash teardown
                 logger.exception("stream_sid=<%s> | failed to persist analytics", stream_sid)
+
+
+# Mount the vanilla-JS dashboard assets (web/app.js, web/styles.css) as static
+# files. GET / above serves web/index.html when present (the real dashboard),
+# falling back to the placeholder only if web/ has not been built yet.
+if _WEB_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=str(_WEB_DIR)), name="static")
