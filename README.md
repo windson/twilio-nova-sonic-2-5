@@ -316,6 +316,18 @@ Sonic model ARN, DynamoDB RW on just the two tables, and CloudWatch Logs write.
   surfaced by `GET /api/config`, with `APP_LOG_GROUP` set on the task), so it
   needs no extra IAM and no metrics pipeline.
 
+- **Conversational turns (what `turn_count` means).** A turn is one side of the
+  user<->Nova Sonic alternation: a caller utterance answered by a Sonic utterance
+  is the back-and-forth. `turn_count` is derived from the
+  `BidiTranscriptStreamEvent` `role` (`user`/`assistant`) + `is_final` alternation,
+  not from Nova response IDs. This **replaced the earlier `response_id`-based
+  grouping** because in live calls Nova Sonic reused a single `response_id` for
+  the entire exchange, so counting matched response-start/response-complete pairs
+  reported `turn_count = 1` even when there were several user<->Sonic
+  alternations. The `response_id` grouping is retained only as a secondary
+  Nova-response timing signal (`nova_response_count`). See
+  `CallMetrics._build_conversation_turns` in `app/metrics.py`.
+
 - **Conversation (chat) view.** The call detail panel reconstructs the call as a
   chat transcript (caller vs Nova Sonic, ordered by start time, in text),
   showing the time each turn took and, for Sonic turns, TTFT and latency. It is
