@@ -62,6 +62,20 @@ Parameters:
       collections.example.com. When set, PUBLIC_BASE_URL is this hostname so
       TwiML emits wss://<hostname>/media. Must be used together with
       CertificateArn for a live call.
+  EnableCloudFront:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: >-
+      Option 1 (CloudFront TLS front door). When "true", provision an Amazon
+      CloudFront distribution in front of the HTTP:80 ALB to obtain a free
+      AWS-managed *.cloudfront.net TLS hostname so Twilio Media Streams can
+      connect over wss://<dist>.cloudfront.net/media WITHOUT a custom domain or
+      ACM certificate. When "true", PUBLIC_BASE_URL and the PublicBaseUrl output
+      resolve to the CloudFront domain. Leave "false" to keep the plain
+      HTTP:80/ALB (or the ACM custom-domain) behavior.
 
 Conditions:
   # HTTPS/WSS is enabled only when an ACM certificate ARN is supplied, so the
@@ -69,6 +83,9 @@ Conditions:
   HasCertificate: !Not [!Equals [!Ref CertificateArn, ""]]
   # Prefer the real TLS hostname for PUBLIC_BASE_URL when provided.
   HasPublicHostname: !Not [!Equals [!Ref PublicHostname, ""]]
+  # Option 1: gate the CloudFront distribution + its outputs / PUBLIC_BASE_URL
+  # branch so the template still validates and deploys when CloudFront is off.
+  EnableCf: !Equals [!Ref EnableCloudFront, "true"]
 
 Resources:
   # --- DynamoDB persistence --------------------------------------------------
@@ -309,6 +326,60 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref TargetGroup
 
+  # --- CloudFront distribution (Option 1: free AWS-managed TLS front door) ---
+  # Puts a CloudFront distribution in front of the HTTP:80 ALB so Twilio Media
+  # Streams can connect over wss://<dist>.cloudfront.net/media using the free
+  # *.cloudfront.net managed certificate - no custom domain / ACM required.
+  # CloudFront supports WebSockets automatically; the wss:// upgrade passes
+  # through because the managed AllViewer origin-request policy forwards the
+  # Sec-WebSocket-* / Upgrade / Connection headers to the origin, and the
+  # managed CachingDisabled cache policy keeps the dynamic /media traffic
+  # uncached. Origin read/keepalive timeouts are set to their 60s max so the
+  # initial WS 101 Switching Protocols handshake is not cut off.
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: EnableCf
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "${AWS::StackName} CloudFront TLS front door for Twilio wss"
+        Enabled: true
+        PriceClass: PriceClass_100
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        Origins:
+          - Id: alb-origin
+            DomainName: !GetAtt LoadBalancer.DNSName
+            CustomOriginConfig:
+              # ALB is HTTP:80 only (no cert on the ALB); CloudFront terminates
+              # TLS at the edge and talks plaintext HTTP to the origin.
+              OriginProtocolPolicy: http-only
+              HTTPPort: 80
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 60
+        DefaultCacheBehavior:
+          TargetOriginId: alb-origin
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: false
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+          # Managed CachingDisabled - dynamic REST + WebSocket traffic.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          # Managed AllViewer - forwards all viewer headers (including the
+          # Sec-WebSocket-* headers) so the wss:// upgrade reaches the origin.
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+        ViewerCertificate:
+          # Free AWS-managed *.cloudfront.net certificate (trusted TLS).
+          CloudFrontDefaultCertificate: true
+
   # --- ECS cluster / service -------------------------------------------------
   Cluster:
     Type: AWS::ECS::Cluster
@@ -342,15 +413,19 @@ Resources:
               Value: !Ref DuesTable
             - Name: CALLS_TABLE
               Value: !Ref CallsTable
-            # PUBLIC_BASE_URL drives the TwiML wss://<host>/media URL. For a
-            # live call this MUST be the TLS hostname the ACM cert covers (not
-            # the raw ALB DNS, which has no certificate). Falls back to the ALB
-            # DNS for HTTP-only/internal testing when no hostname is set.
+            # PUBLIC_BASE_URL drives the TwiML wss://<host>/media URL.
+            # Precedence: (1) CloudFront domain when Option 1 is enabled (free
+            # managed TLS); (2) the ACM-covered TLS hostname when PublicHostname
+            # is set; (3) the raw ALB DNS (HTTP-only/internal testing). The app
+            # normalizes whatever host it receives to wss://<host>/media.
             - Name: PUBLIC_BASE_URL
               Value: !If
-                - HasPublicHostname
-                - !Ref PublicHostname
-                - !GetAtt LoadBalancer.DNSName
+                - EnableCf
+                - !GetAtt Distribution.DomainName
+                - !If
+                  - HasPublicHostname
+                  - !Ref PublicHostname
+                  - !GetAtt LoadBalancer.DNSName
           # Twilio credentials are injected from Secrets Manager/SSM by ARN;
           # no secret value appears in this template.
           Secrets:
@@ -494,14 +569,19 @@ Resources:
 Outputs:
   PublicBaseUrl:
     Description: >-
-      Host used for PUBLIC_BASE_URL (TwiML emits wss://<this>/media). The TLS
-      hostname when PublicHostname is set, otherwise the raw ALB DNS. A live
-      Twilio call REQUIRES the TLS hostname (CertificateArn + PublicHostname);
-      the raw ALB DNS has no certificate and Twilio will refuse wss:// to it.
+      Host used for PUBLIC_BASE_URL (TwiML emits wss://<this>/media). The
+      CloudFront domain when Option 1 (EnableCloudFront) is on, else the TLS
+      hostname when PublicHostname is set, else the raw ALB DNS. A live Twilio
+      call REQUIRES a TLS endpoint (CloudFront, or CertificateArn +
+      PublicHostname); the raw ALB DNS has no certificate and Twilio will
+      refuse wss:// to it.
     Value: !If
-      - HasPublicHostname
-      - !Ref PublicHostname
-      - !GetAtt LoadBalancer.DNSName
+      - EnableCf
+      - !GetAtt Distribution.DomainName
+      - !If
+        - HasPublicHostname
+        - !Ref PublicHostname
+        - !GetAtt LoadBalancer.DNSName
   AlbDnsName:
     Description: >-
       Raw ALB DNS name. Point your PublicHostname CNAME/alias record at this.
@@ -509,6 +589,12 @@ Outputs:
   HttpsEnabled:
     Description: Whether the HTTPS:443 (wss) listener was provisioned.
     Value: !If [HasCertificate, "true", "false"]
+  CloudFrontDomainName:
+    Condition: EnableCf
+    Description: >-
+      CloudFront distribution domain (*.cloudfront.net). Twilio Media Streams
+      connect over wss://<this>/media via the free AWS-managed TLS cert.
+    Value: !GetAtt Distribution.DomainName
   DashboardUrl:
     Description: CloudWatch dashboard console URL.
     Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${Dashboard}"
