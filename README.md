@@ -32,6 +32,13 @@ built-in analytics dashboard.
   support the WebSocket upgrade. The Application Load Balancer does both; its
   **idle timeout is set to >= 120s** so a long, mostly-listening conversation is
   not dropped mid-call. See Troubleshooting if the socket closes early.
+- **TLS front door (Option 1: CloudFront).** The simplest way to give Twilio a
+  trusted `wss://` endpoint without owning a custom domain is to put an **Amazon
+  CloudFront** distribution in front of the HTTP-only ALB. CloudFront serves the
+  free, AWS-managed `*.cloudfront.net` certificate, so the public endpoint is
+  `wss://<dist>.cloudfront.net/media` and TwiML emits that URL. CloudFront
+  forwards the WebSocket upgrade to the ALB over HTTP. This is the deployed
+  configuration; see **AWS deploy -> Option 1** and **Troubleshooting**.
 - **Metrics (`app/metrics.py`).** Per call: total end-to-end time, the Twilio
   transport latency vs Nova Sonic active time split, TTFT (time to first audio),
   turn count, and per-turn duration/latency. Emitted as one JSON object per line
@@ -181,8 +188,53 @@ Sonic model ARN, DynamoDB RW on just the two tables, and CloudWatch Logs write.
 
 5. **Enable TLS for live calls (required by Twilio).** Twilio Media Streams
    only connect over `wss://` (TLS); a plaintext `ws://` endpoint is refused.
-   The raw ALB DNS name has **no certificate**, so you must terminate TLS on the
-   ALB with an ACM certificate on a real hostname:
+   The raw ALB DNS name has **no certificate**, so you must front it with TLS.
+   There are two supported options.
+
+   ### Option 1 (recommended, no custom domain): CloudFront in front of the ALB
+
+   Put an Amazon CloudFront distribution in front of the HTTP-only ALB and use
+   the **free AWS-managed `*.cloudfront.net` certificate** — no ACM certificate,
+   no DNS record, and no domain you must own. The template gates this behind the
+   `EnableCloudFront` parameter:
+
+   ```bash
+   export VPC_ID=vpc-xxxxxxxx
+   export PUBLIC_SUBNET_IDS=subnet-aaaa,subnet-bbbb   # >= 2 AZs
+   export ENABLE_CLOUDFRONT=true
+   scripts/deploy.sh deploy     # adds EnableCloudFront=true to the stack
+   ```
+
+   With `EnableCloudFront=true` the stack creates an `AWS::CloudFront::Distribution`
+   whose single origin is the ALB DNS over **`http-only`** (the ALB has no cert),
+   and sets `PUBLIC_BASE_URL` to the distribution domain so TwiML emits
+   `wss://<dist>.cloudfront.net/media`. The distribution domain is exposed as the
+   `CloudFrontDomainName` stack output. CloudFront deploys in ~5-15 min; the stack
+   finishes `UPDATE_COMPLETE` once it is live. For the WebSocket upgrade to pass
+   through, the default cache behavior uses:
+
+   - the managed **AllViewer** origin-request policy
+     (`216adef6-5c7f-47e4-b989-5492eafa07d3`) so the `Upgrade`, `Connection`, and
+     all `Sec-WebSocket-*` headers are forwarded to the ALB;
+   - the managed **CachingDisabled** cache policy
+     (`4135ea2d-6df8-44a3-9df3-4b5a84be39ad`);
+   - `ViewerProtocolPolicy: redirect-to-https`, all 7 methods allowed;
+   - `OriginReadTimeout` and `OriginKeepaliveTimeout` set to **60s** (the max).
+
+   Verify after deploy:
+
+   ```bash
+   CF=$(aws cloudformation describe-stacks --stack-name ar-collections-nova-sonic \
+     --region us-east-1 \
+     --query "Stacks[0].Outputs[?OutputKey=='CloudFrontDomainName'].OutputValue|[0]" \
+     --output text)
+   curl -sS -o /dev/null -w '%{http_code}\n' https://$CF/healthz   # -> 200 (trusted cert, no -k)
+   ```
+
+   ### Option 2 (custom domain): ACM certificate + HTTPS listener on the ALB
+
+   If you own a hostname, terminate TLS directly on the ALB with an ACM
+   certificate on that real hostname:
 
    - Request/import an ACM certificate (in the stack's region, `us-east-1`) for
      a hostname you control, e.g. `collections.example.com`.
@@ -245,6 +297,34 @@ Sonic model ARN, DynamoDB RW on just the two tables, and CloudWatch Logs write.
 - **ALB idle timeout closes the socket mid-call.** The template sets
   `idle_timeout.timeout_seconds = 120`. If you lowered it, a quiet stretch in the
   conversation can trip the idle timeout and drop the WebSocket. Keep it >= 120s.
+
+- **CloudFront (Option 1): `wss` upgrade fails with 403/502 or the handshake
+  hangs.** The WebSocket upgrade only passes through CloudFront when the cache
+  behavior forwards the upgrade headers. Confirm the default behavior uses the
+  managed **AllViewer** origin-request policy (forwards `Upgrade`/`Connection`/
+  `Sec-WebSocket-*`) and the managed **CachingDisabled** cache policy, that the
+  origin protocol is **`http-only`** (the ALB listens on HTTP:80 with no cert),
+  and that the ALB target group is healthy on `/healthz`. Validate the upgrade
+  end-to-end before dialing by opening a client socket to
+  `wss://<dist>.cloudfront.net/media`; a **101 Switching Protocols** handshake and
+  an open socket (the app calls `websocket.accept()` immediately) is the pass
+  signal, corroborated by a `stream`/metrics `stream_start` log line in
+  `/ecs/<stack>/app`.
+
+- **CloudFront origin timeout vs. long silences (validated finding).**
+  CloudFront's `OriginReadTimeout`/`OriginKeepaliveTimeout` (default 30s, raised
+  to the **60s** max here) applies to the **initial HTTP response** — i.e. the
+  `101 Switching Protocols` handshake — **not** to an already-established,
+  long-lived WebSocket. Once the socket is upgraded, CloudFront holds the
+  persistent TCP connection open, so silent stretches on an in-progress Media
+  Streams call do **not** trip the 60s origin-response ceiling. This was observed
+  empirically on a live call (silent gaps of several seconds while the agent
+  spoke and the debtor listened did not cause any CloudFront/ALB-initiated
+  disconnect). The governing idle timeout for an established socket is the ALB's
+  (120s), and Nova Sonic auto-reconnects near its ~8-minute bi-di limit. CloudFront
+  is therefore a safe TLS front door for this workload; the only residual risk is
+  a near-silent conversation that exceeds the ALB idle timeout, which the app
+  mitigates with Twilio `mark` keepalives and the Nova auto-restart.
 
 - **Bedrock `AccessDenied` on `InvokeModelWithBidirectionalStream`.** Check (1)
   **model access** is enabled for `amazon.nova-2-5-sonic`, (2) the **task IAM
