@@ -1,0 +1,458 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  AR Collections Nova Sonic 2.5 Agent - ECS Fargate service behind an
+  Application Load Balancer (WebSocket/WSS capable) bridging Twilio Media
+  Streams to Amazon Bedrock Nova Sonic 2.5. Provisions DynamoDB persistence,
+  CloudWatch logs + dashboard, a CloudTrail management-event trail, and a
+  least-privilege IAM task role scoped to the Nova Sonic model.
+
+Parameters:
+  ContainerImage:
+    Type: String
+    Description: >-
+      Full ECR image URI for the app (e.g.
+      <acct>.dkr.ecr.us-east-1.amazonaws.com/ar-collections-nova-sonic:latest).
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC in which to run the Fargate service and ALB.
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Two or more public subnets (different AZs) for the ALB and tasks.
+  NovaModelId:
+    Type: String
+    Default: amazon.nova-2-5-sonic
+    Description: Bedrock Nova Sonic 2.5 model id (verified streaming in us-east-1).
+  TwilioAccountSidArn:
+    Type: String
+    Description: >-
+      Secrets Manager secret ARN (or SSM parameter ARN) that holds the Twilio
+      account SID. Referenced by ARN only - never inline the value.
+  TwilioAuthTokenArn:
+    Type: String
+    Description: Secrets Manager/SSM ARN holding the Twilio auth token.
+  TwilioFromNumberArn:
+    Type: String
+    Description: Secrets Manager/SSM ARN holding the Twilio from number.
+  TwilioVerifiedCallerIdArn:
+    Type: String
+    Description: Secrets Manager/SSM ARN holding the Twilio verified caller id.
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Number of Fargate tasks to run.
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    Description: CloudWatch log retention (days) for the app log group.
+
+Resources:
+  # --- DynamoDB persistence --------------------------------------------------
+  DuesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: account_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: account_id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  CallsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: call_sid
+          AttributeType: S
+      KeySchema:
+        - AttributeName: call_sid
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # --- CloudWatch logs -------------------------------------------------------
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}/app"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # --- IAM roles -------------------------------------------------------------
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-twilio-secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - ssm:GetParameters
+                  - ssm:GetParameter
+                Resource:
+                  - !Ref TwilioAccountSidArn
+                  - !Ref TwilioAuthTokenArn
+                  - !Ref TwilioFromNumberArn
+                  - !Ref TwilioVerifiedCallerIdArn
+
+  # Least-privilege task role: Bedrock bidi stream on the Nova Sonic model,
+  # DynamoDB RW on just the two tables, and CloudWatch Logs write.
+  TaskRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      # bedrock:InvokeModelWithBidirectionalStream is a valid Bedrock action
+      # (Nova Sonic bi-di streaming) that cfn-lint's bundled IAM action catalog
+      # does not yet list, so W3037 is a false positive here.
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W3037
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: bedrock-nova-sonic-bidi
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModelWithBidirectionalStream
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${NovaModelId}"
+        - PolicyName: dynamodb-rw
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt DuesTable.Arn
+                  - !GetAtt CallsTable.Arn
+        - PolicyName: cloudwatch-logs-write
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt AppLogGroup.Arn
+                  - !Sub "${AppLogGroup.Arn}:*"
+
+  # --- Networking / security groups -----------------------------------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public ingress for the AR Collections ALB.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP (also carries the WebSocket upgrade for wss).
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all egress.
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow ALB to reach Fargate tasks on the app port.
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all egress (Bedrock, DynamoDB, Twilio API, ECR).
+
+  ServiceIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ServiceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Description: App port reachable only from the ALB.
+
+  # --- Application Load Balancer (WebSocket/WSS capable) ---------------------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      LoadBalancerAttributes:
+        # >= 120s so Nova's long-lived bi-di WebSocket is not closed by the ALB
+        # idle timeout mid-conversation.
+        - Key: idle_timeout.timeout_seconds
+          Value: "120"
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /healthz
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+        # Stickiness keeps a caller's REST + WebSocket on the same task.
+        - Key: stickiness.enabled
+          Value: "true"
+        - Key: stickiness.type
+          Value: lb_cookie
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # --- ECS cluster / service -------------------------------------------------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-cluster"
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-app"
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: "512"
+      Memory: "1024"
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Ref ContainerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          Environment:
+            - Name: NOVA_MODEL_ID
+              Value: !Ref NovaModelId
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: DUES_TABLE
+              Value: !Ref DuesTable
+            - Name: CALLS_TABLE
+              Value: !Ref CallsTable
+            # PUBLIC_BASE_URL is the ALB DNS so TwiML emits wss://<alb>/media.
+            - Name: PUBLIC_BASE_URL
+              Value: !GetAtt LoadBalancer.DNSName
+          # Twilio credentials are injected from Secrets Manager/SSM by ARN;
+          # no secret value appears in this template.
+          Secrets:
+            - Name: TWILIO_ACCOUNT_SID
+              ValueFrom: !Ref TwilioAccountSidArn
+            - Name: TWILIO_AUTH_TOKEN
+              ValueFrom: !Ref TwilioAuthTokenArn
+            - Name: TWILIO_FROM_NUMBER
+              ValueFrom: !Ref TwilioFromNumberArn
+            - Name: TWILIO_VERIFIED_CALLER_ID
+              ValueFrom: !Ref TwilioVerifiedCallerIdArn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AppLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref TaskDefinition
+      # >= 120s matches the ALB idle timeout so the WebSocket stays open.
+      HealthCheckGracePeriodSeconds: 120
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref PublicSubnetIds
+          SecurityGroups:
+            - !Ref ServiceSecurityGroup
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroup
+
+  # --- CloudWatch dashboard --------------------------------------------------
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${AWS::StackName}-observability"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric", "x": 0, "y": 0, "width": 8, "height": 6,
+              "properties": {
+                "title": "Call volume (ALB requests)",
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "metrics": [
+                  [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 8, "y": 0, "width": 8, "height": 6,
+              "properties": {
+                "title": "Avg TTFT (custom metric: ARCollections/TTFTms)",
+                "region": "${AWS::Region}",
+                "stat": "Average",
+                "metrics": [
+                  [ "ARCollections", "TTFTms" ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 16, "y": 0, "width": 8, "height": 6,
+              "properties": {
+                "title": "Request latency (ALB target response time)",
+                "region": "${AWS::Region}",
+                "stat": "Average",
+                "metrics": [
+                  [ "AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ]
+                ]
+              }
+            },
+            {
+              "type": "log", "x": 0, "y": 6, "width": 24, "height": 6,
+              "properties": {
+                "title": "Recent app logs (call lifecycle / metrics JSON lines)",
+                "region": "${AWS::Region}",
+                "query": "SOURCE '${AppLogGroup}' | fields @timestamp, @message | sort @timestamp desc | limit 50"
+              }
+            }
+          ]
+        }
+
+  # --- CloudTrail (management events) ---------------------------------------
+  TrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  TrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt TrailBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${TrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  Trail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: TrailBucketPolicy
+    Properties:
+      S3BucketName: !Ref TrailBucket
+      IsLogging: true
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      EnableLogFileValidation: true
+
+Outputs:
+  PublicBaseUrl:
+    Description: >-
+      ALB DNS name. Set PUBLIC_BASE_URL to this so TwiML emits
+      wss://<this>/media for Twilio Media Streams.
+    Value: !GetAtt LoadBalancer.DNSName
+  DashboardUrl:
+    Description: CloudWatch dashboard console URL.
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${Dashboard}"
+  DuesTableName:
+    Description: DynamoDB table for due/account records (DUES_TABLE).
+    Value: !Ref DuesTable
+  CallsTableName:
+    Description: DynamoDB table for call analytics (CALLS_TABLE).
+    Value: !Ref CallsTable
+  AppLogGroupName:
+    Description: CloudWatch log group for the app JSON logs.
+    Value: !Ref AppLogGroup
+  CloudTrailName:
+    Description: CloudTrail trail recording management events.
+    Value: !Ref Trail
