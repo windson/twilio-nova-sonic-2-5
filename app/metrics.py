@@ -17,8 +17,14 @@ ordered streams this collector computes the metrics the user asked for:
 
 Approximations (documented here and in FEAT-003 findings):
 
-- A "turn" is a matched ``BidiResponseStartEvent`` / ``BidiResponseCompleteEvent``
-  pair keyed by ``response_id``. Per-turn duration = complete_time - start_time.
+- A conversational "turn" is one side of the user<->assistant alternation,
+  derived from ``BidiTranscriptStreamEvent`` roles (see
+  :meth:`CallMetrics._build_conversation_turns`). This is the headline
+  ``turn_count``. The response_id-based grouping below is kept as a secondary
+  Nova-response timing signal and surfaced as ``nova_response_count``.
+- A Nova response window is a matched ``BidiResponseStartEvent`` /
+  ``BidiResponseCompleteEvent`` pair keyed by ``response_id``. Per-response
+  duration = complete_time - start_time.
 - TTFT for a turn = time from that turn's ``response_start`` to the first
   ``BidiAudioStreamEvent`` of the same response. The conversation-level TTFT is
   the first turn's TTFT.
@@ -134,9 +140,20 @@ class CallMetrics:
         self._session_start: float | None = None
         self._session_end: float | None = None
 
-        # Turn state keyed by response_id.
+        # Nova response timing keyed by response_id (secondary signal; see the
+        # conversational-turn comment in :meth:`_build_conversation_turns`).
         self._open_turns: dict[str, dict[str, Any]] = {}
         self.turns: list[dict[str, Any]] = []
+
+        # Conversational turns (user<->assistant alternation). Rebuilt on
+        # demand from the transcript stream. See :meth:`_build_conversation_turns`.
+        self.conversation_turns: list[dict[str, Any]] = []
+
+        # Fallback: latest non-final user transcript text seen. If a call only
+        # yields partial (non-final) user transcripts, we still want the chat
+        # view to show what the user said rather than an empty bubble.
+        self._last_user_partial_text: str | None = None
+        self._last_user_partial_t_ms: float | None = None
 
         # Conversation-level aggregates.
         self.first_ttft_ms: float | None = None
@@ -347,8 +364,15 @@ class CallMetrics:
         role = getattr(event, "role", None)
         text = getattr(event, "text", None)
         is_final = bool(getattr(event, "is_final", False))
-        if role == "user" and is_final:
-            self._last_user_final_wall = now
+        if role == "user":
+            if is_final:
+                self._last_user_final_wall = now
+            elif text:
+                # Retain the latest partial user transcript as a fallback so the
+                # chat view is not empty when Nova only emits non-final user
+                # transcripts (observed in some live calls).
+                self._last_user_partial_text = text
+                self._last_user_partial_t_ms = self._rel_ms(now)
         self.transcripts.append(
             {
                 "role": role,
@@ -370,6 +394,161 @@ class CallMetrics:
             "modality_details": getattr(event, "modality_details", None),
         }
         self._emit("usage", **self.usage)
+
+    # -- conversational turns -------------------------------------------------
+
+    # ------------------------------------------------------------------------
+    # What is a "turn"?
+    #
+    # The user's observation: a turn is one back-and-forth in the conversation
+    # (the user says something, Nova Sonic answers), not an internal grouping of
+    # Nova's output. The ORIGINAL implementation counted a turn as a matched
+    # BidiResponseStartEvent/BidiResponseCompleteEvent pair keyed by
+    # ``response_id``. In live calls Nova Sonic REUSED a single ``response_id``
+    # for an entire multi-exchange conversation, so that count collapsed to 1
+    # even though the user and the agent alternated several times. That is the
+    # bug this method fixes.
+    #
+    # Reliable signal: BidiTranscriptStreamEvent carries ``role`` in
+    # {"user", "assistant"} with ``is_final`` and a timestamp. We derive
+    # conversational turns from that alternation: group consecutive FINAL
+    # transcripts of the same role into one segment; each segment is one
+    # conversational turn (speaker = that role). This agent is AI-initiated and
+    # speaks first (the kickoff), so a leading assistant-only segment is counted
+    # as the opening turn. The old response_id-based count is preserved intact
+    # as ``self.turns`` and surfaced as ``nova_response_count`` so no signal is
+    # lost; it is only demoted from being the headline "turn_count".
+    #
+    # Model-invocation-logging decision (do NOT enable it):
+    # Amazon Bedrock model invocation logging (the account-level
+    # PutModelInvocationLoggingConfiguration API) ONLY logs Converse,
+    # ConverseStream, InvokeModel and InvokeModelWithResponseStream. It does NOT
+    # capture bedrock:InvokeModelWithBidirectionalStream, which is the operation
+    # Nova Sonic bi-di streaming (this app) uses, so it would NOT provide
+    # turn/latency ground truth for Nova Sonic. There is also no CloudFormation
+    # resource type for it (account-level API only), so it does not fit this
+    # project's IaC-first model. Verified against the AWS docs
+    # (bedrock/latest/userguide/model-invocation-logging.html). We therefore
+    # rely on the transcript alternation above plus the response_start/first-
+    # audio timing in ``self.turns`` for turn and latency semantics.
+    # ------------------------------------------------------------------------
+
+    def _build_conversation_turns(self) -> list[dict[str, Any]]:
+        """Build the user<->assistant conversational-turn model.
+
+        Groups consecutive final transcripts by role into segments; each segment
+        is one conversational turn. Assistant segments are associated with the
+        nearest Nova response timing in :attr:`turns` (matched by closest start
+        time, since Nova may reuse a single ``response_id``) to attach
+        ``ttft_ms`` and ``latency_ms``.
+
+        Returns:
+            A list of conversational-turn dicts (also stored on
+            :attr:`conversation_turns`).
+        """
+        finals = [
+            t
+            for t in self.transcripts
+            if t.get("is_final") and t.get("role") in ("user", "assistant") and t.get("text")
+        ]
+
+        # Fallback: if no final user transcript was captured but we retained a
+        # partial, inject it so the chat view reflects user speech.
+        if (
+            self._last_user_partial_text
+            and not any(t.get("role") == "user" for t in finals)
+        ):
+            finals.append(
+                {
+                    "role": "user",
+                    "text": self._last_user_partial_text,
+                    "is_final": False,
+                    "t_ms": self._last_user_partial_t_ms,
+                }
+            )
+            finals.sort(key=lambda t: (t.get("t_ms") if t.get("t_ms") is not None else 0.0))
+
+        # Assistant Nova response timings sorted by start, each used at most once
+        # so repeated assistant segments map to successive responses.
+        assistant_timings = sorted(
+            (t for t in self.turns if t.get("start_ms") is not None),
+            key=lambda t: t["start_ms"],
+        )
+        used_timing: set[int] = set()
+
+        turns: list[dict[str, Any]] = []
+        idx = 0
+        for item in finals:
+            role = item["role"]
+            t_ms = item.get("t_ms")
+            if turns and turns[-1]["speaker"] == role:
+                # Extend the current same-role segment.
+                seg = turns[-1]
+                if item.get("text"):
+                    seg["_texts"].append(item["text"])
+                if t_ms is not None:
+                    seg["end_ms"] = t_ms
+                    if seg["start_ms"] is None:
+                        seg["start_ms"] = t_ms
+                continue
+            seg = {
+                "index": idx,
+                "speaker": role,
+                "_texts": [item["text"]] if item.get("text") else [],
+                "start_ms": t_ms,
+                "end_ms": t_ms,
+            }
+            turns.append(seg)
+            idx += 1
+
+        for seg in turns:
+            seg["text"] = " ".join(seg.pop("_texts")).strip()
+            start_ms = seg.get("start_ms")
+            end_ms = seg.get("end_ms")
+            if start_ms is not None and end_ms is not None:
+                seg["total_ms"] = round(end_ms - start_ms, 3)
+            else:
+                seg["total_ms"] = None
+            if seg["speaker"] == "assistant":
+                timing = self._closest_timing(start_ms, assistant_timings, used_timing)
+                seg["ttft_ms"] = timing.get("ttft_ms") if timing else None
+                seg["latency_ms"] = timing.get("turn_latency_ms") if timing else None
+
+        self.conversation_turns = turns
+        return turns
+
+    @staticmethod
+    def _closest_timing(
+        start_ms: float | None,
+        timings: list[dict[str, Any]],
+        used: set[int],
+    ) -> dict[str, Any] | None:
+        """Return the unused Nova response timing closest to ``start_ms``.
+
+        Matching by closest start time (rather than response_id) because Nova
+        may reuse one response_id across the whole exchange.
+        """
+        best_i: int | None = None
+        best_delta: float | None = None
+        for i, timing in enumerate(timings):
+            if i in used:
+                continue
+            if start_ms is None:
+                best_i = i
+                break
+            delta = abs(timing["start_ms"] - start_ms)
+            if best_delta is None or delta < best_delta:
+                best_delta = delta
+                best_i = i
+        if best_i is None:
+            return None
+        used.add(best_i)
+        return timings[best_i]
+
+    @property
+    def conversation_turn_count(self) -> int:
+        """Number of conversational (user<->assistant) turns."""
+        return len(self._build_conversation_turns())
 
     # -- summary / serialization ----------------------------------------------
 
@@ -395,7 +574,13 @@ class CallMetrics:
         return round(max(total - self.nova_total_ms, 0.0), 3)
 
     def summary(self) -> dict[str, Any]:
-        """Compact metrics summary (the headline numbers)."""
+        """Compact metrics summary (the headline numbers).
+
+        ``turn_count`` reflects CONVERSATIONAL turns (user<->assistant
+        alternation). The old response_id-based count is preserved as
+        ``nova_response_count``.
+        """
+        conversation_turns = self._build_conversation_turns()
         return {
             "call_sid": self.call_sid,
             "account_id": self.account_id,
@@ -404,13 +589,20 @@ class CallMetrics:
             "twilio_latency_ms": self.twilio_latency_ms,
             "non_nova_ms": self.non_nova_ms,
             "ttft_ms": self.first_ttft_ms,
-            "turn_count": len(self.turns),
+            "turn_count": len(conversation_turns),
+            "nova_response_count": len(self.turns),
             "barge_in_count": self.barge_in_count,
             "usage": self.usage,
         }
 
     def to_call_analytics(self) -> dict[str, Any]:
-        """Serializable CallAnalytics record for the store/UI (FEAT-003/004)."""
+        """Serializable CallAnalytics record for the store/UI (FEAT-003/004).
+
+        ``turn_count`` is the conversational-turn count; ``nova_response_count``
+        preserves the response_id-based count. ``conversation_turns`` carries
+        the chat-style user<->assistant model for the UI.
+        """
+        conversation_turns = self._build_conversation_turns()
         return {
             "call_sid": self.call_sid,
             "account_id": self.account_id,
@@ -419,9 +611,11 @@ class CallMetrics:
             "twilio_latency_ms": self.twilio_latency_ms,
             "non_nova_ms": self.non_nova_ms,
             "ttft_ms": self.first_ttft_ms,
-            "turn_count": len(self.turns),
+            "turn_count": len(conversation_turns),
+            "nova_response_count": len(self.turns),
             "barge_in_count": self.barge_in_count,
             "usage": self.usage,
+            "conversation_turns": list(conversation_turns),
             "turns": list(self.turns),
             "transcripts": list(self.transcripts),
             "events_log": list(self.events_log),

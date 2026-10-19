@@ -97,6 +97,7 @@ def _call_summary(record: dict[str, Any]) -> dict[str, Any]:
         "twilio_latency_ms": record.get("twilio_latency_ms"),
         "ttft_ms": record.get("ttft_ms"),
         "turn_count": record.get("turn_count"),
+        "nova_response_count": record.get("nova_response_count"),
         "barge_in_count": record.get("barge_in_count"),
     }
 

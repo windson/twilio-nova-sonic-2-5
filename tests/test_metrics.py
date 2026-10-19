@@ -124,9 +124,22 @@ def test_metrics_full_synthetic_stream():
     assert m.call_sid == "CA-TEST"
     assert m.account_id == "ACC-1001"
 
-    # Turn count
+    # Nova response windows (response_id-based, preserved as secondary signal)
     assert len(m.turns) == 2
+    assert m.summary()["nova_response_count"] == 2
+
+    # Conversational turns: assistant opening segment + user segment = 2.
     assert m.summary()["turn_count"] == 2
+    assert len(m.conversation_turns) == 2
+    assert [t["speaker"] for t in m.conversation_turns] == ["assistant", "user"]
+    assert m.conversation_turns[0]["text"] == "Hello, this is Ava."
+    assert m.conversation_turns[1]["text"] == "I can pay next week."
+    # Assistant conversational turn carries ttft/latency from nearest response.
+    assert m.conversation_turns[0]["ttft_ms"] == 300.0
+    assert m.conversation_turns[0]["latency_ms"] == 160.0
+    # Every conversational turn exposes total_ms.
+    for t in m.conversation_turns:
+        assert "total_ms" in t
 
     # Per-turn duration
     assert m.turns[0]["duration_ms"] == 1000.0
@@ -167,7 +180,169 @@ def test_metrics_full_synthetic_stream():
     analytics = m.to_call_analytics()
     assert analytics["call_sid"] == "CA-TEST"
     assert len(analytics["turns"]) == 2
+    assert analytics["nova_response_count"] == 2
+    assert analytics["turn_count"] == 2
+    assert len(analytics["conversation_turns"]) == 2
     assert analytics["events_log"]  # in-depth log present
+
+
+def test_conversation_turns_from_alternation_with_shared_response_id():
+    """The core bug fix: Nova reuses ONE response_id across several user<->
+    assistant exchanges, yet the conversational turn_count must be > 1.
+
+    Also asserts conversation_turns carry speaker/text/total_ms and assistant
+    turns carry ttft_ms/latency_ms, while nova_response_count stays at the old
+    response_id-based value (here: 1, because of the single shared id).
+    """
+    clock = FakeClock()
+    m = CallMetrics(call_sid="CA-SHARED", account_id="ACC-1001", clock=clock)
+
+    clock.set(0.0)
+    m.on_session_start()
+
+    # Nova opens ONE response and keeps the same response_id for everything.
+    clock.set(0.5)
+    m.record_event(BidiResponseStartEvent(response_id="shared"))
+    # First audio -> TTFT 300ms for this (only) Nova response.
+    clock.set(0.8)
+    m.record_event(_audio_event())
+
+    # Assistant opening turn (AI speaks first).
+    clock.set(1.0)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="Hello, this is Ava from billing.", role="assistant",
+            is_final=True, current_transcript="Hello, this is Ava from billing.",
+        )
+    )
+    # User replies.
+    clock.set(1.5)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="Hi, what is this about?", role="user",
+            is_final=True, current_transcript="Hi, what is this about?",
+        )
+    )
+    # Assistant replies again (still same response_id).
+    clock.set(2.0)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="You have a balance of fifty dollars.", role="assistant",
+            is_final=True, current_transcript="You have a balance of fifty dollars.",
+        )
+    )
+    # User replies again.
+    clock.set(2.6)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="Okay, I will pay tomorrow.", role="user",
+            is_final=True, current_transcript="Okay, I will pay tomorrow.",
+        )
+    )
+
+    clock.set(3.0)
+    m.record_event(BidiResponseCompleteEvent(response_id="shared", stop_reason="complete"))
+    clock.set(3.5)
+    m.on_session_end()
+
+    # Old response_id-based count is 1 (the bug symptom), preserved distinctly.
+    assert m.summary()["nova_response_count"] == 1
+    assert len(m.turns) == 1
+
+    # Conversational turn_count reflects the real back-and-forth: 4 segments
+    # (assistant, user, assistant, user) -> > 1.
+    assert m.summary()["turn_count"] == 4
+    assert m.summary()["turn_count"] > 1
+
+    turns = m.conversation_turns
+    assert [t["speaker"] for t in turns] == ["assistant", "user", "assistant", "user"]
+    for t in turns:
+        assert t["text"]
+        assert "total_ms" in t
+    # Assistant turns carry ttft/latency (first assistant mapped to the one
+    # Nova response timing available).
+    assert turns[0]["ttft_ms"] == 300.0
+    assert "latency_ms" in turns[0]
+    assert "ttft_ms" in turns[2]
+
+
+def test_conversation_turns_join_consecutive_same_role_finals():
+    """Consecutive final transcripts of the same role collapse into one turn."""
+    clock = FakeClock()
+    m = CallMetrics(clock=clock)
+    clock.set(0.0)
+    m.on_session_start()
+
+    clock.set(1.0)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="Hello there.", role="assistant", is_final=True,
+            current_transcript="Hello there.",
+        )
+    )
+    clock.set(1.3)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="How can I help?", role="assistant", is_final=True,
+            current_transcript="How can I help?",
+        )
+    )
+    clock.set(2.0)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="I need help.", role="user", is_final=True,
+            current_transcript="I need help.",
+        )
+    )
+    clock.set(2.5)
+    m.on_session_end()
+
+    turns = m.conversation_turns
+    assert len(turns) == 2
+    assert turns[0]["speaker"] == "assistant"
+    assert turns[0]["text"] == "Hello there. How can I help?"
+    assert turns[0]["total_ms"] == 300.0  # 1300ms - 1000ms
+    assert turns[1]["speaker"] == "user"
+
+
+def test_user_partial_transcript_fallback_populates_chat():
+    """If only non-final user transcripts arrive, the latest partial is used so
+    the chat view is not empty.
+    """
+    clock = FakeClock()
+    m = CallMetrics(clock=clock)
+    clock.set(0.0)
+    m.on_session_start()
+
+    clock.set(1.0)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="Hello.", role="assistant", is_final=True,
+            current_transcript="Hello.",
+        )
+    )
+    # User only emits partial (non-final) transcripts.
+    clock.set(1.5)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta="I", text="I", role="user", is_final=False, current_transcript="I",
+        )
+    )
+    clock.set(1.8)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=" will pay", text="I will pay", role="user", is_final=False,
+            current_transcript="I will pay",
+        )
+    )
+    clock.set(2.0)
+    m.on_session_end()
+
+    turns = m.conversation_turns
+    speakers = [t["speaker"] for t in turns]
+    assert "user" in speakers
+    user_turn = next(t for t in turns if t["speaker"] == "user")
+    assert user_turn["text"] == "I will pay"
 
 
 def test_metrics_emits_json_log_lines_for_lifecycle(caplog):
