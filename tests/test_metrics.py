@@ -259,11 +259,32 @@ def test_conversation_turns_from_alternation_with_shared_response_id():
     for t in turns:
         assert t["text"]
         assert "total_ms" in t
-    # Assistant turns carry ttft/latency (first assistant mapped to the one
-    # Nova response timing available).
+
+    # The FIRST assistant turn maps to the one Nova response window available,
+    # so it carries a real TTFT labelled as coming from the response window.
     assert turns[0]["ttft_ms"] == 300.0
-    assert "latency_ms" in turns[0]
-    assert "ttft_ms" in turns[2]
+    assert turns[0]["ttft_source"] == "response_window"
+
+    # FINDING #1 fix: the LATER assistant turn (index 2) still gets a
+    # meaningful, NON-None per-utterance latency derived from the preceding
+    # user turn's last final transcript (1500ms) to this assistant turn's first
+    # final transcript (2000ms) = 500ms, even though Nova reused a single
+    # response_id and no response window is left for it.
+    assert turns[2]["speaker"] == "assistant"
+    assert turns[2]["latency_ms"] == 500.0
+    assert turns[2]["latency_ms"] is not None
+    # TTFT for the later turn cannot be derived per-utterance (Nova emits no
+    # per-utterance audio marker under a shared response_id), so it is honestly
+    # reported as unavailable rather than silently blank.
+    assert turns[2]["ttft_ms"] is None
+    assert turns[2]["ttft_source"] == "unavailable"
+
+    # total_ms (elapsed conversation time) is non-zero for turns that are a
+    # single final transcript, because it measures to the next turn's start.
+    # Turn 0 (assistant@1000ms) -> next turn (user@1500ms) = 500ms.
+    assert turns[0]["total_ms"] == 500.0
+    # Turn 1 (user@1500ms) -> next turn (assistant@2000ms) = 500ms.
+    assert turns[1]["total_ms"] == 500.0
 
 
 def test_conversation_turns_join_consecutive_same_role_finals():
@@ -301,8 +322,64 @@ def test_conversation_turns_join_consecutive_same_role_finals():
     assert len(turns) == 2
     assert turns[0]["speaker"] == "assistant"
     assert turns[0]["text"] == "Hello there. How can I help?"
-    assert turns[0]["total_ms"] == 300.0  # 1300ms - 1000ms
+    # Raw intra-segment span of the joined assistant finals (1300ms - 1000ms).
+    assert turns[0]["transcript_span_ms"] == 300.0
+    # total_ms is the elapsed time the turn occupied the conversation = span to
+    # the NEXT turn's start (user turn at 2000ms) - this turn's start (1000ms).
+    assert turns[0]["total_ms"] == 1000.0
     assert turns[1]["speaker"] == "user"
+
+
+def test_single_final_turn_total_ms_is_nonzero_elapsed():
+    """FINDING #2 fix: a turn made of a single final transcript must report a
+    sensible non-zero elapsed time (span to the next turn's start), not 0.
+
+    Also asserts the LAST turn falls back to its transcript span / session end,
+    and that the raw intra-segment span is still exposed as transcript_span_ms.
+    """
+    clock = FakeClock()
+    m = CallMetrics(clock=clock)
+    clock.set(0.0)
+    m.on_session_start()
+
+    # Each turn is a SINGLE final transcript -> intra-segment span is 0 for all.
+    clock.set(1.0)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="Hello, this is Ava.", role="assistant", is_final=True,
+            current_transcript="Hello, this is Ava.",
+        )
+    )
+    clock.set(2.5)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="I can pay next week.", role="user", is_final=True,
+            current_transcript="I can pay next week.",
+        )
+    )
+    clock.set(4.0)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="Great, thank you.", role="assistant", is_final=True,
+            current_transcript="Great, thank you.",
+        )
+    )
+    clock.set(6.0)
+    m.on_session_end()  # total_e2e = 6000ms
+
+    turns = m.conversation_turns
+    # Every segment is a single final -> raw span is 0 for all of them.
+    assert all(t["transcript_span_ms"] == 0.0 for t in turns)
+
+    # But total_ms (elapsed conversation time) is NON-zero and sensible:
+    # turn 0 (assistant@1000) -> next (user@2500) = 1500ms.
+    assert turns[0]["total_ms"] == 1500.0
+    # turn 1 (user@2500) -> next (assistant@4000) = 1500ms.
+    assert turns[1]["total_ms"] == 1500.0
+    # LAST turn (assistant@4000) has no following turn; its span is 0, so it
+    # falls back to the session end (6000ms) -> 2000ms.
+    assert turns[2]["total_ms"] == 2000.0
+    assert all(t["total_ms"] not in (None, 0.0) for t in turns)
 
 
 def test_user_partial_transcript_fallback_populates_chat():

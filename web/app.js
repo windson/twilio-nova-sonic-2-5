@@ -46,29 +46,37 @@ function fmtMoney(amount, currency) {
   }
 }
 
-// Build a CloudWatch Logs Insights console deep link scoped to a single call.
+// Build a CloudWatch Logs console "Log events" deep link scoped to a single
+// call (observations #3/#4).
 //
 // POC approach A (no new IAM, built entirely client-side): we link to the log
-// group's "Log events" search view with a filterPattern on the call_sid. The
-// CloudWatch console uses a custom fragment encoding where object keys/values
-// are joined with ~ and sub-objects are introduced with $25... escapes; the
-// log-group path is double-URL-encoded (each "/" -> %2F -> $252F). The log
-// events search URL is the most reliable shape to construct correctly:
+// group's "Log events" view with a filterPattern on the call_sid. The
+// CloudWatch console encodes this view in the URL fragment with a custom
+// scheme: the log-group path is double-URL-encoded (each "/" -> "%2F" -> the
+// console's "$252F"), and "?"/"=" inside the fragment are written as the
+// console escapes "$3F"/"$3D". The resulting shape is:
 //
 //   https://<region>.console.aws.amazon.com/cloudwatch/home?region=<region>
-//     #logsV2:log-groups/log-group/<enc log group>/log-events$3FfilterPattern$3D<call_sid>
+//     #logsV2:log-groups/log-group/<enc log group>/log-events$3FfilterPattern$3D<term>
 //
 // where <enc log group> is encodeURIComponent(logGroup) with each "%" further
-// encoded to "$25" (the console's fragment escape), and "$3F"/"$3D" stand in
-// for "?"/"=" inside the fragment.
+// encoded to "$25".
+//
+// filterPattern value: the CloudWatch Logs *log-events* filter treats a bare
+// alphanumeric token as a TERM match (it matches any event containing that
+// token). A Twilio call_sid ("CA" + 32 hex chars) is a single such token, so
+// we pass it PLAIN rather than wrapping it in quotes. A quoted "CAxxxx" is a
+// phrase filter and, for a token with no word-breaking characters, can fail to
+// match; the plain term is the robust choice here.
 function cloudwatchLogsUrl(callSid) {
   const region = state.awsRegion || "us-east-1";
   const logGroup = state.appLogGroup || "/ecs/ar-collections-nova-sonic/app";
   // Double-encode the log group: URL-encode, then turn "%" into the console's
   // "$25" fragment escape (so "/" -> "%2F" -> "$252F").
   const encGroup = encodeURIComponent(logGroup).replace(/%/g, "$25");
-  // filterPattern value: a quoted string so the SID is matched literally.
-  const filter = encodeURIComponent(`"${callSid}"`).replace(/%/g, "$25");
+  // Plain term (no surrounding quotes) so the log-events filter does a term
+  // match on the SID. Still encode in case of unexpected characters.
+  const filter = encodeURIComponent(callSid).replace(/%/g, "$25");
   const base = `https://${region}.console.aws.amazon.com/cloudwatch/home?region=${region}`;
   return (
     `${base}#logsV2:log-groups/log-group/${encGroup}/log-events` +
@@ -315,12 +323,19 @@ function chatSegments(record) {
   if (Array.isArray(turns) && turns.length) {
     return turns
       .slice()
-      .sort((a, b) => (a.start_ms || 0) - (b.start_ms || 0))
+      // Order by start_ms, then by the backend-assigned index as a stable
+      // secondary key so turns lacking timestamps keep spoken order.
+      .sort(
+        (a, b) =>
+          (a.start_ms || 0) - (b.start_ms || 0) ||
+          (a.index || 0) - (b.index || 0)
+      )
       .map((t) => ({
         speaker: t.speaker === "assistant" ? "assistant" : "user",
         text: t.text || "",
         totalMs: t.total_ms,
         ttftMs: t.ttft_ms,
+        ttftSource: t.ttft_source,
         latencyMs: t.latency_ms,
       }));
   }
@@ -337,6 +352,7 @@ function chatSegments(record) {
       text: t.text || "",
       totalMs: null,
       ttftMs: null,
+      ttftSource: null,
       latencyMs: null,
     }))
     .filter((s) => s.text);
@@ -370,8 +386,19 @@ function renderChat(record) {
     const parts = [];
     if (seg.totalMs != null) parts.push(`turn ${fmtMs(seg.totalMs)}`);
     if (seg.speaker === "assistant") {
-      if (seg.ttftMs != null) parts.push(`TTFT ${fmtMs(seg.ttftMs)}`);
+      // Latency is derivable per Sonic turn (caller-stop -> first reply), so
+      // we show it whenever available. TTFT comes from the Nova response
+      // window; when Nova reuses one response_id for the whole call, later
+      // turns have no per-utterance audio marker, so label TTFT honestly as
+      // unavailable instead of silently omitting it.
       if (seg.latencyMs != null) parts.push(`latency ${fmtMs(seg.latencyMs)}`);
+      if (seg.ttftMs != null) {
+        const label =
+          seg.ttftSource === "response_window" ? "TTFT (response)" : "TTFT";
+        parts.push(`${label} ${fmtMs(seg.ttftMs)}`);
+      } else if (seg.ttftSource === "unavailable") {
+        parts.push("TTFT n/a (shared response)");
+      }
     }
     meta.textContent = parts.join(" \u00b7 ");
 

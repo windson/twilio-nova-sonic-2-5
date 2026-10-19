@@ -437,10 +437,33 @@ class CallMetrics:
         """Build the user<->assistant conversational-turn model.
 
         Groups consecutive final transcripts by role into segments; each segment
-        is one conversational turn. Assistant segments are associated with the
-        nearest Nova response timing in :attr:`turns` (matched by closest start
-        time, since Nova may reuse a single ``response_id``) to attach
-        ``ttft_ms`` and ``latency_ms``.
+        is one conversational turn.
+
+        Turn duration semantics (``total_ms``): the value the UI shows as a
+        turn's "total time" is the ELAPSED time that turn occupied the
+        conversation, i.e. the span from this turn's ``start_ms`` to the NEXT
+        turn's ``start_ms``. A turn made of a single final transcript would have
+        an intra-segment span of 0 (``start_ms == end_ms``), which reads as a
+        broken measurement; measuring to the next turn's start gives a sensible
+        non-zero elapsed time whenever ordering allows it. For the LAST turn
+        (no following turn) we fall back to its own transcript span, and if that
+        is 0 we fall back to the session end. The raw intra-segment transcript
+        span is still exposed as ``transcript_span_ms`` for callers that want
+        the pure utterance duration.
+
+        Assistant TTFT/latency semantics: Nova Sonic may reuse a single
+        ``response_id`` for the whole call, so the response-window timing in
+        :attr:`turns` only yields one TTFT/latency window even when several
+        assistant turns occur. To give EVERY assistant turn a meaningful
+        latency, we always derive a per-utterance ``latency_ms`` from the
+        preceding user turn's last final transcript to this assistant turn's
+        first final transcript (how long the caller waited for Sonic to answer).
+        TTFT is taken from the matched response window when one is still
+        available for that turn (``ttft_source == "response_window"``);
+        otherwise, because Nova emits no per-utterance audio marker we cannot
+        derive a true first-token time for later turns, so ``ttft_ms`` is left
+        ``None`` with ``ttft_source == "unavailable"`` so the UI can label it
+        honestly rather than silently showing nothing.
 
         Returns:
             A list of conversational-turn dicts (also stored on
@@ -501,18 +524,68 @@ class CallMetrics:
             turns.append(seg)
             idx += 1
 
-        for seg in turns:
+        session_end_ms = self.total_e2e_ms
+        prev_user_end_ms: float | None = None
+        for i, seg in enumerate(turns):
             seg["text"] = " ".join(seg.pop("_texts")).strip()
             start_ms = seg.get("start_ms")
             end_ms = seg.get("end_ms")
+
+            # Raw intra-segment span (0 for a single-final turn) kept for callers
+            # that want the pure utterance duration.
             if start_ms is not None and end_ms is not None:
-                seg["total_ms"] = round(end_ms - start_ms, 3)
+                seg["transcript_span_ms"] = round(end_ms - start_ms, 3)
             else:
-                seg["total_ms"] = None
+                seg["transcript_span_ms"] = None
+
+            # Turn "total time" = elapsed time this turn occupied the
+            # conversation = span to the NEXT turn's start. See the docstring for
+            # why end_ms - start_ms (which is 0 for single-final turns) is a poor
+            # measure here.
+            total_ms: float | None = None
+            next_start = None
+            if i + 1 < len(turns):
+                next_start = turns[i + 1].get("start_ms")
+            if start_ms is not None and next_start is not None:
+                total_ms = round(next_start - start_ms, 3)
+            elif start_ms is not None:
+                # Last turn (or next start missing): own transcript span, then
+                # fall back to the session end so the value is not a bare 0.
+                span = seg["transcript_span_ms"]
+                if span:
+                    total_ms = span
+                elif session_end_ms is not None and session_end_ms >= start_ms:
+                    total_ms = round(session_end_ms - start_ms, 3)
+            seg["total_ms"] = total_ms
+
             if seg["speaker"] == "assistant":
+                # Per-utterance latency: from when the caller last finished
+                # speaking (preceding user turn's last final transcript) to this
+                # assistant turn's first final transcript. This is derivable for
+                # EVERY assistant turn, unlike the shared response window.
+                latency_ms: float | None = None
+                if prev_user_end_ms is not None and start_ms is not None:
+                    latency_ms = round(max(start_ms - prev_user_end_ms, 0.0), 3)
+
                 timing = self._closest_timing(start_ms, assistant_timings, used_timing)
-                seg["ttft_ms"] = timing.get("ttft_ms") if timing else None
-                seg["latency_ms"] = timing.get("turn_latency_ms") if timing else None
+                if timing is not None:
+                    seg["ttft_ms"] = timing.get("ttft_ms")
+                    seg["ttft_source"] = "response_window"
+                    # Prefer the response-window latency when we have it (it is
+                    # the user-stop -> response_start measure); else keep the
+                    # per-utterance transcript-derived latency.
+                    if timing.get("turn_latency_ms") is not None:
+                        latency_ms = timing.get("turn_latency_ms")
+                else:
+                    # No response window left for this turn (Nova reused one
+                    # response_id). We cannot derive a true per-utterance first-
+                    # token time, so TTFT is honestly unavailable; latency still
+                    # comes from the transcript gap above.
+                    seg["ttft_ms"] = None
+                    seg["ttft_source"] = "unavailable"
+                seg["latency_ms"] = latency_ms
+            elif seg["speaker"] == "user" and end_ms is not None:
+                prev_user_end_ms = end_ms
 
         self.conversation_turns = turns
         return turns

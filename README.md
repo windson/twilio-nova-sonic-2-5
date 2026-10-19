@@ -314,7 +314,11 @@ Sonic model ARN, DynamoDB RW on just the two tables, and CloudWatch Logs write.
   CloudWatch Logs "Log events" view pre-filtered to that call's `call_sid`. It
   is built entirely client-side from `aws_region` + `app_log_group` (both
   surfaced by `GET /api/config`, with `APP_LOG_GROUP` set on the task), so it
-  needs no extra IAM and no metrics pipeline.
+  needs no extra IAM and no metrics pipeline. The `call_sid` is passed as a
+  **plain `filterPattern` term** (not quoted): the Logs "Log events" filter
+  treats a bare alphanumeric token as a term match, which is what a Twilio
+  `call_sid` is, so a plain term matches reliably where a quoted phrase can not.
+  The link uses `stopPropagation` so clicking it does not also select the row.
 
 - **Conversational turns (what `turn_count` means).** A turn is one side of the
   user<->Nova Sonic alternation: a caller utterance answered by a Sonic utterance
@@ -334,6 +338,24 @@ Sonic model ARN, DynamoDB RW on just the two tables, and CloudWatch Logs write.
   driven by the `conversation_turns` field from `GET /api/calls/{id}` and falls
   back to the raw `transcripts` for older records. The raw per-event JSON log
   remains available under the collapsible "In-depth event log" panel.
+
+  - **Per-turn total time** (`total_ms`) is the elapsed time the turn occupied
+    the conversation — the span from the turn's start to the **next** turn's
+    start (the last turn falls back to its own transcript span, then the session
+    end). This is deliberately *not* `end − start` within the turn, because most
+    turns are a single final transcript whose intra-segment span is 0 and would
+    read as a broken "0 ms" measurement. The raw intra-segment span is still
+    available as `transcript_span_ms`.
+  - **Sonic TTFT / latency.** Because Nova Sonic can reuse one `response_id` for
+    the whole call, the response-window TTFT is only known for the turn that
+    maps to that window. Every Sonic turn still gets a real **latency**
+    (`latency_ms`), derived from the preceding caller turn's last final
+    transcript to this Sonic turn's first final transcript. **TTFT** is shown
+    when it comes from a response window (labelled `TTFT (response)`, with
+    `ttft_source = "response_window"`); for later turns under a shared
+    `response_id` Nova emits no per-utterance audio marker, so TTFT is honestly
+    labelled unavailable (`ttft_source = "unavailable"`) rather than left
+    silently blank.
 
 - **Model invocation logging is intentionally NOT enabled.** Bedrock model
   invocation logging only captures `Converse`/`ConverseStream`/`InvokeModel`/
