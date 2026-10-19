@@ -221,6 +221,29 @@ Sonic model ARN, DynamoDB RW on just the two tables, and CloudWatch Logs write.
    - `ViewerProtocolPolicy: redirect-to-https`, all 7 methods allowed;
    - `OriginReadTimeout` and `OriginKeepaliveTimeout` set to **60s** (the max).
 
+   **ALB ingress is locked to CloudFront when `EnableCloudFront=true`.** To make
+   the CloudFront TLS front door the *only* ingress path (so a plaintext
+   `ws://<alb-dns>/media` can no longer bypass CloudFront), the ALB security
+   group's `:80` ingress is restricted to the AWS-managed CloudFront prefix list
+   `com.amazonaws.global.cloudfront.origin-facing` (us-east-1 id `pl-3b927c52`,
+   passed via the `CloudFrontOriginFacingPrefixListId` parameter) instead of
+   `0.0.0.0/0`. CloudFront talks to the origin over `http-only:80`, so only the
+   `:80` rule is needed; adding a second `:443` prefix-list rule is unnecessary
+   and would exceed the 60-rule-per-SG limit (the managed prefix list has ~49
+   entries, each of which counts toward that quota). When `EnableCloudFront=false`
+   the original open `0.0.0.0/0` ingress on `:80`/`:443` is used instead. Resolve
+   the prefix list id for a region with:
+
+   ```bash
+   aws ec2 describe-managed-prefix-lists \
+     --filters Name=prefix-list-name,Values=com.amazonaws.global.cloudfront.origin-facing \
+     --region us-east-1 --query 'PrefixLists[0].PrefixListId' --output text
+   ```
+
+   Verify the boundary after deploy: `https://<dist>.cloudfront.net/healthz`
+   still returns **200**, while a direct `curl --max-time 10 http://<alb-dns>/healthz`
+   now **hangs/times out** (connection no longer accepted from outside CloudFront).
+
    Verify after deploy:
 
    ```bash

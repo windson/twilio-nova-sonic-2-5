@@ -74,8 +74,23 @@ Parameters:
       AWS-managed *.cloudfront.net TLS hostname so Twilio Media Streams can
       connect over wss://<dist>.cloudfront.net/media WITHOUT a custom domain or
       ACM certificate. When "true", PUBLIC_BASE_URL and the PublicBaseUrl output
-      resolve to the CloudFront domain. Leave "false" to keep the plain
-      HTTP:80/ALB (or the ACM custom-domain) behavior.
+      resolve to the CloudFront domain, AND the ALB ingress is locked down to
+      the CloudFront origin-facing managed prefix list so the raw ALB DNS can no
+      longer be reached directly over plaintext (the CloudFront edge becomes the
+      only ingress path). Leave "false" to keep the plain HTTP:80/ALB (or the
+      ACM custom-domain) behavior with open ingress.
+  CloudFrontOriginFacingPrefixListId:
+    Type: String
+    Default: pl-3b927c52
+    Description: >-
+      AWS-managed prefix list id for com.amazonaws.global.cloudfront.origin-facing
+      in this region (us-east-1 default: pl-3b927c52). Used to restrict the ALB
+      security group ingress to CloudFront edge IPs only when EnableCloudFront is
+      "true", enforcing the CloudFront TLS front door and closing the plaintext
+      ws://<alb-dns>/media bypass. Resolve with:
+      aws ec2 describe-managed-prefix-lists --filters
+      Name=prefix-list-name,Values=com.amazonaws.global.cloudfront.origin-facing
+      --region us-east-1.
 
 Conditions:
   # HTTPS/WSS is enabled only when an ACM certificate ARN is supplied, so the
@@ -86,6 +101,9 @@ Conditions:
   # Option 1: gate the CloudFront distribution + its outputs / PUBLIC_BASE_URL
   # branch so the template still validates and deploys when CloudFront is off.
   EnableCf: !Equals [!Ref EnableCloudFront, "true"]
+  # Inverse of EnableCf: open ALB ingress (0.0.0.0/0) only when CloudFront is
+  # off. When CloudFront is on, ingress is locked to the managed prefix list.
+  CloudFrontDisabled: !Not [!Equals [!Ref EnableCloudFront, "true"]]
 
 Resources:
   # --- DynamoDB persistence --------------------------------------------------
@@ -216,26 +234,64 @@ Resources:
                   - !Sub "${AppLogGroup.Arn}:*"
 
   # --- Networking / security groups -----------------------------------------
+  # ALB security group. Ingress is attached as separate SecurityGroupIngress
+  # resources (below) because a single CloudFormation ingress rule cannot mix
+  # CidrIp and SourcePrefixListId: when EnableCloudFront is "true" the ALB
+  # accepts :80/:443 ONLY from the CloudFront origin-facing managed prefix list
+  # (so the raw ALB DNS is unreachable over plaintext and the CloudFront TLS
+  # front door is enforced); when "false" it accepts :80/:443 from 0.0.0.0/0.
   AlbSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: Public ingress for the AR Collections ALB.
       VpcId: !Ref VpcId
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
-          CidrIp: 0.0.0.0/0
-          Description: HTTP (health checks; also redirected to HTTPS when TLS is on).
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: 0.0.0.0/0
-          Description: HTTPS/WSS - Twilio Media Streams WebSocket (wss://).
       SecurityGroupEgress:
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
           Description: Allow all egress.
+
+  # --- ALB ingress (CloudFront-only when Option 1 is enabled) ---------------
+  # EnableCloudFront=true: lock ingress to CloudFront edge IPs via the managed
+  # prefix list so only the CloudFront distribution can reach the ALB origin.
+  # Only the :80 rule is created: CloudFront talks to this origin over
+  # http-only on port 80 (see Distribution.OriginProtocolPolicy), and no
+  # HTTPS:443 listener exists on the ALB in the CloudFront path (HttpsListener
+  # requires a certificate). Referencing a managed prefix list counts its
+  # entry count (49) against the per-SG rule quota (60), so a second :443
+  # prefix-list rule would exceed the limit and is unnecessary here.
+  AlbIngressHttpCloudFront:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: EnableCf
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourcePrefixListId: !Ref CloudFrontOriginFacingPrefixListId
+      Description: HTTP from CloudFront origin-facing edge IPs only (Option 1).
+
+  # EnableCloudFront=false: original open ingress (plain ALB / ACM custom domain).
+  AlbIngressHttpOpen:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: CloudFrontDisabled
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: 0.0.0.0/0
+      Description: HTTP (health checks; also redirected to HTTPS when TLS is on).
+
+  AlbIngressHttpsOpen:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: CloudFrontDisabled
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      Description: HTTPS/WSS - Twilio Media Streams WebSocket (wss://).
 
   ServiceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
