@@ -79,22 +79,34 @@ cmd_deploy() {
   local uri
   uri="$(image_uri)"
 
-  # Optional TLS overrides. For a LIVE Twilio call both are required: Twilio
-  # Media Streams only connect over wss:// (TLS), and the raw ALB DNS has no
-  # certificate. Set CERTIFICATE_ARN (ACM) and PUBLIC_HOSTNAME (a DNS name that
-  # points at the ALB and that the cert covers) to add an HTTPS:443 listener
-  # and make PUBLIC_BASE_URL the TLS hostname.
+  # TLS options - two mutually-exclusive paths to a wss://-reachable endpoint
+  # (Twilio Media Streams only connect over TLS, and the raw ALB DNS has no
+  # certificate):
+  #
+  #   Option 1 (CloudFront, no domain needed): set ENABLE_CLOUDFRONT=true to put
+  #   an Amazon CloudFront distribution in front of the HTTP:80 ALB. CloudFront
+  #   supplies a FREE AWS-managed *.cloudfront.net TLS hostname and
+  #   PUBLIC_BASE_URL resolves to it, so TwiML emits
+  #   wss://<dist>.cloudfront.net/media. No ACM cert or custom DNS required.
+  #
+  #   Custom-domain path (ACM): set CERTIFICATE_ARN (ACM) and PUBLIC_HOSTNAME
+  #   (a DNS name that points at the ALB and that the cert covers) to add an
+  #   HTTPS:443 listener on the ALB and make PUBLIC_BASE_URL the TLS hostname.
+  #
+  # ENABLE_CLOUDFRONT defaults to "false" so existing behavior is preserved.
   local tls_overrides=()
+  tls_overrides+=("EnableCloudFront=${ENABLE_CLOUDFRONT:-false}")
   if [[ -n "${CERTIFICATE_ARN:-}" ]]; then
     tls_overrides+=("CertificateArn=${CERTIFICATE_ARN}")
   fi
   if [[ -n "${PUBLIC_HOSTNAME:-}" ]]; then
     tls_overrides+=("PublicHostname=${PUBLIC_HOSTNAME}")
   fi
-  if [[ ${#tls_overrides[@]} -eq 0 ]]; then
-    echo "==> WARNING: no CERTIFICATE_ARN/PUBLIC_HOSTNAME set - deploying an" \
-         "HTTP:80-only ALB. Twilio (wss://) will NOT connect to this; set both" \
-         "for a live call." >&2
+  if [[ "${ENABLE_CLOUDFRONT:-false}" != "true" && -z "${CERTIFICATE_ARN:-}" && -z "${PUBLIC_HOSTNAME:-}" ]]; then
+    echo "==> WARNING: no ENABLE_CLOUDFRONT=true and no CERTIFICATE_ARN/" \
+         "PUBLIC_HOSTNAME set - deploying an HTTP:80-only ALB. Twilio (wss://)" \
+         "will NOT connect to this; enable CloudFront (Option 1) or set both" \
+         "ACM values for a live call." >&2
   fi
 
   echo "==> Deploying stack ${STACK_NAME} with image ${uri}"
