@@ -230,6 +230,15 @@ Conditions:
   AdmitV6CloudFrontOrigin: !And
     - !Condition UseVpcOriginCond
     - !Condition HasV6PrefixList
+  # When the VPC-origin posture is active AND no PrivateSubnetIds were supplied,
+  # the stack provisions its own dualstack private subnets (PrivateSubnet1/2
+  # below) and wires the internal ALB, the Fargate service, and the private
+  # route-table associations to them. Supplying PrivateSubnetIds overrides this
+  # (an operator can bring existing private subnets), keeping the parameter path
+  # intact. !Join over the CommaDelimitedList yields "" only when it is empty.
+  ProvisionPrivateSubnets: !And
+    - !Condition UseVpcOriginCond
+    - !Equals [!Join ["", !Ref PrivateSubnetIds], ""]
   # Wire the OTLP endpoint env var only when an endpoint is actually supplied,
   # so the console/stdout path (the default) carries no empty OTLP config.
   HasOtelEndpoint: !Not [!Equals [!Ref OtelExporterOtlpEndpoint, ""]]
@@ -538,6 +547,72 @@ Resources:
       SourceSecurityGroupId: !Ref AlbSecurityGroup
       Description: App port reachable only from the ALB.
 
+  # --- Private networking the VPC origin requires (Option 2) -----------------
+  # The target VPC ships with only PUBLIC subnets and NO IPv6 CIDR, yet the
+  # internal ALB and the AWS::CloudFront::VpcOrigin are dualstack (a dualstack
+  # ALB in an IPv6-less VPC fails to create) and need PRIVATE subnets with no
+  # public IP. So, only under UseVpcOriginCond, the stack adds an
+  # Amazon-provided IPv6 /56 to the VPC and carves two dualstack private subnets
+  # from it. These are created only when UseVpcOrigin="true"; the default
+  # "false" path provisions none of them and stays byte-compatible. An operator
+  # who supplies PrivateSubnetIds bypasses the stack-created subnets (see the
+  # ProvisionPrivateSubnets condition), but the subnets below are still created
+  # (harmless, unreferenced) when UseVpcOrigin="true" with an explicit list.
+  VpcIpv6Cidr:
+    Type: AWS::EC2::VPCCidrBlock
+    Condition: UseVpcOriginCond
+    Properties:
+      VpcId: !Ref VpcId
+      AmazonProvidedIpv6CidrBlock: true
+
+  # Two private subnets in two AZs (!GetAZs picks the region's AZs wherever the
+  # stack deploys). VPC CIDR is 10.0.0.0/16 with 10.0.1.0/24 and 10.0.2.0/24
+  # already used by the two public subnets, so 10.0.11.0/24 and 10.0.12.0/24 do
+  # not overlap. A dualstack ALB requires its subnets to carry an IPv6 CIDR, so
+  # each subnet takes a /64 sliced from the VPC's Amazon-provided block and sets
+  # AssignIpv6AddressOnCreation. MapPublicIpOnLaunch is false (private).
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Condition: UseVpcOriginCond
+    Metadata:
+      # E1017: cfn-lint's bundled resource spec for AWS::EC2::VPCCidrBlock lists
+      # only IpSource/Ipv6AddressAttribute as GetAtt attributes and so rejects
+      # !GetAtt VpcIpv6Cidr.Ipv6CidrBlocks. This is a spec gap, not a real error:
+      # the live CloudFormation service accepts this attribute (confirmed via
+      # aws cloudformation validate-template), and it is the documented way to
+      # carve subnet /64s from an Amazon-provided /56. The GetAtt also enforces
+      # the create-after-VpcIpv6Cidr ordering (so no explicit DependsOn needed).
+      # Narrowly scoped to this single false positive.
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E1017
+    Properties:
+      VpcId: !Ref VpcId
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      AssignIpv6AddressOnCreation: true
+      Ipv6CidrBlock: !Select [0, !Cidr [!Select [0, !GetAtt VpcIpv6Cidr.Ipv6CidrBlocks], 2, 64]]
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Condition: UseVpcOriginCond
+    Metadata:
+      # E1017: same cfn-lint spec-gap false positive as PrivateSubnet1 (the live
+      # service accepts !GetAtt VpcIpv6Cidr.Ipv6CidrBlocks). Narrowly scoped.
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E1017
+    Properties:
+      VpcId: !Ref VpcId
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      AssignIpv6AddressOnCreation: true
+      Ipv6CidrBlock: !Select [1, !Cidr [!Select [0, !GetAtt VpcIpv6Cidr.Ipv6CidrBlocks], 2, 64]]
+
   # --- Private-subnet egress (Option 2: CloudFront VPC origin) ---------------
   # EGRESS DESIGN. When UseVpcOrigin=true the Fargate tasks move from public
   # subnets (AssignPublicIp=ENABLED, which gave them direct outbound internet)
@@ -603,11 +678,12 @@ Resources:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Condition: UseVpcOriginCond
     Metadata:
-      # W1035: cfn-lint resolves !Select against the empty-string DEFAULT of
-      # PrivateSubnetIds (an empty list) and flags the element against the
-      # AWS::EC2::Subnet::Id regex. False positive for the same reason as above:
-      # real subnet ids are supplied whenever this resource is actually created
-      # (UseVpcOrigin="true"); the empty default only keeps the "false" path
+      # W1035: on the supplied-list branch cfn-lint resolves !Select against the
+      # empty-string DEFAULT of PrivateSubnetIds (an empty list) and flags the
+      # element against the AWS::EC2::Subnet::Id regex. False positive: that
+      # branch is only taken when an operator actually supplies PrivateSubnetIds
+      # (ProvisionPrivateSubnets false); otherwise the stack-created
+      # PrivateSubnet1 is used. The empty default only keeps the "false" path
       # deployable.
       cfn-lint:
         config:
@@ -615,7 +691,10 @@ Resources:
             - W1035
     Properties:
       RouteTableId: !Ref PrivateRouteTable
-      SubnetId: !Select [0, !Ref PrivateSubnetIds]
+      SubnetId: !If
+        - ProvisionPrivateSubnets
+        - !Ref PrivateSubnet1
+        - !Select [0, !Ref PrivateSubnetIds]
 
   PrivateSubnet2RouteAssoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
@@ -628,7 +707,10 @@ Resources:
             - W1035
     Properties:
       RouteTableId: !Ref PrivateRouteTable
-      SubnetId: !Select [1, !Ref PrivateSubnetIds]
+      SubnetId: !If
+        - ProvisionPrivateSubnets
+        - !Ref PrivateSubnet2
+        - !Select [1, !Ref PrivateSubnetIds]
 
   # --- Application Load Balancer (WebSocket/WSS capable) ---------------------
   # When UseVpcOrigin=true the ALB is INTERNAL (no public IP) in the private
@@ -656,7 +738,16 @@ Resources:
       Type: application
       Scheme: !If [UseVpcOriginCond, internal, internet-facing]
       IpAddressType: !If [UseVpcOriginCond, dualstack, ipv4]
-      Subnets: !If [UseVpcOriginCond, !Ref PrivateSubnetIds, !Ref PublicSubnetIds]
+      # When the stack provisions its own private subnets, use them; when an
+      # operator supplied PrivateSubnetIds, use those; otherwise (VPC origin
+      # off) the public subnets.
+      Subnets: !If
+        - UseVpcOriginCond
+        - !If
+          - ProvisionPrivateSubnets
+          - [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+          - !Ref PrivateSubnetIds
+        - !Ref PublicSubnetIds
       SecurityGroups:
         - !Ref AlbSecurityGroup
       LoadBalancerAttributes:
@@ -938,7 +1029,13 @@ Resources:
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: !If [UseVpcOriginCond, DISABLED, ENABLED]
-          Subnets: !If [UseVpcOriginCond, !Ref PrivateSubnetIds, !Ref PublicSubnetIds]
+          Subnets: !If
+            - UseVpcOriginCond
+            - !If
+              - ProvisionPrivateSubnets
+              - [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+              - !Ref PrivateSubnetIds
+            - !Ref PublicSubnetIds
           SecurityGroups:
             - !Ref ServiceSecurityGroup
       LoadBalancers:
@@ -1097,3 +1194,13 @@ Outputs:
   CloudTrailName:
     Description: CloudTrail trail recording management events.
     Value: !Ref Trail
+  ProvisionedPrivateSubnetIds:
+    Condition: UseVpcOriginCond
+    Description: >-
+      The private subnet ids backing the internal ALB, the VPC origin ENI, and
+      the Fargate tasks when UseVpcOrigin="true": the stack-created subnets when
+      PrivateSubnetIds was left blank, else the operator-supplied list.
+    Value: !If
+      - ProvisionPrivateSubnets
+      - !Join [",", [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+      - !Join [",", !Ref PrivateSubnetIds]
