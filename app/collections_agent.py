@@ -11,7 +11,10 @@ seams :mod:`app.sonic_bridge` injects per call.
 
 from __future__ import annotations
 
+import calendar
 import logging
+import re
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from strands import tool
@@ -19,6 +22,158 @@ from strands import tool
 from app.store import DUE_STATUSES, Store, get_default_store
 
 logger = logging.getLogger(__name__)
+
+# Weekday names -> Python weekday() index (Monday=0 .. Sunday=6).
+_WEEKDAYS = {
+    "monday": 0,
+    "tuesday": 1,
+    "wednesday": 2,
+    "thursday": 3,
+    "friday": 4,
+    "saturday": 5,
+    "sunday": 6,
+}
+
+# Small number words so phrases like "in two weeks" resolve without digits.
+_NUMBER_WORDS = {
+    "a": 1,
+    "an": 1,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+}
+
+# Ordinal words -> 1-based index (for "first/second ... <weekday>").
+_ORDINAL_WORDS = {
+    "first": 1,
+    "1st": 1,
+    "second": 2,
+    "2nd": 2,
+    "third": 3,
+    "3rd": 3,
+    "fourth": 4,
+    "4th": 4,
+    "fifth": 5,
+    "5th": 5,
+    "last": -1,
+}
+
+
+def _add_months(d: date, months: int) -> date:
+    """Add ``months`` calendar months to ``d`` (clamping the day of month)."""
+    total = d.month - 1 + months
+    year = d.year + total // 12
+    month = total % 12 + 1
+    last_day = calendar.monthrange(year, month)[1]
+    return date(year, month, min(d.day, last_day))
+
+
+def _nth_weekday_of_month(year: int, month: int, weekday: int, n: int) -> date:
+    """Return the ``n``-th ``weekday`` of ``month``/``year`` (n=-1 => last)."""
+    if n == -1:
+        last_day = calendar.monthrange(year, month)[1]
+        d = date(year, month, last_day)
+        while d.weekday() != weekday:
+            d -= timedelta(days=1)
+        return d
+    first = date(year, month, 1)
+    offset = (weekday - first.weekday()) % 7
+    day = 1 + offset + (n - 1) * 7
+    last_day = calendar.monthrange(year, month)[1]
+    if day > last_day:
+        # Fewer than n of that weekday this month: clamp to the last one.
+        return _nth_weekday_of_month(year, month, weekday, -1)
+    return date(year, month, day)
+
+
+def _resolve_relative_date(phrase: str, reference_date: date) -> date | None:
+    """Convert a natural-language date phrase to a concrete :class:`date`.
+
+    Pure stdlib datetime math (no network, no sandbox) so it returns instantly
+    on the turn path. Handles, at minimum:
+
+    - ``tomorrow``
+    - ``next <weekday>`` (e.g. "next Monday")
+    - ``in N days/weeks/months`` (digits or small number words)
+    - ``next month 1st <weekday>`` / ``first <weekday> of next month``
+    - ``end of next month``
+
+    Returns ``None`` when the phrase cannot be understood.
+    """
+    text = (phrase or "").strip().lower()
+    if not text:
+        return None
+
+    # Already an ISO date -> pass through.
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        pass
+
+    if "tomorrow" in text:
+        return reference_date + timedelta(days=1)
+    if "today" in text:
+        return reference_date
+
+    # "end of next month" / "end of the month"
+    if "end of" in text and "month" in text:
+        months = 1 if "next" in text else 0
+        target = _add_months(reference_date, months)
+        last_day = calendar.monthrange(target.year, target.month)[1]
+        return date(target.year, target.month, last_day)
+
+    # Ordinal weekday of next month, both orderings:
+    #   "next month 1st monday", "first monday of next month"
+    if "next month" in text or ("next" in text and "month" in text):
+        weekday = next((_WEEKDAYS[w] for w in _WEEKDAYS if w in text), None)
+        if weekday is not None:
+            ordinal = next(
+                (_ORDINAL_WORDS[o] for o in _ORDINAL_WORDS if re.search(rf"\b{o}\b", text)),
+                1,
+            )
+            target_month = _add_months(reference_date.replace(day=1), 1)
+            return _nth_weekday_of_month(
+                target_month.year, target_month.month, weekday, ordinal
+            )
+
+    # "in N days/weeks/months"
+    m = re.search(r"in\s+(\d+|[a-z]+)\s+(day|week|month)s?", text)
+    if m:
+        qty_token, unit = m.group(1), m.group(2)
+        qty = int(qty_token) if qty_token.isdigit() else _NUMBER_WORDS.get(qty_token)
+        if qty is not None:
+            if unit == "day":
+                return reference_date + timedelta(days=qty)
+            if unit == "week":
+                return reference_date + timedelta(weeks=qty)
+            if unit == "month":
+                return _add_months(reference_date, qty)
+
+    # "next <weekday>" (strictly the following week's occurrence).
+    if "next" in text:
+        weekday = next((_WEEKDAYS[w] for w in _WEEKDAYS if w in text), None)
+        if weekday is not None:
+            days_ahead = (weekday - reference_date.weekday()) % 7
+            days_ahead = days_ahead + 7 if days_ahead == 0 else days_ahead
+            return reference_date + timedelta(days=days_ahead)
+
+    # Bare "<weekday>" -> the next upcoming occurrence (today counts as +7).
+    weekday = next((_WEEKDAYS[w] for w in _WEEKDAYS if w in text), None)
+    if weekday is not None:
+        days_ahead = (weekday - reference_date.weekday()) % 7
+        days_ahead = days_ahead or 7
+        return reference_date + timedelta(days=days_ahead)
+
+    return None
 
 
 def _format_amount(record: Mapping[str, Any]) -> str:
@@ -66,6 +221,13 @@ def get_system_prompt(due_record: Mapping[str, Any]) -> str:
         "- You are an AI assistant; if asked, say so plainly.\n"
         "- Do not provide legal, tax, or financial advice.\n"
         "- Keep each spoken turn short and natural for a phone conversation.\n\n"
+        "Handling dates:\n"
+        "- If the debtor gives a relative or natural-language date (for example "
+        "'next month, the first Monday', 'in two weeks', 'next Friday', or "
+        "'the end of next month'), call the `compute_future_date` tool with "
+        "that phrase to resolve it to a concrete YYYY-MM-DD date. Confirm the "
+        "resolved date with the debtor, then pass it as promised_date to "
+        "`update_due_record`.\n\n"
         "Recording the outcome:\n"
         "- When the conversation reaches an outcome, call the "
         "`update_due_record` tool exactly once with the right new_status "
@@ -149,4 +311,55 @@ def build_tools(store: Store | None = None) -> list[Any]:
         _ = record  # record kept for potential future use/logging
         return confirmation
 
-    return [update_due_record]
+    @tool
+    def compute_future_date(phrase: str, reference_date: str | None = None) -> str:
+        """Resolve a natural-language date phrase to a concrete calendar date.
+
+        This is the in-call "code interpreter" tool: it performs deterministic,
+        purely-local stdlib date math (no network, no sandbox) so it returns
+        within the turn without adding meaningful latency. Call it whenever the
+        debtor gives a relative or natural-language date so you can confirm and
+        record a concrete date.
+
+        Args:
+            phrase: A natural-language date phrase, e.g. "next month 1st Monday",
+                "first Monday of next month", "in two weeks", "in 10 days",
+                "next Friday", "end of next month", or "tomorrow".
+            reference_date: Optional ISO date (YYYY-MM-DD) to compute relative
+                to. Defaults to today (UTC).
+
+        Returns:
+            A short sentence containing the resolved ISO date (YYYY-MM-DD) that
+            the assistant can speak and pass to
+            ``update_due_record.promised_date``.
+        """
+        if reference_date:
+            try:
+                ref = datetime.strptime(reference_date.strip(), "%Y-%m-%d").date()
+            except ValueError:
+                ref = datetime.now(timezone.utc).date()
+        else:
+            ref = datetime.now(timezone.utc).date()
+
+        resolved = _resolve_relative_date(phrase, ref)
+        if resolved is None:
+            logger.info(
+                "phrase=<%s> | compute_future_date: unparseable phrase",
+                phrase,
+                extra={"event_type": "tool_invocation", "tool": "compute_future_date"},
+            )
+            return (
+                f"I couldn't work out a specific date from '{phrase}'. Could you "
+                "give me a specific day?"
+            )
+
+        iso = resolved.isoformat()
+        logger.info(
+            "phrase=<%s>, resolved=<%s> | compute_future_date",
+            phrase,
+            iso,
+            extra={"event_type": "tool_invocation", "tool": "compute_future_date"},
+        )
+        return f"That date is {iso}."
+
+    return [update_due_record, compute_future_date]

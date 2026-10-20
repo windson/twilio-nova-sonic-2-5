@@ -27,6 +27,10 @@ def _settings() -> Settings:
     return Settings(
         nova_model_id="amazon.nova-2-5-sonic",
         aws_region="us-west-2",
+        app_log_group="/ecs/ar-collections-nova-sonic/app",
+        extraction_model_id="amazon.nova-lite-v1:0",
+        payment_link_base_url="https://pay.example.com/",
+        twilio_trial_mode=True,
         twilio_account_sid=None,
         twilio_auth_token=None,
         twilio_from_number=None,

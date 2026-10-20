@@ -11,6 +11,12 @@ built-in analytics dashboard.
 
 ## Architecture
 
+A full, numbered AWS architecture diagram (Twilio -> CloudFront -> ALB -> ECS ->
+Nova Sonic, the in-call tools, DynamoDB, the async post-call intelligence path,
+the downstream triggers, and observability) is in
+[docs/architecture.md](docs/architecture.md). The quick picture of the live
+audio path:
+
 ```
   PSTN caller                Twilio Media Streams            This app (FastAPI)
   (phone)  <----- audio ----> (telephony transport) <== WebSocket /media ==>  |
@@ -43,6 +49,15 @@ built-in analytics dashboard.
   transport latency vs Nova Sonic active time split, TTFT (time to first audio),
   turn count, and per-turn duration/latency. Emitted as one JSON object per line
   to stdout (CloudWatch-friendly) and persisted for the dashboard.
+  - **Turns are per utterance.** A user utterance is one turn and a Sonic
+    utterance is another; the dashboard shows the total count of such turns and
+    the duration of each. Consecutive same-role utterances are counted
+    separately (not merged). The grouped user<->assistant view is kept
+    separately as `conversation_turns` for the chat transcript.
+  - **Nova Sonic total time = sum of the durations of Nova's outbound audio
+    frames** (PCM16 mono 24 kHz: `ms = bytes / (2 * 24000)`). This replaces the
+    earlier response-window sum, which under-counted because Nova reuses a
+    single `response_id` across the call.
 
 > **Verified AWS fact:** `amazon.nova-2-5-sonic` is available in Amazon Bedrock
 > in **us-east-1** with **streaming = true**. The bi-di operation to grant in
@@ -135,7 +150,10 @@ built-in analytics dashboard.
 6. **Watch the dashboard** at `http://localhost:8080/` — it lists due records and
    past calls, and shows per-call metrics (total e2e, Twilio-vs-Nova split, TTFT,
    turn count), a per-turn timeline, and an in-depth event log that updates live
-   while a call is active.
+   while a call is active. The turn count is per utterance (each user utterance
+   and each Sonic utterance is one turn) and the per-turn table shows the
+   duration of each; "Nova Sonic total time" is the summed duration of Nova's
+   outbound audio frames.
 
 ## AWS deploy
 
@@ -145,7 +163,21 @@ The IaC (`infra/template.yaml`) provisions an **ECS Fargate** service behind an
 **dashboard**, a **CloudTrail** management-event trail to an S3 bucket, and a
 **least-privilege IAM task role** granting
 `bedrock:InvokeModelWithBidirectionalStream` + `bedrock:InvokeModel` on the Nova
-Sonic model ARN, DynamoDB RW on just the two tables, and CloudWatch Logs write.
+Sonic model ARN, a separate scoped `bedrock:InvokeModel` grant on the text
+extraction model ARN for the post-call Converse extraction, DynamoDB RW on just
+the two tables, and CloudWatch Logs write. The post-call PTP payment-link SMS
+needs no new IAM (it reuses existing egress + the Secrets-Manager Twilio
+credentials).
+
+> **Extraction model / IAM coupling.** The text-extraction model is set once via
+> the `ExtractionModelId` CloudFormation parameter (default
+> `amazon.nova-lite-v1:0`; also allows `amazon.nova-micro-v1:0`). That single
+> parameter drives BOTH the `EXTRACTION_MODEL_ID` container env var AND the
+> `Resource` ARN of the `bedrock-text-extraction` IAM grant, so the model the
+> app invokes and the model IAM permits can never drift. To use a different
+> model, add it to the parameter's `AllowedValues` and redeploy — do not set
+> `EXTRACTION_MODEL_ID` out of band, or the Converse call will be access-denied
+> at runtime (surfacing as `intelligence_status = failed`).
 
 `scripts/deploy.sh` wraps the steps (run the pieces yourself as needed):
 
@@ -221,6 +253,29 @@ Sonic model ARN, DynamoDB RW on just the two tables, and CloudWatch Logs write.
    - `ViewerProtocolPolicy: redirect-to-https`, all 7 methods allowed;
    - `OriginReadTimeout` and `OriginKeepaliveTimeout` set to **60s** (the max).
 
+   **ALB ingress is locked to CloudFront when `EnableCloudFront=true`.** To make
+   the CloudFront TLS front door the *only* ingress path (so a plaintext
+   `ws://<alb-dns>/media` can no longer bypass CloudFront), the ALB security
+   group's `:80` ingress is restricted to the AWS-managed CloudFront prefix list
+   `com.amazonaws.global.cloudfront.origin-facing` (us-east-1 id `pl-3b927c52`,
+   passed via the `CloudFrontOriginFacingPrefixListId` parameter) instead of
+   `0.0.0.0/0`. CloudFront talks to the origin over `http-only:80`, so only the
+   `:80` rule is needed; adding a second `:443` prefix-list rule is unnecessary
+   and would exceed the 60-rule-per-SG limit (the managed prefix list has ~49
+   entries, each of which counts toward that quota). When `EnableCloudFront=false`
+   the original open `0.0.0.0/0` ingress on `:80`/`:443` is used instead. Resolve
+   the prefix list id for a region with:
+
+   ```bash
+   aws ec2 describe-managed-prefix-lists \
+     --filters Name=prefix-list-name,Values=com.amazonaws.global.cloudfront.origin-facing \
+     --region us-east-1 --query 'PrefixLists[0].PrefixListId' --output text
+   ```
+
+   Verify the boundary after deploy: `https://<dist>.cloudfront.net/healthz`
+   still returns **200**, while a direct `curl --max-time 10 http://<alb-dns>/healthz`
+   now **hangs/times out** (connection no longer accepted from outside CloudFront).
+
    Verify after deploy:
 
    ```bash
@@ -268,6 +323,124 @@ Sonic model ARN, DynamoDB RW on just the two tables, and CloudWatch Logs write.
 > a CloudFormation template because it validates cleanly with `cfn-lint`
 > **without** needing `cdk bootstrap`. (Recorded in FEAT-005 findings.)
 
+## Post-call intelligence (disposition, structured data, next-best-action)
+
+After a call ends, the app extracts two key artifacts and runs the matching
+downstream automation. All of this runs **asynchronously, off the real-time
+audio path** (see the no-latency guarantee below), so it cannot add to call
+latency. The full flow is drawn as phases 6-9 in
+[docs/architecture.md](docs/architecture.md).
+
+### 1. Call Disposition (the "what happened")
+
+A standardized, high-level outcome tag used to update the CRM, route/stop
+automated workflows, and stay compliant. The taxonomy is the `CALL_DISPOSITIONS`
+tuple in `app/store.py` (disposition is richer than, and separate from, the
+`DUE_STATUSES` on the due record):
+
+| Disposition | Meaning | Downstream directive |
+| --- | --- | --- |
+| `promise_to_pay` (PTP) | Debtor committed to a date/amount | **Send a payment-link SMS and pause** further automated collection (`collection_paused = true`) |
+| `dispute_raised` | Debtor disputes the balance | **Escalate to a human specialist** (`escalated = true`) + escalation event |
+| `refusal_to_pay` | Debtor explicitly refuses | Route to a human collections strategy queue |
+| `inbound_callback_requested` | Debtor will call back / asked for a callback | Schedule a follow-up touchpoint |
+| `wrong_number` | Reached the wrong party | Flag so the number is not re-dialed |
+| `no_answer` | Nobody picked up | Reschedule per retry policy |
+| `left_voicemail` | Voicemail left | Reschedule and wait for callback |
+| `already_paid` | Debtor says it is already paid | Verify/reconcile; pause collection |
+| `undetermined` | Could not be classified | Leave for human review; no automated trigger |
+
+The two key triggers (`app/postcall.py`):
+
+- **PTP ->** pause auto-collection on the account, then attempt a **real**
+  payment-link SMS via `app/twilio_client.send_sms` (reusing the existing Twilio
+  REST client + Secrets-Manager credentials; the link is built from
+  `PAYMENT_LINK_BASE_URL` + `account_id`).
+- **Dispute Raised ->** set `escalated = true` and emit an
+  `escalation_to_human_specialist` event.
+
+> **Twilio TRIAL limitation + SMS destination.** The SMS destination is
+> **trial-aware** (`TWILIO_TRIAL_MODE`, default `true`):
+>
+> - **Trial mode (`true`)** — the verified number is the only legal destination,
+>   so the payment link is pinned to `TWILIO_VERIFIED_CALLER_ID` regardless of
+>   the debtor.
+> - **Full account (`false`)** — the SMS addresses the **debtor's own `phone`**
+>   from the account record, falling back to the verified id only when the
+>   record carries no phone.
+>
+> The send is always attempted for real; the outcome is **logged and flagged**
+> via `ptp_sms_status` (`sent` | `blocked_trial` on a trial block | `failed` on a
+> genuine error), **never faked**. The destination is recorded on the call
+> record as `ptp_sms_to` in a **masked** form (last four digits only) so an
+> auditor can see where the link went without the full number leaking. The demo
+> seed records (`ACC-1001`/`ACC-1002`) ship with `phone = null`, so they fall
+> back to the verified id until a real number is set.
+
+### 2. Structured Conversation Data & Next-Best-Action (the "why & what's next")
+
+The extracted entities, payment details, and behavioral insights, plus the exact
+next step. Stored on the CallAnalytics record (`app/store.py`) as:
+
+```
+structured_data:
+  payment_specifics:
+    promised_amount             # number (stored as Decimal in DynamoDB)
+    agreed_date                 # resolved YYYY-MM-DD
+    preferred_payment_method    # e.g. card, bank transfer
+  contextual_data:
+    reason_for_delinquency      # e.g. medical emergency, temporary unemployment
+    customer_sentiment          # e.g. cooperative, hostile
+next_best_action                # e.g. "Schedule follow-up call on YYYY-MM-DD"
+```
+
+These fields are **extracted post-call via the Bedrock Converse API on the TEXT
+model `amazon.nova-lite-v1:0`** (`EXTRACTION_MODEL_ID`; `app/postcall.py` prompts
+for a strict JSON object and parses it defensively). Until extraction completes
+they stay blank (`intelligence_status = pending`); the dashboard renders blank
+placeholders and fills them in when `intelligence_status` becomes `ready`.
+
+### 3. The `compute_future_date` code-interpreter tool
+
+To turn relative phrases the debtor speaks (e.g. "I'll pay next month, the first
+Monday") into a concrete date, the agent calls a **custom Strands `@tool`**,
+`compute_future_date(phrase, reference_date=None)` in `app/collections_agent.py`
+(same `@tool` decorator pattern as `update_due_record`, which Nova Sonic already
+invokes in-call). It does deterministic, purely-local **stdlib `datetime`** math
+(no network, no sandbox), so it returns within the turn.
+
+**Why a custom `@tool` and not the vended `python_repl` or AgentCore:** Strands'
+vended `strands.vended_tools.python_repl` requires a configured Sandbox (local
+Docker / microVM / SSH host) to execute code. Local Docker is broken in this
+environment (podman shim) and a sandbox is heavy overkill for a tiny date
+computation; AWS Bedrock AgentCore's code interpreter is likewise unnecessary
+infrastructure here. A custom `@tool` is the correct, lowest-risk API.
+
+Example: with a reference date in May 2024, `"next month 1st Monday"` resolves to
+`2024-06-03`. Other handled phrases include `"in two weeks"`, `"next Friday"`,
+`"end of next month"`, and `"tomorrow"`.
+
+The **same date math** is reused post-call in `app/postcall.py` to resolve a
+relative `agreed_date` phrase returned by the extraction model into a concrete
+ISO date.
+
+### Async / no-latency guarantee
+
+The in-call tools (`update_due_record`, `compute_future_date`) are cheap and
+local, but the **expensive work** (LLM disposition classification + structured
+extraction + the downstream triggers) runs **after the call ends**, off the
+audio/turn path, as a fire-and-forget `asyncio` task launched from the `/media`
+WebSocket finally-block in `app/main.py` (`extract_and_apply` in
+`app/postcall.py`). The call-latency metrics (`total_e2e_ms`, `nova_total_ms`,
+`ttft_ms`) are computed on the audio path (`session_start`..`session_end`) and
+are frozen before the post-call task runs, so it provably cannot inflate them.
+
+This is enforced by a test:
+`tests/test_postcall.py::test_no_added_latency_postcall_does_not_touch_call_metrics`
+drives a synthetic `CallMetrics` session to fixed values, then runs
+`extract_and_apply` and asserts the three metrics are **byte-for-byte
+unchanged**.
+
 ## Observability
 
 - **CloudWatch Logs.** App logs are one JSON object per line (call placed, stream
@@ -280,7 +453,69 @@ Sonic model ARN, DynamoDB RW on just the two tables, and CloudWatch Logs write.
 
 - **CloudWatch Dashboard** (`<stack>-observability`): call volume (ALB request
   count), average TTFT, request latency, and a live log widget. Open the
-  `DashboardUrl` stack output in the console.
+  `DashboardUrl` stack output in the console. The dashboard's
+  `ARCollections/TTFTms` widget is an aspirational custom-metric placeholder:
+  nothing emits that metric yet, so it reads empty. Wiring it live would mean
+  emitting per-call custom metrics via `cloudwatch:PutMetricData` (POC approach
+  B, which would also add that IAM action to the task role).
+
+- **Per-call CloudWatch deep link (POC approach A).** Each row in the dashboard
+  "Past calls" table has a **Logs** link that opens the app log group's
+  CloudWatch Logs "Log events" view pre-filtered to that call's `call_sid`. It
+  is built entirely client-side from `aws_region` + `app_log_group` (both
+  surfaced by `GET /api/config`, with `APP_LOG_GROUP` set on the task), so it
+  needs no extra IAM and no metrics pipeline. The `call_sid` is passed as a
+  **plain `filterPattern` term** (not quoted): the Logs "Log events" filter
+  treats a bare alphanumeric token as a term match, which is what a Twilio
+  `call_sid` is, so a plain term matches reliably where a quoted phrase can not.
+  The link uses `stopPropagation` so clicking it does not also select the row.
+
+- **Conversational turns (what `turn_count` means).** A turn is one side of the
+  user<->Nova Sonic alternation: a caller utterance answered by a Sonic utterance
+  is the back-and-forth. `turn_count` is derived from the
+  `BidiTranscriptStreamEvent` `role` (`user`/`assistant`) + `is_final` alternation,
+  not from Nova response IDs. This **replaced the earlier `response_id`-based
+  grouping** because in live calls Nova Sonic reused a single `response_id` for
+  the entire exchange, so counting matched response-start/response-complete pairs
+  reported `turn_count = 1` even when there were several user<->Sonic
+  alternations. The `response_id` grouping is retained only as a secondary
+  Nova-response timing signal (`nova_response_count`). See
+  `CallMetrics._build_conversation_turns` in `app/metrics.py`.
+
+- **Conversation (chat) view.** The call detail panel reconstructs the call as a
+  chat transcript (caller vs Nova Sonic, ordered by start time, in text),
+  showing the time each turn took and, for Sonic turns, TTFT and latency. It is
+  driven by the `conversation_turns` field from `GET /api/calls/{id}` and falls
+  back to the raw `transcripts` for older records. The raw per-event JSON log
+  remains available under the collapsible "In-depth event log" panel.
+
+  - **Per-turn total time** (`total_ms`) is the elapsed time the turn occupied
+    the conversation — the span from the turn's start to the **next** turn's
+    start (the last turn falls back to its own transcript span, then the session
+    end). This is deliberately *not* `end − start` within the turn, because most
+    turns are a single final transcript whose intra-segment span is 0 and would
+    read as a broken "0 ms" measurement. The raw intra-segment span is still
+    available as `transcript_span_ms`.
+  - **Sonic TTFT / latency.** Because Nova Sonic can reuse one `response_id` for
+    the whole call, the response-window TTFT is only known for the turn that
+    maps to that window. Every Sonic turn still gets a real **latency**
+    (`latency_ms`), derived from the preceding caller turn's last final
+    transcript to this Sonic turn's first final transcript. **TTFT** is shown
+    when it comes from a response window (labelled `TTFT (response)`, with
+    `ttft_source = "response_window"`); for later turns under a shared
+    `response_id` Nova emits no per-utterance audio marker, so TTFT is honestly
+    labelled unavailable (`ttft_source = "unavailable"`) rather than left
+    silently blank.
+
+- **Model invocation logging is intentionally NOT enabled.** Bedrock model
+  invocation logging only captures `Converse`/`ConverseStream`/`InvokeModel`/
+  `InvokeModelWithResponseStream`. Nova Sonic bi-directional streaming uses
+  `InvokeModelWithBidirectionalStream`, which that feature does not cover, so it
+  would not record any turn/TTFT ground truth here (and there is no
+  CloudFormation resource for it — it is an account-level API). Turn semantics
+  are therefore derived from the Strands `BidiTranscriptStreamEvent`
+  user/assistant alternation plus response-start/first-audio timing. See the
+  comment near the turn-counting logic in `app/metrics.py`.
 
 - **CloudTrail.** A multi-region management-event trail writes to the encrypted,
   private S3 bucket created by the stack. Use it (and CloudWatch) to diagnose

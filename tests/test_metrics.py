@@ -7,6 +7,7 @@ clock, and the computed metrics are asserted against hand-computed expectations.
 
 from __future__ import annotations
 
+import base64
 import logging
 
 from app.metrics import CallMetrics
@@ -35,6 +36,23 @@ class FakeClock:
 
 def _audio_event() -> BidiAudioStreamEvent:
     return BidiAudioStreamEvent(audio="AAAA", format="pcm", sample_rate=24000, channels=1)
+
+
+# Decoded byte length of the small "AAAA" payload used by _audio_event().
+# base64 "AAAA" decodes to 3 bytes. For PCM16 mono 24 kHz the frame duration is
+# decoded_bytes / (2 * 24000 * 1) * 1000 ms = decoded_bytes / 48 ms.
+_SMALL_FRAME_BYTES = len(base64.b64decode("AAAA"))
+_SMALL_FRAME_MS = _SMALL_FRAME_BYTES / 48.0
+
+
+def _audio_event_bytes(num_bytes: int) -> BidiAudioStreamEvent:
+    """Build a BidiAudioStreamEvent whose decoded PCM payload is exactly
+    ``num_bytes`` bytes, so the Nova speaking-time contribution is deterministic.
+
+    PCM16 mono 24 kHz: ms = num_bytes / (2 * 24000) * 1000 = num_bytes / 48.
+    """
+    payload = base64.b64encode(b"\x00" * num_bytes).decode()
+    return BidiAudioStreamEvent(audio=payload, format="pcm", sample_rate=24000, channels=1)
 
 
 def test_metrics_full_synthetic_stream():
@@ -124,9 +142,27 @@ def test_metrics_full_synthetic_stream():
     assert m.call_sid == "CA-TEST"
     assert m.account_id == "ACC-1001"
 
-    # Turn count
+    # Nova response windows (response_id-based, preserved as secondary signal)
     assert len(m.turns) == 2
+    assert m.summary()["nova_response_count"] == 2
+
+    # Headline turn_count is now PER-UTTERANCE: each final user/assistant
+    # transcript counts separately. Here: one assistant final + one user final
+    # = 2 utterance turns.
     assert m.summary()["turn_count"] == 2
+
+    # The GROUPED conversation_turns (chat view) still exist as a secondary
+    # model: assistant opening segment + user segment = 2.
+    assert len(m.conversation_turns) == 2
+    assert [t["speaker"] for t in m.conversation_turns] == ["assistant", "user"]
+    assert m.conversation_turns[0]["text"] == "Hello, this is Ava."
+    assert m.conversation_turns[1]["text"] == "I can pay next week."
+    # Assistant conversational turn carries ttft/latency from nearest response.
+    assert m.conversation_turns[0]["ttft_ms"] == 300.0
+    assert m.conversation_turns[0]["latency_ms"] == 160.0
+    # Every conversational turn exposes total_ms.
+    for t in m.conversation_turns:
+        assert "total_ms" in t
 
     # Per-turn duration
     assert m.turns[0]["duration_ms"] == 1000.0
@@ -144,11 +180,16 @@ def test_metrics_full_synthetic_stream():
     # Total end-to-end
     assert m.total_e2e_ms == 4000.0
 
-    # Nova total = sum of active response windows = 1000 + 700 = 1700
-    assert m.nova_total_ms == 1700.0
+    # CORRECTED Nova total = sum of outbound audio-frame durations. This stream
+    # feeds three _audio_event() frames (t=1.5, t=1.7, t=3.35), each a 3-byte
+    # PCM payload => 3 * (3/48) ms. The OLD response-window sum (1000 + 700 =
+    # 1700ms) is now reported SEPARATELY as nova_response_window_ms.
+    assert m.nova_total_ms == round(3 * _SMALL_FRAME_MS, 3)
+    assert m.nova_response_window_ms == 1700.0
+    assert m.nova_total_ms != m.nova_response_window_ms
 
-    # Twilio vs Nova split: non-nova share = total - nova
-    assert m.non_nova_ms == 2300.0
+    # Twilio vs Nova split: non-nova share = max(total - corrected nova, 0).
+    assert m.non_nova_ms == round(4000.0 - m.nova_total_ms, 3)
     # Twilio transport delay mean of [20, 40] = 30ms
     assert m.twilio_latency_ms == 30.0
 
@@ -163,11 +204,259 @@ def test_metrics_full_synthetic_stream():
     roles = {t["role"] for t in m.transcripts if t["is_final"]}
     assert {"assistant", "user"} <= roles
 
-    # Serializable analytics round-trip shape
+    # Serializable analytics round-trip shape.
     analytics = m.to_call_analytics()
     assert analytics["call_sid"] == "CA-TEST"
+    # 'turns' is now the PER-UTTERANCE list (one assistant + one user = 2).
     assert len(analytics["turns"]) == 2
+    assert [t["speaker"] for t in analytics["turns"]] == ["assistant", "user"]
+    for t in analytics["turns"]:
+        assert set(("index", "speaker", "text", "duration_ms")) <= set(t)
+    # response_id windows preserved separately.
+    assert analytics["nova_response_count"] == 2
+    assert len(analytics["nova_response_turns"]) == 2
+    # Headline turn_count is the per-utterance count.
+    assert analytics["turn_count"] == 2
+    # Grouped chat model still present.
+    assert len(analytics["conversation_turns"]) == 2
     assert analytics["events_log"]  # in-depth log present
+
+
+def test_conversation_turns_from_alternation_with_shared_response_id():
+    """The core bug fix: Nova reuses ONE response_id across several user<->
+    assistant exchanges, yet the conversational turn_count must be > 1.
+
+    Also asserts conversation_turns carry speaker/text/total_ms and assistant
+    turns carry ttft_ms/latency_ms, while nova_response_count stays at the old
+    response_id-based value (here: 1, because of the single shared id).
+    """
+    clock = FakeClock()
+    m = CallMetrics(call_sid="CA-SHARED", account_id="ACC-1001", clock=clock)
+
+    clock.set(0.0)
+    m.on_session_start()
+
+    # Nova opens ONE response and keeps the same response_id for everything.
+    clock.set(0.5)
+    m.record_event(BidiResponseStartEvent(response_id="shared"))
+    # First audio -> TTFT 300ms for this (only) Nova response.
+    clock.set(0.8)
+    m.record_event(_audio_event())
+
+    # Assistant opening turn (AI speaks first).
+    clock.set(1.0)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="Hello, this is Ava from billing.", role="assistant",
+            is_final=True, current_transcript="Hello, this is Ava from billing.",
+        )
+    )
+    # User replies.
+    clock.set(1.5)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="Hi, what is this about?", role="user",
+            is_final=True, current_transcript="Hi, what is this about?",
+        )
+    )
+    # Assistant replies again (still same response_id).
+    clock.set(2.0)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="You have a balance of fifty dollars.", role="assistant",
+            is_final=True, current_transcript="You have a balance of fifty dollars.",
+        )
+    )
+    # User replies again.
+    clock.set(2.6)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="Okay, I will pay tomorrow.", role="user",
+            is_final=True, current_transcript="Okay, I will pay tomorrow.",
+        )
+    )
+
+    clock.set(3.0)
+    m.record_event(BidiResponseCompleteEvent(response_id="shared", stop_reason="complete"))
+    clock.set(3.5)
+    m.on_session_end()
+
+    # Old response_id-based count is 1 (the bug symptom), preserved distinctly.
+    assert m.summary()["nova_response_count"] == 1
+    assert len(m.turns) == 1
+
+    # Headline turn_count is per-utterance. Here the four finals already
+    # alternate role (assistant, user, assistant, user), so the per-utterance
+    # count equals the grouped count: 4 (and > 1, which is the bug fix).
+    assert m.summary()["turn_count"] == 4
+    assert m.summary()["turn_count"] > 1
+
+    turns = m.conversation_turns
+    assert [t["speaker"] for t in turns] == ["assistant", "user", "assistant", "user"]
+    for t in turns:
+        assert t["text"]
+        assert "total_ms" in t
+
+    # The FIRST assistant turn maps to the one Nova response window available,
+    # so it carries a real TTFT labelled as coming from the response window.
+    assert turns[0]["ttft_ms"] == 300.0
+    assert turns[0]["ttft_source"] == "response_window"
+
+    # FINDING #1 fix: the LATER assistant turn (index 2) still gets a
+    # meaningful, NON-None per-utterance latency derived from the preceding
+    # user turn's last final transcript (1500ms) to this assistant turn's first
+    # final transcript (2000ms) = 500ms, even though Nova reused a single
+    # response_id and no response window is left for it.
+    assert turns[2]["speaker"] == "assistant"
+    assert turns[2]["latency_ms"] == 500.0
+    assert turns[2]["latency_ms"] is not None
+    # TTFT for the later turn cannot be derived per-utterance (Nova emits no
+    # per-utterance audio marker under a shared response_id), so it is honestly
+    # reported as unavailable rather than silently blank.
+    assert turns[2]["ttft_ms"] is None
+    assert turns[2]["ttft_source"] == "unavailable"
+
+    # total_ms (elapsed conversation time) is non-zero for turns that are a
+    # single final transcript, because it measures to the next turn's start.
+    # Turn 0 (assistant@1000ms) -> next turn (user@1500ms) = 500ms.
+    assert turns[0]["total_ms"] == 500.0
+    # Turn 1 (user@1500ms) -> next turn (assistant@2000ms) = 500ms.
+    assert turns[1]["total_ms"] == 500.0
+
+
+def test_conversation_turns_join_consecutive_same_role_finals():
+    """Consecutive final transcripts of the same role collapse into one turn."""
+    clock = FakeClock()
+    m = CallMetrics(clock=clock)
+    clock.set(0.0)
+    m.on_session_start()
+
+    clock.set(1.0)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="Hello there.", role="assistant", is_final=True,
+            current_transcript="Hello there.",
+        )
+    )
+    clock.set(1.3)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="How can I help?", role="assistant", is_final=True,
+            current_transcript="How can I help?",
+        )
+    )
+    clock.set(2.0)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="I need help.", role="user", is_final=True,
+            current_transcript="I need help.",
+        )
+    )
+    clock.set(2.5)
+    m.on_session_end()
+
+    turns = m.conversation_turns
+    assert len(turns) == 2
+    assert turns[0]["speaker"] == "assistant"
+    assert turns[0]["text"] == "Hello there. How can I help?"
+    # Raw intra-segment span of the joined assistant finals (1300ms - 1000ms).
+    assert turns[0]["transcript_span_ms"] == 300.0
+    # total_ms is the elapsed time the turn occupied the conversation = span to
+    # the NEXT turn's start (user turn at 2000ms) - this turn's start (1000ms).
+    assert turns[0]["total_ms"] == 1000.0
+    assert turns[1]["speaker"] == "user"
+
+
+def test_single_final_turn_total_ms_is_nonzero_elapsed():
+    """FINDING #2 fix: a turn made of a single final transcript must report a
+    sensible non-zero elapsed time (span to the next turn's start), not 0.
+
+    Also asserts the LAST turn falls back to its transcript span / session end,
+    and that the raw intra-segment span is still exposed as transcript_span_ms.
+    """
+    clock = FakeClock()
+    m = CallMetrics(clock=clock)
+    clock.set(0.0)
+    m.on_session_start()
+
+    # Each turn is a SINGLE final transcript -> intra-segment span is 0 for all.
+    clock.set(1.0)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="Hello, this is Ava.", role="assistant", is_final=True,
+            current_transcript="Hello, this is Ava.",
+        )
+    )
+    clock.set(2.5)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="I can pay next week.", role="user", is_final=True,
+            current_transcript="I can pay next week.",
+        )
+    )
+    clock.set(4.0)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="Great, thank you.", role="assistant", is_final=True,
+            current_transcript="Great, thank you.",
+        )
+    )
+    clock.set(6.0)
+    m.on_session_end()  # total_e2e = 6000ms
+
+    turns = m.conversation_turns
+    # Every segment is a single final -> raw span is 0 for all of them.
+    assert all(t["transcript_span_ms"] == 0.0 for t in turns)
+
+    # But total_ms (elapsed conversation time) is NON-zero and sensible:
+    # turn 0 (assistant@1000) -> next (user@2500) = 1500ms.
+    assert turns[0]["total_ms"] == 1500.0
+    # turn 1 (user@2500) -> next (assistant@4000) = 1500ms.
+    assert turns[1]["total_ms"] == 1500.0
+    # LAST turn (assistant@4000) has no following turn; its span is 0, so it
+    # falls back to the session end (6000ms) -> 2000ms.
+    assert turns[2]["total_ms"] == 2000.0
+    assert all(t["total_ms"] not in (None, 0.0) for t in turns)
+
+
+def test_user_partial_transcript_fallback_populates_chat():
+    """If only non-final user transcripts arrive, the latest partial is used so
+    the chat view is not empty.
+    """
+    clock = FakeClock()
+    m = CallMetrics(clock=clock)
+    clock.set(0.0)
+    m.on_session_start()
+
+    clock.set(1.0)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="Hello.", role="assistant", is_final=True,
+            current_transcript="Hello.",
+        )
+    )
+    # User only emits partial (non-final) transcripts.
+    clock.set(1.5)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta="I", text="I", role="user", is_final=False, current_transcript="I",
+        )
+    )
+    clock.set(1.8)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=" will pay", text="I will pay", role="user", is_final=False,
+            current_transcript="I will pay",
+        )
+    )
+    clock.set(2.0)
+    m.on_session_end()
+
+    turns = m.conversation_turns
+    speakers = [t["speaker"] for t in turns]
+    assert "user" in speakers
+    user_turn = next(t for t in turns if t["speaker"] == "user")
+    assert user_turn["text"] == "I will pay"
 
 
 def test_metrics_emits_json_log_lines_for_lifecycle(caplog):
@@ -224,6 +513,151 @@ def test_ttft_attributed_to_newest_open_turn_under_overlap():
     by_id = {t["response_id"]: t for t in m.turns}
     assert by_id["r2"]["ttft_ms"] == 300.0
     assert by_id["r1"]["ttft_ms"] is None
+
+
+def test_nova_total_ms_sums_audio_not_response_window_regression():
+    """Regression for the live 'Total Nova Sonic speaking time' bug.
+
+    Nova Sonic reuses ONE response_id for the whole call: it fires many
+    BidiResponseStartEvent (one per speech burst) but only a single late
+    BidiResponseCompleteEvent at call end. The OLD metric summed the
+    response_start..complete windows, so it measured only the last window and
+    badly under-counted. The corrected nova_total_ms sums the actual outbound
+    audio-frame durations.
+
+    This test feeds several audio frames of KNOWN decoded byte sizes and asserts
+    nova_total_ms equals their summed duration, which DIFFERS from the old
+    response-window sum (still reported as nova_response_window_ms). Under the
+    old calc nova_total_ms would equal the window sum and this test would FAIL.
+    """
+    clock = FakeClock()
+    m = CallMetrics(call_sid="CA-NOVA", account_id="ACC-1001", clock=clock)
+
+    clock.set(0.0)
+    m.on_session_start()
+
+    # Nova opens its (reused) response id repeatedly across the call.
+    clock.set(0.5)
+    m.record_event(BidiResponseStartEvent(response_id="shared"))
+
+    # Three known-size audio frames: 48000, 24000, 12000 decoded bytes.
+    # PCM16 mono 24 kHz: ms = bytes / 48 -> 1000, 500, 250 ms = 1750 ms total.
+    frame_bytes = [48000, 24000, 12000]
+    expected_nova_ms = round(sum(b / 48.0 for b in frame_bytes), 3)
+    assert expected_nova_ms == 1750.0
+
+    clock.set(1.0)
+    m.record_event(_audio_event_bytes(frame_bytes[0]))
+    # Nova "restarts" the same response id mid-call (repeated response_start).
+    clock.set(2.0)
+    m.record_event(BidiResponseStartEvent(response_id="shared"))
+    clock.set(2.0)
+    m.record_event(_audio_event_bytes(frame_bytes[1]))
+    clock.set(3.0)
+    m.record_event(BidiResponseStartEvent(response_id="shared"))
+    clock.set(3.0)
+    m.record_event(_audio_event_bytes(frame_bytes[2]))
+
+    # ONE late response_complete at call end (stop_reason incomplete-ish). The
+    # response-window sum therefore captures only a small slice of the call.
+    clock.set(10.0)
+    m.record_event(BidiResponseCompleteEvent(response_id="shared", stop_reason="complete"))
+    clock.set(12.0)
+    m.on_session_end()
+
+    # CORRECTED headline: sum of audio-frame durations.
+    assert m.nova_total_ms == expected_nova_ms
+    assert m.summary()["nova_total_ms"] == expected_nova_ms
+    assert m.to_call_analytics()["nova_total_ms"] == expected_nova_ms
+
+    # The old erroneous response-window sum does NOT equal the corrected
+    # audio-derived value: repeated response_start events reusing one id each
+    # overwrote the open-turn start, so the single late response_complete
+    # measures a bogus window (here 7000ms) unrelated to the 1750ms Nova
+    # actually spoke. This inequality is exactly what would fail under the old
+    # calc (where nova_total_ms WAS the window sum).
+    assert m.nova_response_window_ms != m.nova_total_ms
+    assert m.nova_response_window_ms == 7000.0
+
+    # non_nova_ms stays coherent with the CORRECTED nova_total_ms.
+    assert m.non_nova_ms == round(12000.0 - expected_nova_ms, 3)
+
+
+def test_per_utterance_turn_model_counts_each_utterance():
+    """Headline per-utterance turns: a user utterance is one turn and a Sonic
+    utterance is another. Consecutive same-role finals are NOT merged (contrast
+    with the grouped conversation_turns, which DOES merge them).
+    """
+    clock = FakeClock()
+    m = CallMetrics(call_sid="CA-UTT", account_id="ACC-1001", clock=clock)
+
+    clock.set(0.0)
+    m.on_session_start()
+
+    # Alternation that also includes TWO consecutive same-role (assistant)
+    # finals, to prove they are counted as two separate utterance turns.
+    clock.set(1.0)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="Hello, this is Ava.", role="assistant", is_final=True,
+            current_transcript="Hello, this is Ava.",
+        )
+    )
+    clock.set(1.4)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="How can I help you today?", role="assistant", is_final=True,
+            current_transcript="How can I help you today?",
+        )
+    )
+    clock.set(2.0)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="I can pay next week.", role="user", is_final=True,
+            current_transcript="I can pay next week.",
+        )
+    )
+    clock.set(2.8)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="Great, I will note that.", role="assistant", is_final=True,
+            current_transcript="Great, I will note that.",
+        )
+    )
+    clock.set(4.0)
+    m.on_session_end()
+
+    # Per-utterance (headline) turn count = 4 individual utterances, with NO
+    # same-role merging of the two leading assistant finals.
+    assert m.summary()["turn_count"] == 4
+    analytics = m.to_call_analytics()
+    assert analytics["turn_count"] == 4
+
+    turns = analytics["turns"]
+    assert len(turns) == 4
+    assert [t["speaker"] for t in turns] == ["assistant", "assistant", "user", "assistant"]
+    assert [t["text"] for t in turns] == [
+        "Hello, this is Ava.",
+        "How can I help you today?",
+        "I can pay next week.",
+        "Great, I will note that.",
+    ]
+    # Each per-utterance turn carries speaker / text / duration_ms.
+    for t in turns:
+        assert t["speaker"] in ("user", "assistant")
+        assert t["text"]
+        assert "duration_ms" in t
+    # duration_ms = span to next utterance start; first turn 1.0 -> 1.4 = 400ms.
+    assert turns[0]["duration_ms"] == 400.0
+    # Last turn (assistant@2800) falls back to session end (4000) -> 1200ms.
+    assert turns[3]["duration_ms"] == 1200.0
+
+    # CONTRAST: the grouped conversation_turns DO merge the two leading
+    # assistant finals into a single chat segment, giving a SMALLER count (3)
+    # than the per-utterance headline count (4).
+    assert len(m.conversation_turns) == 3
+    assert [t["speaker"] for t in m.conversation_turns] == ["assistant", "user", "assistant"]
+    assert m.conversation_turns[0]["text"] == "Hello, this is Ava. How can I help you today?"
 
 
 def test_unmatched_response_complete_without_start_is_safe():

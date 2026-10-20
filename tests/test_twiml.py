@@ -7,13 +7,17 @@ from unittest.mock import MagicMock
 import pytest
 
 from app.config import Settings
-from app.twilio_client import build_stream_twiml, place_outbound_call
+from app.twilio_client import build_stream_twiml, place_outbound_call, send_sms
 
 
 def _settings(**overrides) -> Settings:
     base = dict(
         nova_model_id="amazon.nova-2-5-sonic",
         aws_region="us-east-1",
+        app_log_group="/ecs/ar-collections-nova-sonic/app",
+        extraction_model_id="amazon.nova-lite-v1:0",
+        payment_link_base_url="https://pay.example.com/",
+        twilio_trial_mode=True,
         twilio_account_sid="AC_test_sid",
         twilio_auth_token="test_token_value",
         twilio_from_number="+15005550006",
@@ -67,6 +71,41 @@ def test_place_outbound_call_uses_from_number_and_mocked_client():
     assert result.call_sid == "CA_test_call_sid"
     assert result.account_id == "DUE-99"
     assert result.from_number == "+15005550006"
+
+
+def test_send_sms_uses_messages_create_with_mocked_client():
+    fake_message = MagicMock()
+    fake_message.sid = "SM_test_sid"
+    fake_client = MagicMock()
+    fake_client.messages.create.return_value = fake_message
+    factory = MagicMock(return_value=fake_client)
+
+    result = send_sms(
+        "+15005550010",
+        "Pay here: https://pay.example.com/ACC-1001",
+        settings=_settings(),
+        client_factory=factory,
+    )
+
+    factory.assert_called_once_with("AC_test_sid", "test_token_value")
+    fake_client.messages.create.assert_called_once()
+    _, kwargs = fake_client.messages.create.call_args
+    assert kwargs["from_"] == "+15005550006"
+    assert kwargs["to"] == "+15005550010"
+    assert "pay.example.com" in kwargs["body"]
+    assert result.message_sid == "SM_test_sid"
+
+
+def test_send_sms_requires_config():
+    factory = MagicMock()
+    with pytest.raises(ValueError):
+        send_sms(
+            "+15005550010",
+            "body",
+            settings=_settings(twilio_account_sid=None),
+            client_factory=factory,
+        )
+    factory.assert_not_called()
 
 
 def test_place_outbound_call_requires_config():
