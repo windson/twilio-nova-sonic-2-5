@@ -693,6 +693,172 @@ def test_tool_use_blocks_emit_one_invocation_per_tool():
     ]
 
 
+def test_conversation_turns_expose_accurate_ask1_field_names():
+    """ASK 1: the response-wait window must be exposed under an accurate name
+    (``response_wait_ms``) and turn-elapsed under ``turn_elapsed_ms``, with the
+    legacy ``latency_ms``/``total_ms`` kept as backward-compatible aliases of
+    the SAME values. ttft_source stays honest. Fails if the relabel is reverted.
+    """
+    clock = FakeClock()
+    m = CallMetrics(call_sid="CA-LBL", account_id="ACC-1001", clock=clock)
+    clock.set(0.0)
+    m.on_session_start()
+    clock.set(0.5)
+    m.record_event(BidiResponseStartEvent(response_id="shared"))
+    clock.set(0.8)
+    m.record_event(_audio_event())
+    clock.set(1.0)
+    m.record_event(_final_transcript("Hello, this is Ava.", role="assistant"))
+    clock.set(1.5)
+    m.record_event(_final_transcript("What is this about?", role="user"))
+    clock.set(2.0)
+    m.record_event(_final_transcript("You owe fifty dollars.", role="assistant"))
+    clock.set(3.0)
+    m.record_event(BidiResponseStopEvent(response_id="shared"))
+    clock.set(3.5)
+    m.on_session_end()
+
+    turns = m.conversation_turns
+    later_assistant = turns[2]
+    assert later_assistant["speaker"] == "assistant"
+    # Accurate name present AND equal to the legacy alias.
+    assert "response_wait_ms" in later_assistant
+    assert later_assistant["response_wait_ms"] == later_assistant["latency_ms"]
+    assert later_assistant["response_wait_ms"] == 500.0
+    # turn_elapsed_ms is present on every turn and aliases total_ms.
+    for t in turns:
+        assert "turn_elapsed_ms" in t
+        assert t["turn_elapsed_ms"] == t["total_ms"]
+    # ttft_source stays honest for the later (unmatched) assistant turn.
+    assert later_assistant["ttft_source"] == "unavailable"
+    assert turns[0]["ttft_source"] == "response_window"
+
+
+def test_sync_tool_calls_attached_to_nearest_assistant_turn():
+    """ASK 5: in-call (sync) tool invocations with a call-timeline t_ms are
+    attached to the nearest preceding assistant turn as tool_calls entries
+    labelled kind='sync'. Fails if the association logic is reverted.
+    """
+    clock = FakeClock()
+    m = CallMetrics(call_sid="CA-TOOL", account_id="ACC-1001", clock=clock)
+    clock.set(0.0)
+    m.on_session_start()
+    clock.set(1.0)
+    m.record_event(_final_transcript("Hello, I can update your record.", role="assistant"))
+    # Sync tool fires during the assistant turn (t=1.2s -> t_ms=1200).
+    clock.set(1.2)
+    m.record_event(
+        BidiToolUseBlocksEvent(
+            tool_uses=[{"name": "update_due_record", "input": {}, "toolUseId": "t1"}]
+        )
+    )
+    clock.set(2.0)
+    m.record_event(_final_transcript("I will pay next week.", role="user"))
+    clock.set(2.5)
+    m.record_event(_final_transcript("Noted, thank you.", role="assistant"))
+    # Second sync tool fires during the later assistant turn (t=2.7 -> 2700).
+    clock.set(2.7)
+    m.record_event(
+        BidiToolUseBlocksEvent(
+            tool_uses=[
+                {"name": "capture_payment_date_phrase", "input": {}, "toolUseId": "t2"}
+            ]
+        )
+    )
+    clock.set(3.5)
+    m.on_session_end()
+
+    turns = m.conversation_turns
+    # Every turn carries a tool_calls list.
+    assert all("tool_calls" in t for t in turns)
+    # First assistant turn (start 1000) owns the 1200ms update_due_record call.
+    first_asst = turns[0]
+    assert first_asst["speaker"] == "assistant"
+    assert [c["tool"] for c in first_asst["tool_calls"]] == ["update_due_record"]
+    assert first_asst["tool_calls"][0]["kind"] == "sync"
+    assert first_asst["tool_calls"][0]["t_ms"] == 1200.0
+    # Later assistant turn (start 2500) owns the 2700ms capture call.
+    later_asst = turns[2]
+    assert [c["tool"] for c in later_asst["tool_calls"]] == [
+        "capture_payment_date_phrase"
+    ]
+    assert later_asst["tool_calls"][0]["kind"] == "sync"
+    # The user turn has no tool calls attached.
+    assert turns[1]["tool_calls"] == []
+
+
+def test_interrupted_turn_marked_and_barge_in_inline_by_t_ms():
+    """ASK 7: an assistant turn whose time window contains a barge-in is marked
+    interrupted (the full intended transcript is preserved, NOT truncated), and
+    the barge-in is surfaced inline as a timeline marker ordered by t_ms. Fails
+    if interrupted-marking or the inline marker is reverted.
+    """
+    clock = FakeClock()
+    m = CallMetrics(call_sid="CA-BARGE", account_id="ACC-1001", clock=clock)
+    clock.set(0.0)
+    m.on_session_start()
+    # Assistant turn 0 starts at 1000ms.
+    clock.set(1.0)
+    m.record_event(_final_transcript("Hello, I am calling about your balance.", role="assistant"))
+    # Barge-in at 1500ms falls inside assistant turn 0's window -> interrupted.
+    clock.set(1.5)
+    m.record_event(BidiBargeInEvent())
+    # User turn 1 at 2000ms.
+    clock.set(2.0)
+    m.record_event(_final_transcript("Stop, who is this?", role="user"))
+    # Assistant turn 2 at 2500ms (NOT interrupted).
+    clock.set(2.5)
+    m.record_event(_final_transcript("This is Ava from billing.", role="assistant"))
+    clock.set(3.0)
+    m.on_session_end()
+
+    turns = m.conversation_turns
+    # Turn 0 interrupted; the full intended transcript is preserved (not cut).
+    assert turns[0]["interrupted"] is True
+    assert turns[0]["barge_in_ms"] == [1500.0]
+    assert turns[0]["text"] == "Hello, I am calling about your balance."
+    # The non-interrupted turns are explicitly marked False.
+    assert turns[1]["interrupted"] is False
+    assert turns[2]["interrupted"] is False
+
+    # The serialized record surfaces the barge-in inline as a timeline marker.
+    analytics = m.to_call_analytics()
+    markers = analytics["barge_in_events"]
+    assert markers == [{"type": "barge_in", "t_ms": 1500.0}]
+
+
+def test_transport_delay_estimate_named_honestly_and_async_tool_calls_empty():
+    """ASK 6: the per-frame transport ESTIMATE is exposed as
+    ``transport_delay_estimate_ms`` (alias of the legacy twilio_latency_ms) and
+    ``non_nova_ms`` stays a documented residual. ASK 5: async_tool_calls is
+    empty at call end (async tools run post-call, off-path).
+    """
+    clock = FakeClock()
+    m = CallMetrics(call_sid="CA-TR", account_id="ACC-1001", clock=clock)
+    clock.set(0.0)
+    m.on_session_start()
+    clock.set(0.5)
+    m.record_inbound_media(480)
+    clock.set(1.0)
+    m.record_inbound_media(960)  # 500 local vs 480 twilio -> 20ms
+    clock.set(1.04)
+    m.record_inbound_media(980)  # 540 vs 500 -> 40ms
+    clock.set(2.0)
+    m.on_session_end()
+
+    analytics = m.to_call_analytics()
+    # Estimate present under the accurate name AND equal to the legacy alias.
+    assert analytics["transport_delay_estimate_ms"] == analytics["twilio_latency_ms"]
+    assert analytics["transport_delay_estimate_ms"] == 30.0
+    assert m.transport_delay_estimate_ms == 30.0
+    # non_nova_ms remains the documented residual (total - nova).
+    assert analytics["non_nova_ms"] == round(2000.0 - m.nova_total_ms, 3)
+    # Async tool calls empty at call end; twilio_insights is a pending marker.
+    assert analytics["async_tool_calls"] == []
+    assert analytics["twilio_insights"]["available"] is False
+    assert analytics["twilio_insights"]["source"] == "pending"
+
+
 def test_usage_adapts_ga_token_details():
     """GA BidiUsageEvent: cache_read comes from input_token_details."""
     clock = FakeClock()

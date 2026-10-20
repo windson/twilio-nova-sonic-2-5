@@ -38,12 +38,32 @@ Approximations (documented here and in FEAT-003 findings):
   durations (see the ``nova_total_ms`` property for why the old
   response_start..complete window sum under-counted). The legacy window sum is
   retained as ``nova_response_window_ms`` for diagnostics.
-- ``twilio_latency_ms`` = transport delay derived from Twilio media ``timestamp``
+- ``twilio_latency_ms`` / ``transport_delay_estimate_ms`` (ASK 2/6) = a per-frame
+  transport-delay ESTIMATE derived from Twilio media ``timestamp``
   (stream-relative ms) vs local receive wall-clock. Twilio's ``timestamp`` is
   milliseconds since the stream started; comparing its growth to locally
   measured elapsed time yields the extra transport delay. We report the mean
-  observed transport delay. As a cross-check, the share of total e2e time not
-  attributable to Nova responses is reported as ``non_nova_ms``.
+  observed transport delay. This is an ESTIMATE, not an authoritative network
+  measurement -- it is surfaced under the accurate name
+  ``transport_delay_estimate_ms`` (with ``twilio_latency_ms`` kept as a
+  deprecated backward-compatible alias). The REAL, authentic Twilio Call
+  resource facts (duration, start/end, price, from/to, status) are fetched
+  OFF-PATH post-call by :func:`app.twilio_client.fetch_call_insights` and
+  attached to the stored record as ``twilio_insights``; advanced QoS
+  (RTT/jitter/packet-loss/MOS) is a paid Voice Insights add-on that is NOT
+  enabled on the trial account and is marked unavailable rather than fabricated.
+- ``non_nova_ms`` = ``total_e2e_ms - nova_total_ms`` -- the share of the call's
+  end-to-end wall-clock NOT spent with Sonic actively producing speech. It is a
+  bookkeeping residual (network transport, user speech, silence, tool time),
+  NOT a transport-latency measurement; the transport estimate above is a
+  separate, independently-derived figure.
+
+Terminology (ASK 1, from FEAT-001): per conversational turn the app exposes
+``response_wait_ms`` (time for Sonic to begin answering; the value previously
+MISLABELED ``latency_ms``, kept as a deprecated alias), ``ttft_ms`` (official
+time-to-first-audio, ``gen_ai.server.time_to_first_audio``) with an honest
+``ttft_source``, ``turn_elapsed_ms`` (turn-elapsed; alias of ``total_ms``) and
+``transcript_span_ms`` (spoken duration).
 """
 
 from __future__ import annotations
@@ -668,36 +688,156 @@ class CallMetrics:
             seg["total_ms"] = total_ms
 
             if seg["speaker"] == "assistant":
-                # Per-utterance latency: from when the caller last finished
-                # speaking (preceding user turn's last final transcript) to this
-                # assistant turn's first final transcript. This is derivable for
-                # EVERY assistant turn, unlike the shared response window.
-                latency_ms: float | None = None
+                # Per-utterance "response wait": from when the caller last
+                # finished speaking (preceding user turn's last final transcript)
+                # to this assistant turn's first final transcript, i.e. how long
+                # the caller waited for Sonic to BEGIN answering. This is a
+                # response-WAIT window, NOT model/network latency, and is
+                # derivable for EVERY assistant turn unlike the shared response
+                # window. ASK 1: it is exposed under the accurate name
+                # ``response_wait_ms`` (``latency_ms`` is kept as a deprecated
+                # backward-compatible alias with the SAME value).
+                response_wait_ms: float | None = None
                 if prev_user_end_ms is not None and start_ms is not None:
-                    latency_ms = round(max(start_ms - prev_user_end_ms, 0.0), 3)
+                    response_wait_ms = round(max(start_ms - prev_user_end_ms, 0.0), 3)
 
                 timing = self._closest_timing(start_ms, assistant_timings, used_timing)
                 if timing is not None:
                     seg["ttft_ms"] = timing.get("ttft_ms")
                     seg["ttft_source"] = "response_window"
-                    # Prefer the response-window latency when we have it (it is
-                    # the user-stop -> response_start measure); else keep the
-                    # per-utterance transcript-derived latency.
+                    # Prefer the response-window wait when we have it (it is the
+                    # user-stop -> response_start measure); else keep the
+                    # per-utterance transcript-derived wait.
                     if timing.get("turn_latency_ms") is not None:
-                        latency_ms = timing.get("turn_latency_ms")
+                        response_wait_ms = timing.get("turn_latency_ms")
                 else:
                     # No response window left for this turn (Nova reused one
                     # response_id). We cannot derive a true per-utterance first-
-                    # token time, so TTFT is honestly unavailable; latency still
-                    # comes from the transcript gap above.
+                    # token time, so TTFT is honestly unavailable; the response
+                    # wait still comes from the transcript gap above.
                     seg["ttft_ms"] = None
                     seg["ttft_source"] = "unavailable"
-                seg["latency_ms"] = latency_ms
+                # Accurate name (ASK 1) + deprecated backward-compatible alias.
+                seg["response_wait_ms"] = response_wait_ms
+                seg["latency_ms"] = response_wait_ms
             elif seg["speaker"] == "user" and end_ms is not None:
                 prev_user_end_ms = end_ms
 
+        # ASK 1: expose the turn-elapsed time under an accurate name alongside
+        # the legacy ``total_ms`` key the frontend currently reads.
+        for seg in turns:
+            seg["turn_elapsed_ms"] = seg.get("total_ms")
+
+        # ASK 7 + ASK 5: annotate interrupted turns (barge-in inside the turn's
+        # time window) and attach the in-call/sync tool invocations to the
+        # nearest assistant turn. Both are derived purely from the already-
+        # recorded events_log (off the real-time audio path -- this runs only
+        # when the conversation model is (re)built for a summary/serialization).
+        self._annotate_barge_ins(turns)
+        self._attach_sync_tool_calls(turns)
+
         self.conversation_turns = turns
         return turns
+
+    # -- ASK 7: barge-in / interrupted-turn annotation ------------------------
+
+    def _barge_in_markers(self) -> list[dict[str, Any]]:
+        """Return the barge-in events as inline timeline markers (by t_ms).
+
+        GA's ``BidiBargeInEvent`` carries no payload and GA exposes NO
+        delivered-vs-intended transcript (see FEAT-001 finding c), so the ONLY
+        honest signal is the ``barge_in`` entries recorded into
+        :attr:`events_log` with a real call-relative ``t_ms``. We surface each
+        as a lightweight marker the UI can interleave into the timeline; we do
+        NOT fabricate a truncated "delivered" transcript.
+        """
+        return [
+            {"type": "barge_in", "t_ms": e.get("t_ms")}
+            for e in self.events_log
+            if e.get("event_type") == "barge_in"
+        ]
+
+    def _annotate_barge_ins(self, turns: list[dict[str, Any]]) -> None:
+        """Mark assistant turns whose time window contains a barge-in.
+
+        An assistant turn is ``interrupted`` when a ``barge_in`` t_ms falls in
+        its ``[start_ms, next-turn-start)`` window (last turn extends to session
+        end). The full INTENDED transcript is preserved; the turn is only
+        annotated ``interrupted: True`` with the offending barge-in t_ms(s), and
+        each barge-in is also surfaced inline via ``barge_in_marker``. This is
+        the honest signal available on GA; we do not rewrite the transcript.
+        """
+        barge_ins = [
+            e.get("t_ms")
+            for e in self.events_log
+            if e.get("event_type") == "barge_in" and e.get("t_ms") is not None
+        ]
+        session_end_ms = self.total_e2e_ms
+        for i, seg in enumerate(turns):
+            seg.setdefault("interrupted", False)
+            seg.setdefault("barge_in_ms", [])
+            if seg["speaker"] != "assistant":
+                continue
+            start_ms = seg.get("start_ms")
+            if start_ms is None:
+                continue
+            next_start = turns[i + 1].get("start_ms") if i + 1 < len(turns) else None
+            window_end = next_start if next_start is not None else session_end_ms
+            hits = [
+                t
+                for t in barge_ins
+                if t >= start_ms and (window_end is None or t < window_end)
+            ]
+            if hits:
+                seg["interrupted"] = True
+                seg["barge_in_ms"] = hits
+
+    # -- ASK 5: sync in-call tool-call association ----------------------------
+
+    def _sync_tool_calls(self) -> list[dict[str, Any]]:
+        """Return the in-call (sync) tool invocations from events_log.
+
+        SYNC tools (``update_due_record``, ``capture_payment_date_phrase``) are
+        emitted into :attr:`events_log` as ``tool_invocation`` entries carrying
+        a call-relative ``t_ms`` (FEAT-001 finding d). Each is classified
+        ``kind='sync'`` because it has a call-timeline t_ms.
+        """
+        return [
+            {"tool": e.get("tool"), "kind": "sync", "t_ms": e.get("t_ms")}
+            for e in self.events_log
+            if e.get("event_type") == "tool_invocation"
+        ]
+
+    def _attach_sync_tool_calls(self, turns: list[dict[str, Any]]) -> None:
+        """Attach each sync tool call to the nearest preceding assistant turn.
+
+        An in-call tool fires during an assistant's turn (Sonic invokes the
+        tool mid-response), so each ``tool_invocation`` t_ms is associated to
+        the assistant turn whose start_ms is the greatest start <= the tool
+        t_ms; if no assistant turn has started yet it attaches to the first
+        assistant turn. Every turn gets a ``tool_calls`` list (possibly empty).
+        """
+        for seg in turns:
+            seg.setdefault("tool_calls", [])
+        assistant_turns = [t for t in turns if t["speaker"] == "assistant"]
+        for call in self._sync_tool_calls():
+            t_ms = call.get("t_ms")
+            target: dict[str, Any] | None = None
+            for seg in assistant_turns:
+                start_ms = seg.get("start_ms")
+                if start_ms is None:
+                    continue
+                if t_ms is None or start_ms <= t_ms:
+                    target = seg
+                elif target is None:
+                    # First assistant turn starts after the tool t_ms: attach
+                    # to it rather than dropping the call.
+                    target = seg
+                    break
+            if target is None and assistant_turns:
+                target = assistant_turns[0]
+            if target is not None:
+                target["tool_calls"].append(call)
 
     @staticmethod
     def _closest_timing(
@@ -847,12 +987,58 @@ class CallMetrics:
         return round(self.nova_speaking_ms, 3)
 
     @property
+    def transport_delay_estimate_ms(self) -> float | None:
+        """ESTIMATE of mean Twilio transport delay (ms) (ASK 2/6).
+
+        Accurate-named alias of :attr:`twilio_latency_ms`: a per-frame estimate
+        derived from Twilio stream-relative timestamps, NOT an authoritative
+        network measurement. The authentic Twilio Call-resource facts are
+        fetched off-path post-call into ``twilio_insights``; advanced QoS is a
+        paid add-on unavailable on the trial account (never fabricated).
+        """
+        return self.twilio_latency_ms
+
+    @property
     def non_nova_ms(self) -> float | None:
-        """Share of total e2e time not spent in active Nova responses."""
+        """Residual of total e2e time not spent with Sonic actively speaking.
+
+        ``non_nova_ms = total_e2e_ms - nova_total_ms``. This is a bookkeeping
+        RESIDUAL (network transport, user speech, silence, tool time), NOT a
+        transport-latency figure. The transport estimate is reported separately
+        as :attr:`transport_delay_estimate_ms` and the real transport facts live
+        in ``twilio_insights`` (ASK 6).
+        """
         total = self.total_e2e_ms
         if total is None:
             return None
         return round(max(total - self.nova_total_ms, 0.0), 3)
+
+    def async_tool_calls(self) -> list[dict[str, Any]]:
+        """Return call-level ASYNC (post-call, off-path) tool-call entries.
+
+        ASK 5: the AgentCore Code Interpreter date resolution runs POST-CALL,
+        off the real-time audio path, and is logged with
+        ``event_type='code_interpreter'`` WITHOUT a call-timeline ``t_ms`` (it
+        happens after the call ends; FEAT-001 finding d). Such tools are NOT
+        part of the live call and must NOT be counted toward call latency, so
+        they are surfaced here at the call level (not on any turn) with
+        ``kind='async'`` and ``t_ms=None``.
+
+        At call end this is empty -- async tools run later and the post-call
+        pipeline records them on the stored record (see
+        :func:`app.postcall.extract_and_apply`). Any ``code_interpreter`` entry
+        that did land in :attr:`events_log` is still reflected here defensively.
+        """
+        return [
+            {
+                "tool": e.get("tool"),
+                "kind": "async",
+                "t_ms": None,
+                "off_path": True,
+            }
+            for e in self.events_log
+            if e.get("event_type") == "code_interpreter"
+        ]
 
     def summary(self) -> dict[str, Any]:
         """Compact metrics summary (the headline numbers).
@@ -870,6 +1056,9 @@ class CallMetrics:
             "account_id": self.account_id,
             "total_e2e_ms": self.total_e2e_ms,
             "nova_total_ms": round(self.nova_total_ms, 3),
+            # ASK 6: accurate name for the per-frame transport ESTIMATE, with
+            # the legacy key kept as a deprecated alias (same value).
+            "transport_delay_estimate_ms": self.transport_delay_estimate_ms,
             "twilio_latency_ms": self.twilio_latency_ms,
             "non_nova_ms": self.non_nova_ms,
             "ttft_ms": self.first_ttft_ms,
@@ -900,6 +1089,9 @@ class CallMetrics:
             "account_id": self.account_id,
             "total_e2e_ms": self.total_e2e_ms,
             "nova_total_ms": round(self.nova_total_ms, 3),
+            # ASK 6: accurate-named transport ESTIMATE + legacy alias (same
+            # value). The REAL Twilio facts arrive post-call in twilio_insights.
+            "transport_delay_estimate_ms": self.transport_delay_estimate_ms,
             "twilio_latency_ms": self.twilio_latency_ms,
             "non_nova_ms": self.non_nova_ms,
             "ttft_ms": self.first_ttft_ms,
@@ -914,6 +1106,17 @@ class CallMetrics:
             "nova_response_turns": list(self.turns),
             "transcripts": list(self.transcripts),
             "events_log": list(self.events_log),
+            # ASK 7: barge-in markers, interleaved into the UI timeline by t_ms.
+            "barge_in_events": self._barge_in_markers(),
+            # ASK 5: call-level ASYNC tool calls (post-call, off-path, NOT
+            # contributing to call latency). Empty at call end; the post-call
+            # pipeline appends the code-interpreter resolution here.
+            "async_tool_calls": self.async_tool_calls(),
+            # ASK 6: honest Twilio transport split. twilio_insights holds the
+            # REAL Call-resource facts once post-call enrichment runs; it starts
+            # as an explicit "pending" marker so the UI never implies the real
+            # data is present before enrichment (never fabricated).
+            "twilio_insights": _pending_twilio_insights(),
             # -- post-call intelligence (blank at call end) ------------------
             "disposition": None,
             "structured_data": _blank_structured_data(),
@@ -932,6 +1135,24 @@ def _blank_structured_data() -> dict[str, Any]:
     from app.store import blank_structured_data
 
     return blank_structured_data()
+
+
+def _pending_twilio_insights() -> dict[str, Any]:
+    """Placeholder ``twilio_insights`` block set at call end (ASK 2/6).
+
+    The REAL Twilio Call-resource facts are fetched OFF the audio path,
+    post-call, by :func:`app.twilio_client.fetch_call_insights`. Until then the
+    record carries this explicit ``available=False`` / ``source='pending'``
+    marker so the UI never implies authentic Twilio data is present before the
+    enrichment runs. We NEVER fabricate Twilio metrics.
+    """
+    return {
+        "available": False,
+        "source": "pending",
+        "advanced_qos_available": False,
+        "advanced_qos_reason": None,
+        "fields": {},
+    }
 
 
 def _tool_name(tool_use: Any) -> Any:

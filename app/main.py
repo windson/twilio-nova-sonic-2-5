@@ -161,6 +161,9 @@ def _call_summary(record: dict[str, Any]) -> dict[str, Any]:
         "account_id": record.get("account_id"),
         "total_e2e_ms": record.get("total_e2e_ms"),
         "nova_total_ms": record.get("nova_total_ms"),
+        # ASK 6: accurate-named transport ESTIMATE (legacy alias kept for the UI
+        # during the FEAT-004 transition).
+        "transport_delay_estimate_ms": record.get("transport_delay_estimate_ms"),
         "twilio_latency_ms": record.get("twilio_latency_ms"),
         "ttft_ms": record.get("ttft_ms"),
         "turn_count": record.get("turn_count"),

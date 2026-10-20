@@ -206,9 +206,13 @@ async def test_extract_and_apply_ptp_sets_fields_pauses_and_sends_sms(store):
     # Account collection paused.
     assert store.get_due("ACC-1001")["collection_paused"] is True
 
-    # SMS attempted with a payment link containing the account id.
+    # SMS attempted with a payment link containing the account id. The injected
+    # factory is used for BOTH the off-path Twilio Call-insights fetch (ASK 2)
+    # and the PTP SMS send, so locate the client that actually sent a message
+    # rather than assuming the first-created client is the SMS one.
     assert created_clients, "twilio client factory should have been used"
-    sms_kwargs = created_clients[0].messages.created[0]
+    sms_client = next(c for c in created_clients if c.messages.created)
+    sms_kwargs = sms_client.messages.created[0]
     assert "pay.example.com" in sms_kwargs["body"]
     assert "ACC-1001" in sms_kwargs["body"]
 
@@ -640,3 +644,196 @@ def test_mask_number_keeps_only_last_four():
     assert _mask_number("+15551234567") == "+******4567"
     assert _mask_number(None) is None
     assert _mask_number("123") == "***"
+
+
+class _FakeCall:
+    sid = "CA_pc"
+    parent_call_sid = None
+    to = "+15005550010"
+    to_formatted = "(500) 555-0010"
+    from_ = "+15005550006"
+    from_formatted = "(500) 555-0006"
+    status = "completed"
+    start_time = "2024-06-01T12:00:00Z"
+    end_time = "2024-06-01T12:01:30Z"
+    duration = "90"
+    price = "-0.017"
+    price_unit = "USD"
+    direction = "outbound-api"
+    answered_by = None
+    queue_time = "0"
+    date_created = "2024-06-01T12:00:00Z"
+    date_updated = "2024-06-01T12:01:30Z"
+
+
+class _InsightsTwilioClient:
+    """Twilio client stub supporting BOTH calls(sid).fetch() and messages."""
+
+    def __init__(self, *_a):
+        self._call = _FakeCall()
+
+        class _Messages:
+            created: list = []
+
+            def create(self, **kwargs):
+                self.created.append(kwargs)
+
+                class _M:
+                    sid = "SM"
+
+                return _M()
+
+        self.messages = _Messages()
+
+    def calls(self, call_sid):
+        call = self._call
+
+        class _Ctx:
+            def fetch(self):
+                return call
+
+        return _Ctx()
+
+
+async def test_extract_and_apply_enriches_twilio_insights_offpath(store):
+    """ASK 2/6 wiring: extract_and_apply persists authentic twilio_insights
+    fetched off-path for the call_sid. Fails if the enrichment call is removed.
+    """
+    bedrock = FakeBedrock(
+        {
+            "disposition": "undetermined",
+            "payment_specifics": {"promised_amount": None, "agreed_date": None,
+                                  "preferred_payment_method": None},
+            "contextual_data": {"reason_for_delinquency": None, "customer_sentiment": None},
+            "next_best_action": None,
+        }
+    )
+
+    changes = await extract_and_apply(
+        _call_record(),
+        store,
+        _settings(),
+        bedrock_client=bedrock,
+        twilio_client_factory=lambda *a: _InsightsTwilioClient(),
+        code_interpreter_factory=_ci_factory(),
+    )
+
+    insights = changes["twilio_insights"]
+    assert insights["available"] is True
+    assert insights["source"] == "twilio_call_resource"
+    assert insights["fields"]["status"] == "completed"
+    assert insights["fields"]["duration"] == "90"
+    assert insights["fields"]["from"] == "+15005550006"
+    # Advanced QoS remains unavailable (trial add-on), never fabricated.
+    assert insights["advanced_qos_available"] is False
+
+    # Persisted onto the stored record for the API/UI to read.
+    persisted = store.get_call("CA_pc")
+    assert persisted["twilio_insights"]["available"] is True
+
+
+async def test_extract_and_apply_twilio_insights_gated_when_fetch_unavailable(store):
+    """Add-on-gated / unavailable branch: a Twilio client that cannot fetch the
+    call yields an explicit unavailable marker (no fabricated metrics), and the
+    pipeline still completes with intelligence_status ready.
+    """
+    bedrock = FakeBedrock(
+        {
+            "disposition": "undetermined",
+            "payment_specifics": {"promised_amount": None, "agreed_date": None,
+                                  "preferred_payment_method": None},
+            "contextual_data": {"reason_for_delinquency": None, "customer_sentiment": None},
+            "next_best_action": None,
+        }
+    )
+
+    class _NoCallsClient:
+        # No .calls attribute -> fetch_call_insights degrades gracefully.
+        def __init__(self, *_a):
+            pass
+
+    changes = await extract_and_apply(
+        _call_record(),
+        store,
+        _settings(),
+        bedrock_client=bedrock,
+        twilio_client_factory=lambda *a: _NoCallsClient(),
+        code_interpreter_factory=_ci_factory(),
+    )
+
+    assert changes["twilio_insights"]["available"] is False
+    assert changes["twilio_insights"]["fields"] == {}
+    assert changes["intelligence_status"] == "ready"
+
+
+async def test_extract_and_apply_records_async_tool_call_for_date_resolution(store):
+    """ASK 5: resolving a natural-language agreed_date off-path records an
+    async (off-path) tool call that does NOT contribute to call latency. The
+    already-ISO fast path would record none. Fails if async tracking reverts.
+    """
+    bedrock = FakeBedrock(
+        {
+            "disposition": "promise_to_pay",
+            "payment_specifics": {
+                "promised_amount": 100,
+                "agreed_date": "next month 1st Monday",  # natural phrase -> CI runs
+                "preferred_payment_method": None,
+            },
+            "contextual_data": {"reason_for_delinquency": None, "customer_sentiment": None},
+            "next_best_action": "Send link",
+        }
+    )
+
+    def twilio_factory(*_a):
+        return _InsightsTwilioClient()
+
+    changes = await extract_and_apply(
+        _call_record(),
+        store,
+        _settings(),
+        bedrock_client=bedrock,
+        twilio_client_factory=twilio_factory,
+        code_interpreter_factory=_ci_factory("2024-06-03"),
+    )
+
+    async_calls = changes["async_tool_calls"]
+    assert any(
+        c["tool"] == "resolve_date_phrase" and c["kind"] == "async"
+        for c in async_calls
+    )
+    # Async entries carry no call-timeline t_ms and are flagged off-path.
+    for c in async_calls:
+        assert c["t_ms"] is None
+        assert c["off_path"] is True
+
+
+async def test_agreed_date_backfilled_from_captured_phrase_when_llm_null(store):
+    """ASK 8 backfill: when the LLM returns agreed_date=null but the in-call
+    capture tool stored a resolvable promised_date_phrase on the due record,
+    the resolved ISO date backfills structured_data.payment_specifics.agreed_date
+    (the field the UI reads), not only due.promised_date.
+    """
+    store.update_due("ACC-1001", promised_date_phrase="second tuesday of next month")
+    bedrock = FakeBedrock(
+        {
+            "disposition": "promise_to_pay",
+            "payment_specifics": {"promised_amount": 625, "agreed_date": None,
+                                  "preferred_payment_method": None},
+            "contextual_data": {"reason_for_delinquency": None, "customer_sentiment": None},
+            "next_best_action": "Follow up",
+        }
+    )
+
+    changes = await extract_and_apply(
+        _call_record(account_id="ACC-1001"),
+        store,
+        _settings(),
+        bedrock_client=bedrock,
+        twilio_client_factory=lambda *a: _InsightsTwilioClient(),
+        code_interpreter_factory=_ci_factory("2024-07-09"),
+    )
+
+    # The UI field is backfilled from the captured phrase resolution.
+    assert changes["structured_data"]["payment_specifics"]["agreed_date"] == "2024-07-09"
+    # due.promised_date also resolved to the ISO date.
+    assert store.get_due("ACC-1001")["promised_date"] == "2024-07-09"

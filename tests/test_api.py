@@ -188,6 +188,79 @@ def test_calls_expose_postcall_intelligence_fields(store):
     assert full["ptp_sms_status"] == "sent"
 
 
+def test_calls_serialize_feat003_fields(store):
+    """FEAT-003: the full record serialized by GET /api/calls/{id} must carry
+    the renamed/added fields so FEAT-004's UI can read them -- twilio_insights,
+    transport_delay_estimate_ms, per-turn tool_calls + response_wait_ms +
+    turn_elapsed_ms + interrupted, barge_in_events, and async_tool_calls. The
+    list summary also exposes transport_delay_estimate_ms.
+    """
+    analytics = {
+        "call_sid": "CA_feat003",
+        "account_id": "ACC-1001",
+        "total_e2e_ms": 5000.0,
+        "nova_total_ms": 3000.0,
+        "transport_delay_estimate_ms": 42.0,
+        "twilio_latency_ms": 42.0,
+        "non_nova_ms": 2000.0,
+        "turn_count": 2,
+        "conversation_turns": [
+            {
+                "index": 0,
+                "speaker": "assistant",
+                "text": "Hello.",
+                "response_wait_ms": 120.0,
+                "latency_ms": 120.0,
+                "turn_elapsed_ms": 500.0,
+                "total_ms": 500.0,
+                "interrupted": True,
+                "barge_in_ms": [1500.0],
+                "tool_calls": [
+                    {"tool": "update_due_record", "kind": "sync", "t_ms": 1200.0}
+                ],
+            },
+            {"index": 1, "speaker": "user", "text": "Hi.", "interrupted": False,
+             "tool_calls": []},
+        ],
+        "barge_in_events": [{"type": "barge_in", "t_ms": 1500.0}],
+        "async_tool_calls": [
+            {"tool": "resolve_date_phrase", "kind": "async", "t_ms": None, "off_path": True}
+        ],
+        "twilio_insights": {
+            "available": True,
+            "source": "twilio_call_resource",
+            "advanced_qos_available": False,
+            "advanced_qos_reason": "advanced QoS add-on not enabled",
+            "fields": {"status": "completed", "duration": "90", "from": "+15005550006"},
+        },
+    }
+    store.save_call_analytics(analytics)
+
+    # List summary carries the accurate-named transport estimate.
+    calls = client.get("/api/calls").json()["calls"]
+    summary = next(c for c in calls if c["call_sid"] == "CA_feat003")
+    assert summary["transport_delay_estimate_ms"] == 42.0
+
+    full = client.get("/api/calls/CA_feat003").json()
+    # ASK 2/6 twilio_insights.
+    assert full["twilio_insights"]["available"] is True
+    assert full["twilio_insights"]["advanced_qos_available"] is False
+    assert full["twilio_insights"]["fields"]["status"] == "completed"
+    assert full["transport_delay_estimate_ms"] == 42.0
+    # ASK 1 accurate per-turn field names.
+    asst = full["conversation_turns"][0]
+    assert asst["response_wait_ms"] == 120.0
+    assert asst["turn_elapsed_ms"] == 500.0
+    # ASK 5 per-turn tool_calls + call-level async_tool_calls.
+    assert asst["tool_calls"][0]["tool"] == "update_due_record"
+    assert asst["tool_calls"][0]["kind"] == "sync"
+    assert full["async_tool_calls"][0]["kind"] == "async"
+    assert full["async_tool_calls"][0]["t_ms"] is None
+    # ASK 7 interrupted + inline barge-in markers.
+    assert asst["interrupted"] is True
+    assert full["barge_in_events"] == [{"type": "barge_in", "t_ms": 1500.0}]
+
+
 def test_get_call_unknown_id_returns_404(store):
     resp = client.get("/api/calls/does-not-exist")
     assert resp.status_code == 404

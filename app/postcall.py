@@ -168,15 +168,20 @@ def _resolve_date_phrase(
     settings: Settings,
     code_interpreter_factory: Any | None,
     bedrock_client: Any | None,
+    async_tool_calls: list[dict[str, Any]] | None = None,
 ) -> str | None:
     """Resolve a date ``phrase`` to a concrete ISO date.
 
     Fast path: an already-ISO date is parsed with ``strptime`` and both the
-    code-generation model and the code interpreter are skipped entirely.
+    code-generation model and the code interpreter are skipped entirely (and NO
+    async tool call is recorded because no tool ran).
     Otherwise the natural-language phrase is handed to
     :func:`app.code_interpreter.resolve_date_phrase` (off the real-time path),
     where a model WRITES a Python program on the fly and the AWS Bedrock
-    AgentCore Code Interpreter EXECUTES it to compute the date.
+    AgentCore Code Interpreter EXECUTES it to compute the date. ASK 5: that
+    invocation is recorded as an ASYNC (off-path) tool call in
+    ``async_tool_calls`` when a list is provided, so the dashboard can show it
+    without counting it toward call latency.
     """
     text = (phrase or "").strip()
     if not text:
@@ -185,6 +190,15 @@ def _resolve_date_phrase(
         return datetime.strptime(text, "%Y-%m-%d").date().isoformat()
     except ValueError:
         pass
+    if async_tool_calls is not None:
+        async_tool_calls.append(
+            {
+                "tool": "resolve_date_phrase",
+                "kind": "async",
+                "t_ms": None,
+                "off_path": True,
+            }
+        )
     return code_interpreter.resolve_date_phrase(
         text,
         reference_date=reference_date.isoformat(),
@@ -195,12 +209,50 @@ def _resolve_date_phrase(
     )
 
 
+def _enrich_twilio_insights(
+    call_record: Mapping[str, Any],
+    settings: Settings,
+    twilio_client_factory: Any | None,
+) -> dict[str, Any]:
+    """Fetch the REAL Twilio Call resource OFF-PATH (ASK 2/6), never raising.
+
+    Delegates to :func:`app.twilio_client.fetch_call_insights`, which already
+    degrades gracefully. This wrapper adds a belt-and-braces guard so that even
+    an unexpected error during enrichment can never crash the post-call task;
+    it returns an explicit unavailable marker instead of fabricating data.
+    """
+    call_sid = call_record.get("call_sid") or call_record.get("call_id")
+    try:
+        from app.twilio_client import fetch_call_insights
+
+        return fetch_call_insights(
+            str(call_sid) if call_sid else None,
+            settings=settings,
+            client_factory=twilio_client_factory,
+        )
+    except Exception as exc:  # noqa: BLE001 - enrichment must never crash
+        logger.warning(
+            "call_sid=<%s> | twilio insights enrichment errored (%s)",
+            call_sid,
+            type(exc).__name__,
+        )
+        return {
+            "available": False,
+            "source": "unavailable",
+            "advanced_qos_available": False,
+            "advanced_qos_reason": None,
+            "fields": {},
+            "error": type(exc).__name__,
+        }
+
+
 def _build_structured_data(
     parsed: Mapping[str, Any],
     reference_date,
     settings: Settings,
     code_interpreter_factory: Any | None,
     bedrock_client: Any | None,
+    async_tool_calls: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Map the parsed model JSON to the stored structured_data shape.
 
@@ -222,7 +274,12 @@ def _build_structured_data(
     resolved_date = None
     if isinstance(agreed, str) and agreed.strip():
         resolved_date = _resolve_date_phrase(
-            agreed, reference_date, settings, code_interpreter_factory, bedrock_client
+            agreed,
+            reference_date,
+            settings,
+            code_interpreter_factory,
+            bedrock_client,
+            async_tool_calls=async_tool_calls,
         )
     data["payment_specifics"]["agreed_date"] = resolved_date
 
@@ -411,6 +468,15 @@ async def extract_and_apply(
         "triggers": [],
     }
 
+    # ASK 2/6: fetch the REAL Twilio Call resource OFF-PATH (post-call only).
+    # This is intentionally done up front and independently of the LLM
+    # extraction so that even if extraction fails the authentic Twilio facts
+    # are still persisted. It degrades gracefully (never raises) and never
+    # fabricates data. ``call_sid`` keyword matches the fetch signature.
+    changes["twilio_insights"] = _enrich_twilio_insights(
+        call_record, settings, twilio_client_factory
+    )
+
     try:
         if bedrock_client is None:  # pragma: no cover - requires AWS creds/network
             import boto3
@@ -419,13 +485,25 @@ async def extract_and_apply(
                 "bedrock-runtime", region_name=settings.aws_region
             )
 
+        # ASK 5: collect ASYNC (post-call, off-path) tool-call entries. The
+        # AgentCore Code Interpreter date resolution runs here, after the call,
+        # so it is classified kind='async' with t_ms=None (NOT part of call
+        # latency). We record one entry each time a natural-language phrase is
+        # actually resolved (the already-ISO fast path invokes no tool).
+        async_tool_calls: list[dict[str, Any]] = []
+
         transcript = _transcript_text(call_record)
         parsed = _classify(transcript, settings, bedrock_client)
 
         disposition = _normalize_disposition(parsed.get("disposition"))
         reference_date = datetime.now(timezone.utc).date()
         structured_data = _build_structured_data(
-            parsed, reference_date, settings, code_interpreter_factory, bedrock_client
+            parsed,
+            reference_date,
+            settings,
+            code_interpreter_factory,
+            bedrock_client,
+            async_tool_calls=async_tool_calls,
         )
         next_best_action = parsed.get("next_best_action")
 
@@ -446,6 +524,7 @@ async def extract_and_apply(
                     settings,
                     code_interpreter_factory,
                     bedrock_client,
+                    async_tool_calls=async_tool_calls,
                 )
                 if resolved_promise:
                     try:
@@ -455,12 +534,21 @@ async def extract_and_apply(
                             "account_id=<%s> | could not write resolved promised_date",
                             account_id,
                         )
+                    # ASK 8 backfill: when the LLM returned no agreed_date but
+                    # the in-call capture tool recorded a resolvable phrase,
+                    # prefer the captured-phrase resolution to populate the UI
+                    # field (structured_data.payment_specifics.agreed_date), not
+                    # only due.promised_date. Off-path, guarded.
+                    if not structured_data["payment_specifics"].get("agreed_date"):
+                        structured_data["payment_specifics"]["agreed_date"] = resolved_promise
 
         changes["disposition"] = disposition
         changes["structured_data"] = structured_data
         changes["next_best_action"] = (
             next_best_action if isinstance(next_best_action, str) else None
         )
+        # ASK 5: persist the call-level async (off-path) tool calls.
+        changes["async_tool_calls"] = async_tool_calls
 
         triggers: list[str] = []
         # -- downstream triggers ------------------------------------------

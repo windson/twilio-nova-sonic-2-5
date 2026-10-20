@@ -152,6 +152,143 @@ def send_sms(
     )
 
 
+# Authentic Twilio Call-resource attributes we persist for a completed call
+# (ASK 2, FEAT-001 finding b). These are real transport/billing facts obtainable
+# via GET /2010-04-01/Accounts/{sid}/Calls/{CallSid}.json. We deliberately do
+# NOT include advanced Voice Insights QoS (RTT/jitter/packet-loss/MOS): that is
+# a paid add-on NOT enabled on the trial account, so it is marked unavailable
+# rather than fabricated.
+_CALL_RESOURCE_FIELDS = (
+    "sid",
+    "parent_call_sid",
+    "to",
+    "to_formatted",
+    "from_",
+    "from_formatted",
+    "status",
+    "start_time",
+    "end_time",
+    "duration",
+    "price",
+    "price_unit",
+    "direction",
+    "answered_by",
+    "queue_time",
+    "date_created",
+    "date_updated",
+)
+
+# Marker string used when the paid Voice Insights Advanced Features add-on is
+# not enabled (the trial-account reality, per FEAT-001). The UI shows this
+# verbatim so the limitation is stated honestly instead of fabricating QoS.
+ADVANCED_QOS_UNAVAILABLE_REASON = (
+    "Voice Insights Advanced Features (RTT/jitter/packet-loss/MOS) is a paid "
+    "add-on not enabled on this account; advanced QoS is unavailable."
+)
+
+
+def _coerce_call_field(value: Any) -> Any:
+    """Make a Twilio Call attribute JSON/DynamoDB-serializable.
+
+    Twilio returns ``datetime`` for the timestamp fields and ``Decimal``/str for
+    price. We stringify datetimes to ISO-8601 and leave scalars as-is so the
+    stored record contains plain JSON-friendly values (never the auth token).
+    """
+    if value is None:
+        return None
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        try:
+            return isoformat()
+        except Exception:  # noqa: BLE001 - defensive, never crash enrichment
+            return str(value)
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def fetch_call_insights(
+    call_sid: str | None,
+    *,
+    settings: Settings | None = None,
+    client_factory: Any | None = None,
+) -> dict[str, Any]:
+    """Fetch the REAL Twilio Call resource for a completed call (OFF-PATH).
+
+    ASK 2/6: this runs POST-CALL only (wired from :mod:`app.postcall`), never on
+    the real-time audio path. It reads the authentic Call-resource fields
+    (duration, start/end timestamps, from/to, status, price, direction, ...) via
+    the existing ``twilio.rest.Client`` using the Secrets-Manager-stored
+    credentials; the auth token is never logged. It ALWAYS degrades gracefully:
+    on missing creds / missing call_sid / any API error it returns an explicit
+    ``available=False`` marker rather than raising, so a post-call failure can
+    never crash the pipeline and we never fabricate data.
+
+    Advanced Voice Insights QoS (RTT/jitter/packet-loss/MOS) is a paid add-on
+    NOT enabled on the trial account (FEAT-001 finding b); it is always marked
+    ``advanced_qos_available=False`` with a human-readable reason, never faked.
+
+    Args:
+        call_sid: The completed Twilio Call sid to fetch.
+        settings: Settings override (defaults to :func:`get_settings`).
+        client_factory: Injectable ``twilio.rest.Client`` factory (mocked in
+            tests). Defaults to the real client.
+
+    Returns:
+        A ``twilio_insights`` dict: ``{available, source, advanced_qos_available,
+        advanced_qos_reason, fields}``. ``fields`` holds the authentic
+        Call-resource values when available, else is empty.
+    """
+    settings = settings or get_settings()
+
+    base: dict[str, Any] = {
+        "available": False,
+        "source": "twilio_call_resource",
+        "advanced_qos_available": False,
+        "advanced_qos_reason": ADVANCED_QOS_UNAVAILABLE_REASON,
+        "fields": {},
+    }
+
+    if not call_sid:
+        base["source"] = "unavailable"
+        base["error"] = "no_call_sid"
+        return base
+    if not settings.twilio_configured:
+        base["source"] = "unavailable"
+        base["error"] = "twilio_not_configured"
+        return base
+
+    try:
+        client = _make_client(settings, client_factory=client_factory)
+        call = client.calls(call_sid).fetch()
+        fields: dict[str, Any] = {}
+        for name in _CALL_RESOURCE_FIELDS:
+            # ``from_``/``to`` etc. live as attributes on the Twilio Call
+            # instance; map ``from_`` to a friendly ``from`` key for the UI.
+            value = getattr(call, name, None)
+            key = "from" if name == "from_" else name
+            fields[key] = _coerce_call_field(value)
+        base["available"] = True
+        base["fields"] = fields
+        logger.info(
+            "call_sid=<%s>, status=<%s> | twilio call insights fetched",
+            call_sid,
+            fields.get("status"),
+        )
+    except Exception as exc:  # noqa: BLE001 - never crash post-call enrichment
+        base["available"] = False
+        base["source"] = "unavailable"
+        base["error"] = type(exc).__name__
+        # Log WITHOUT the exception payload detail that might echo creds; only
+        # the type name and call sid are recorded.
+        logger.warning(
+            "call_sid=<%s> | twilio call insights fetch failed (%s)",
+            call_sid,
+            type(exc).__name__,
+        )
+    return base
+
+
 def place_outbound_call(
     to: str,
     account_record: Mapping[str, Any] | None = None,
