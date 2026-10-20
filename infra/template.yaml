@@ -316,6 +316,12 @@ Resources:
                   - codebuild:StartBuild
                   - codebuild:BatchGetBuilds
                 Resource: !GetAtt ImageBuildProject.Arn
+              # Self re-invoke (async) while the build is IN_PROGRESS so the
+              # poller never exceeds the Lambda timeout. Name-pattern ARN avoids
+              # a circular dependency on ImageBuildFn.
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-ImageBuildFn-*"
 
   # Lambda-backed custom resource: on Create/Update it starts the CodeBuild
   # build and polls BatchGetBuilds until completion, then signals CloudFormation
