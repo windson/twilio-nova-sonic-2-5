@@ -217,9 +217,11 @@ Resources:
         ScanOnPush: true
 
   # --- In-stack image build (replaces scripts/codebuild_image.sh) ------------
-  # CodeBuild clones the PUBLIC GitHub repo (no SourceCredential needed) and
-  # runs infra/buildspec.yml to build + push the image to AppEcrRepo. Triggered
-  # on Create/Update by the ImageBuildTrigger custom resource below.
+  # CodeBuild clones the GitHub repo (GitHubRepoUrl@SourceVersion; add an
+  # AWS::CodeBuild::SourceCredential if the repo is private) and runs
+  # infra/buildspec.yml to build + push the image to AppEcrRepo. Triggered on
+  # Create/Update by the ImageBuildTrigger custom resource. When a ContainerImage
+  # override is supplied, the trigger skips the build (SkipBuild=true).
   CodeBuildLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -339,7 +341,7 @@ Resources:
           PROJECT_NAME: !Ref ImageBuildProject
       Code:
         ZipFile: |
-          import json, urllib.request, boto3
+          import json, os, time, urllib.request, boto3
           cb = boto3.client("codebuild")
           lam = boto3.client("lambda")
 
@@ -358,15 +360,24 @@ Resources:
 
           def handler(event, context):
               rt = event.get("RequestType")
+              props = event.get("ResourceProperties", {}) or {}
               try:
                   if rt == "Delete":
                       return send(event, context, "SUCCESS", {}, event.get("PhysicalResourceId"))
+                  # ContainerImage override set => task runs that image; skip build.
+                  if str(props.get("SkipBuild", "")).lower() == "true":
+                      return send(event, context, "SUCCESS", {"Skipped": "true"},
+                                  event.get("PhysicalResourceId") or "image-build-skipped")
                   build_id = event.get("BuildId")
                   if not build_id:
-                      import os
-                      resp = cb.start_build(projectName=os.environ["PROJECT_NAME"])
-                      build_id = resp["build"]["id"]
-                  status = cb.batch_get_builds(ids=[build_id])["builds"][0]["buildStatus"]
+                      build_id = cb.start_build(projectName=os.environ["PROJECT_NAME"])["build"]["id"]
+                  # Poll within this invocation, then re-invoke for the rest so we
+                  # never exceed the timeout nor drop the poller mid-build.
+                  for _ in range(12):
+                      status = cb.batch_get_builds(ids=[build_id])["builds"][0]["buildStatus"]
+                      if status != "IN_PROGRESS":
+                          break
+                      time.sleep(15)
                   if status == "IN_PROGRESS":
                       ev = dict(event); ev["BuildId"] = build_id
                       lam.invoke(FunctionName=context.function_name,
@@ -386,6 +397,9 @@ Resources:
       ServiceToken: !GetAtt ImageBuildFn.Arn
       ImageTag: !Ref ImageTag
       SourceVersion: !Ref SourceVersion
+      # When ContainerImage is set, the task runs that image and the in-stack
+      # build is skipped (the source repo need not be cloneable here).
+      SkipBuild: !If [HasContainerImageOverride, "true", "false"]
 
   # --- CloudWatch logs -------------------------------------------------------
   AppLogGroup:
@@ -455,10 +469,8 @@ Resources:
                   - bedrock:InvokeModel
                 Resource:
                   - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${NovaModelId}"
-        # Off-path post-call extraction (app/postcall.py) via Bedrock Converse on
-        # the TEXT model; also reused by app/code_interpreter.py to author the
-        # date-resolution program. Scoped to exactly ExtractionModelId so grant
-        # and EXTRACTION_MODEL_ID env var cannot drift.
+        # Off-path post-call extraction (app/postcall.py) on the TEXT model, also
+        # reused by app/code_interpreter.py. Scoped to exactly ExtractionModelId.
         - PolicyName: bedrock-text-extraction
           PolicyDocument:
             Version: "2012-10-17"
@@ -468,15 +480,10 @@ Resources:
                   - bedrock:InvokeModel
                 Resource:
                   - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${ExtractionModelId}"
-        # Off-path natural-language date resolution (app/code_interpreter.py):
-        # start/invoke/stop against the managed aws.codeinterpreter.v1 default.
-        # Runs only in the post-call task, never on the audio path.
-        # The BUILT-IN interpreter lives in the special account segment "aws"
-        # (arn:...:bedrock-agentcore:<region>:aws:code-interpreter/aws.codeinterpreter.v1),
-        # NOT the caller's account id - verified against the official CFN pattern
-        # (aws|[0-9]{12}) for CodeInterpreterArn and the live AccessDenied log for
-        # CA7893e62ca50768dcfc789ebfd50d3e2c. Also allow any custom interpreter in
-        # this account and the per-session resource created by StartCodeInterpreterSession.
+        # Off-path date resolution (app/code_interpreter.py), post-call only. The
+        # BUILT-IN interpreter arn uses the literal account segment "aws" (per the
+        # official CFN pattern (aws|[0-9]{12})), not the caller account; also allow
+        # custom in-account interpreters + the per-session resource. See DEPLOYMENT.md.
         - PolicyName: agentcore-code-interpreter
           PolicyDocument:
             Version: "2012-10-17"
@@ -636,10 +643,8 @@ Resources:
       SourcePrefixListId: !Ref CloudFrontOriginFacingPrefixListId
       Description: HTTP from CloudFront origin-facing edge IPs only (Option 1).
 
-  # Option 2 (CloudFront VPC origin): ALB is internal, reached only via the VPC
-  # origin ENI. Per AWS VPC-origins guidance the origin SG is opened to the
-  # origin-facing prefix list (avoids a circular dep on CloudFront's managed SG);
-  # the security gain is the ALB being internal/no-public-IP in a private subnet.
+  # Option 2 (CloudFront VPC origin): internal ALB reached only via the VPC origin
+  # ENI; origin SG opened to the origin-facing prefix list. See DEPLOYMENT.md.
   AlbIngressHttpVpcOriginV4:
     Type: AWS::EC2::SecurityGroupIngress
     Condition: UseVpcOriginCond
@@ -809,9 +814,7 @@ Resources:
     Properties:
       Type: application
       Scheme: !If [UseVpcOriginCond, internal, internet-facing]
-      # IPv4 in both postures (sufficient for the private VPC-origin path; a
-      # dualstack internal ALB would need per-subnet IPv6 /64s sliced from an
-      # Amazon-provided VPC block, not derivable in one pass for an external VPC).
+      # IPv4 in both postures (sufficient for the VPC-origin path). See DEPLOYMENT.md.
       IpAddressType: ipv4
       Subnets: !If
         - UseVpcOriginCond
