@@ -298,9 +298,11 @@ def test_call_dashboard_url_scoped_to_call_sid_and_config(store):
     """ASK 4 / D3: both the /api/calls list summary and the full /api/calls/{id}
     record carry a per-call CloudWatch dashboard deep-link that OPENS the
     CONSOLIDATED per-call dashboard (``#dashboards:name=<stack>-per-call``)
-    scoped to the call_sid, built from the configured region + app log group (no
-    live AWS call). Fails if the dashboard_url is dropped, reverts to the old
-    logs-insights-only shape, is not scoped to the call, or ignores the config.
+    built from the configured region + app log group (no live AWS call). BUG 2:
+    the fragment name segment must be EXACTLY the dashboard name (no fused
+    RISON/$-escape blob) so the console does not reject it. Fails if the
+    dashboard_url is dropped, reverts to the old logs-insights-only shape, or
+    ignores the config.
     """
     analytics = {
         "call_sid": "CA_dash",
@@ -333,10 +335,10 @@ def test_call_dashboard_url_scoped_to_call_sid_and_config(store):
         # Dashboard name derived from the configured log group's stack segment.
         assert "my-stack-per-call" in url
         assert "ar-collections-nova-sonic" not in url
-        # Scoped to THIS call_sid via the dashboard variable override token.
-        assert "params" in url
-        assert "CALL_SID_TOKEN" in url
-        assert "CA_dash" in url
+        # BUG 2: name segment is EXACTLY the dashboard name, nothing fused on.
+        name_segment = url.split("#dashboards:name=", 1)[1]
+        assert name_segment == "my-stack-per-call"
+        assert "$3F" not in url and "$3D" not in url and "params" not in url
 
 
 def test_call_dashboard_url_builder_unit():
@@ -353,10 +355,9 @@ def test_call_dashboard_url_builder_unit():
 
     url = call_dashboard_url("CA_unit", aws_region="us-west-2", app_log_group="/ecs/s/app")
     assert url.startswith("https://us-west-2.console.aws.amazon.com/cloudwatch/home")
-    # Consolidated per-call dashboard fragment, scoped via the variable token.
-    assert "#dashboards:name=s-per-call$3Fparams$3D" in url
-    assert "CALL_SID_TOKEN" in url
-    assert "CA_unit" in url
+    # BUG 2: clean named-dashboard fragment; name segment is exactly the name.
+    assert url.endswith("#dashboards:name=s-per-call")
+    assert "$3F" not in url and "$3D" not in url and "params" not in url
     assert "logsV2:logs-insights" not in url
 
 

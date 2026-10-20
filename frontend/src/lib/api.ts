@@ -326,34 +326,20 @@ export function dispositionLabel(disposition?: string | null): string {
 
 // ASK 4 / D3: build the deep-link that OPENS the CONSOLIDATED per-call
 // CloudWatch DASHBOARD (<stack>-per-call, provisioned in infra/template.yaml)
-// with its multi-widget view scoped to a single call_sid: per-turn timeline,
-// TTFT + turns, token usage, barge-ins, tool calls and Twilio/transport. The
-// dashboard's log widgets filter on a pattern dashboard variable whose token
-// (CALL_SID_TOKEN) this link overrides with the call_sid, so every widget loads
-// already filtered to the call. The backend returns this same URL on each call
-// record (dashboard_url); this client-side builder mirrors that construction
-// exactly and is used as a fallback when the backend field is absent.
+// with its multi-widget view: per-turn timeline, TTFT + turns, token usage,
+// barge-ins, tool calls and Twilio/transport. The dashboard's log widgets
+// filter on a pattern dashboard variable (CALL_SID_TOKEN); the operator pastes
+// the call_sid into the dashboard's CALL_SID input box to scope every widget to
+// the call. The backend returns this same URL on each call record
+// (dashboard_url); this client-side builder mirrors that construction exactly
+// and is used as a fallback when the backend field is absent.
 //
-// Encoding mirrors app/dashboard.py: each literal is percent-encoded then "%"
-// is rewritten to the console's "*" escape; "?"/"=" in the fragment use the
-// console's "$3F"/"$3D" escapes; the params value is the console's RISON-like
-// "~(...)" token tree carrying the dashboard-variable override.
-const CALL_SID_TOKEN = "CALL_SID_TOKEN";
+// BUG 2: the documented dashboards deep-link is "#dashboards:name=<name>" with
+// the name segment being EXACTLY the dashboard name (alphanumerics, "-", "_").
+// The previous builder fused a RISON "$3Fparams$3D~(...)" variable-override
+// blob onto the name, so the console parsed it as the DashboardName and
+// rejected it. We now emit the clean named-dashboard link.
 const DEFAULT_STACK_NAME = "ar-collections-nova-sonic";
-
-function consoleToken(value: string): string {
-  let out = "";
-  for (const ch of value) {
-    if (/[A-Za-z0-9\-_.]/.test(ch)) {
-      out += ch;
-    } else {
-      for (const byte of new TextEncoder().encode(ch)) {
-        out += "*" + byte.toString(16).toUpperCase().padStart(2, "0");
-      }
-    }
-  }
-  return out;
-}
 
 // The per-call Logs Insights query the dashboard widgets are built from; kept
 // mirrored with app/dashboard.py so the two stay in lock-step.
@@ -385,13 +371,20 @@ export function callDashboardUrl(
   awsRegion?: string | null,
   appLogGroup?: string | null
 ): string {
+  // callSid is kept in the signature (mirrors app/dashboard.call_dashboard_url
+  // and lets callers pass it) but is no longer embedded in the URL -- the
+  // operator types it into the dashboard's CALL_SID input box.
+  void callSid;
   const region = awsRegion || "us-east-1";
   const name = `${stackNameFromLogGroup(appLogGroup)}-per-call`;
-  // Dashboard-variable override token tree the console reads from the URL:
-  //   ~(~(name~'CALL_SID_TOKEN~value~'<call_sid>))
-  const variables =
-    `~(~(name~'${consoleToken(CALL_SID_TOKEN)}` +
-    `~value~'${consoleToken(callSid)}))`;
+  // BUG 2 fix: the documented CloudWatch dashboards deep-link is
+  //   #dashboards:name=<DashboardName>
+  // where the name segment is EXACTLY the dashboard name (alphanumerics, "-",
+  // "_" only). Fusing a "$3Fparams$3D~(...)" variable-override blob onto the
+  // name made the console read it as part of the name and reject it with
+  // "DashboardName contains invalid characters". We emit the clean named-
+  // dashboard link (no error); the operator types the call_sid into the
+  // dashboard's CALL_SID input box to scope every widget to the call.
   const base = `https://${region}.console.aws.amazon.com/cloudwatch/home?region=${region}`;
-  return `${base}#dashboards:name=${consoleToken(name)}$3Fparams$3D${variables}`;
+  return `${base}#dashboards:name=${name}`;
 }

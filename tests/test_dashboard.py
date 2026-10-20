@@ -11,7 +11,6 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.dashboard import (
-    CALL_SID_TOKEN,
     call_dashboard_query,
     call_dashboard_url,
     per_call_dashboard_name,
@@ -31,13 +30,22 @@ def test_url_targets_consolidated_dashboards_fragment_not_logs_insights():
     assert "queryDetail" not in url
 
 
-def test_url_includes_call_sid_scoping_token():
-    url = call_dashboard_url("CA-ABC-999", aws_region="us-east-1")
-    # The call_sid is carried as the dashboard-variable override value and the
-    # variable token name is the pattern token the widgets filter on.
-    assert "params" in url
-    assert CALL_SID_TOKEN in url  # the pattern variable's token name
-    assert "CA-ABC-999" in url  # the call_sid value (unreserved chars stay bare)
+def test_url_name_segment_is_exactly_the_valid_dashboard_name():
+    """BUG 2: the fragment ``name`` segment must be EXACTLY the dashboard name
+    (valid DashboardName chars only) with NO $-escapes / RISON blob fused onto
+    it, otherwise the console rejects it with "DashboardName contains invalid
+    characters".
+    """
+    url = call_dashboard_url("CA3b7e801f39a87eae9f0af33b18a9875d", aws_region="us-east-1")
+    # Isolate the name token (everything after "name=" to the end of the URL).
+    name_segment = url.split("#dashboards:name=", 1)[1]
+    assert name_segment == "ar-collections-nova-sonic-per-call"
+    # No leftover variable-override escapes anywhere in the URL.
+    assert "$3F" not in url and "$3D" not in url
+    assert "params" not in url
+    assert "~(" not in url
+    # Every character of the name segment is a VALID DashboardName character.
+    assert all(ch.isalnum() or ch in "-_" for ch in name_segment)
 
 
 def test_url_uses_region_and_derives_stack_from_log_group():

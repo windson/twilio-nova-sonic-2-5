@@ -155,6 +155,45 @@ def _launch_postcall(
     return task
 
 
+def _persist_analytics(
+    metrics: "CallMetrics | None",
+    store: Any,
+    stream_sid: str | None,
+) -> None:
+    """Persist the call analytics + launch post-call intelligence, exactly once.
+
+    Called from BOTH the graceful end-of-call sequence (before the Twilio
+    hangup, so a tool-ended call persists its finalized ``total_e2e_ms``) and
+    the ``/media`` websocket ``finally`` (the normal path). It is idempotent per
+    call via a one-shot flag on the ``CallMetrics`` instance: the first caller
+    saves the record and launches the fire-and-forget post-call task; any later
+    caller (e.g. the finally re-running after the hangup dropped the socket) is
+    a no-op, so there is no double-save / double-extract race.
+
+    ``metrics.on_session_end()`` must already have run (via
+    ``SonicSession.finalize_metrics()``) so the saved record carries the
+    computed duration metrics; this helper only reads/persists them.
+    """
+    if metrics is None:
+        return
+    if getattr(metrics, "_persisted", False):
+        return
+    metrics._persisted = True  # type: ignore[attr-defined]
+    saved_record: dict[str, Any] | None = None
+    try:
+        saved_record = store.save_call_analytics(metrics.to_call_analytics())
+    except Exception:  # noqa: BLE001 - persistence must not crash teardown
+        logger.exception("stream_sid=<%s> | failed to persist analytics", stream_sid)
+
+    # Launch the post-call intelligence extraction as a FIRE-AND-FORGET asyncio
+    # task AFTER the call ended and analytics were saved. It runs entirely off
+    # the real-time audio/turn path, so it cannot add to call latency or to the
+    # metrics already frozen above. Guarded so a missing config / scheduling
+    # issue never raises into the websocket teardown.
+    if saved_record is not None:
+        _launch_postcall(saved_record, store, get_settings())
+
+
 def _dashboard_url(call_sid: str | None) -> str | None:
     """Build the per-call CloudWatch dashboard deep-link from config (ASK 4).
 
@@ -370,11 +409,26 @@ async def media_stream(websocket: WebSocket) -> None:
                 end_call_sid = call_sid
 
                 async def _end_session() -> None:
-                    # Terminal action: drop the Twilio call (idempotent + failure
-                    # safe), then close the SonicSession so the existing
-                    # finally-block teardown (save_call_analytics + _launch_postcall)
-                    # runs exactly as today. close() is itself idempotent, so this
-                    # never double-runs teardown.
+                    # BUG 1 graceful end-of-call. Deterministic terminal
+                    # ordering so the caller hears the full farewell AND the
+                    # persisted analytics always carry total_e2e_ms:
+                    #   (a) let the already-generated farewell audio finish
+                    #       draining/playing to Twilio (bounded, never forever);
+                    #   (b) finalize the call metrics (on_session_end computes
+                    #       total_e2e_ms / non_nova_ms and emits call_end_summary)
+                    #       and persist the analytics BEFORE the hangup, so the
+                    #       tool-driven path yields the same record a normal
+                    #       hangup does even though the hangup will tear the
+                    #       socket (and its finally) down out from under us;
+                    #   (c) THEN hang up the Twilio call (idempotent + failure
+                    #       safe) and close the SonicSession.
+                    # Every step is guarded so it runs even if a prior step
+                    # failed, and finalize/persist are idempotent so the /media
+                    # finally re-running them after the hangup is a no-op.
+                    if session is not None:
+                        await session.drain_outbound_audio()
+                        session.finalize_metrics()
+                    _persist_analytics(metrics, store, stream_sid)
                     try:
                         hangup_call(end_call_sid)
                     except Exception:  # noqa: BLE001 - hangup must never crash teardown
@@ -436,23 +490,16 @@ async def media_stream(websocket: WebSocket) -> None:
         logger.exception("stream_sid=<%s> | media stream error", stream_sid)
     finally:
         if session is not None:
+            # Idempotent: ensures on_session_end() ran even on the normal (non
+            # tool) hangup path where the graceful end sequence never fired.
+            session.finalize_metrics()
             await session.close()
         # Persist post-call analytics so the UI/API (FEAT-004) can read history.
-        if metrics is not None:
-            saved_record: dict[str, Any] | None = None
-            try:
-                saved_record = store.save_call_analytics(metrics.to_call_analytics())
-            except Exception:  # noqa: BLE001 - persistence must not crash teardown
-                logger.exception("stream_sid=<%s> | failed to persist analytics", stream_sid)
-
-            # Launch the post-call intelligence extraction as a FIRE-AND-FORGET
-            # asyncio task AFTER the call ended and analytics were saved. It
-            # runs entirely off the real-time audio/turn path, so it cannot add
-            # to call latency or to the metrics already frozen above. It is
-            # guarded so a missing config / scheduling issue never raises into
-            # the websocket teardown.
-            if saved_record is not None:
-                _launch_postcall(saved_record, store, get_settings())
+        # Idempotent: the graceful end-of-call path (_end_session) may have
+        # already persisted + launched the post-call task before the hangup
+        # dropped this socket; _persist_analytics() guards against doing it
+        # twice (one save, one post-call launch per call).
+        _persist_analytics(metrics, store, stream_sid)
 
 
 # Mount the compiled React/shadcn dashboard bundle (built from frontend/ into

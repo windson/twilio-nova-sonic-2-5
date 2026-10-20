@@ -15,24 +15,33 @@ appears inside every widget query; a pattern variable rewrites that token across
 the whole dashboard JSON, so overriding it with one ``call_sid`` scopes every
 widget to that call at once.
 
-Scoping mechanism (verified against the AWS "Dashboard Body Structure and
-Syntax" / "Create flexible dashboards with dashboard variables" docs): the
-dashboard declares a ``variables`` entry of ``type: pattern`` whose ``pattern``
-is the literal ``CALL_SID_TOKEN``. The console applies a variable override
-carried in the dashboard URL fragment after the dashboard name, serialized as
-the console's RISON-like ``~(...)`` token tree. Opening
-``#dashboards:name=<dashboard>`` with that token pre-selects the ``call_sid`` so
-the log widgets load already filtered to the call. No live AWS call, no new IAM.
+Scoping mechanism: the dashboard declares a ``variables`` entry of
+``type: pattern`` whose ``pattern`` is the literal ``CALL_SID_TOKEN``. Every log
+widget's query embeds that token, so entering a ``call_sid`` in the dashboard's
+``CALL_SID`` input box rewrites the token across the whole dashboard JSON and
+scopes every widget to that call at once.
 
-Fallback: if the consolidated dashboard has not been deployed yet (older stack),
-the link still resolves to the dashboards console for the named dashboard; the
-operator can type the ``call_sid`` into the dashboard's variable input box. The
-builder never raises and never performs a network call.
+Deep-link grammar (BUG 2 fix, verified against the AWS CloudFormation docs for
+``AWS::CloudWatch::Dashboard`` and the CloudWatch console dashboards fragment):
+the ONLY documented, reliable deep-link to open a dashboard by name is
 
-Encoding: dashboard deep-links use ``$`` escapes in the fragment (``?`` ->
-``$3F``, ``=`` -> ``$3D``) and encode literal strings in the RISON-like token
-tree by URL-percent-encoding them with ``%`` rewritten to the console ``*``
-escape (a space becomes ``*20``). Unreserved chars are left bare.
+    https://<region>.console.aws.amazon.com/cloudwatch/home?region=<region>#dashboards:name=<DashboardName>
+
+where the ``name`` segment contains ONLY the dashboard name. ``DashboardName``
+itself may contain only alphanumerics, ``-`` and ``_`` (the console validates
+this). The PREVIOUS builder fused a RISON ``$3Fparams$3D~(...)`` dashboard-
+variable-override blob directly onto the name segment; because nothing
+terminated the name token, the console parsed
+``ar-collections-nova-sonic-per-call$3Fparams$3D...`` as the DashboardName and
+rejected it with "The value for field DashboardName contains invalid
+characters. It can only contain alphanumerics, dash (-) and underscore (_)."
+
+AWS does not document a stable URL-fragment syntax for pre-filling a dashboard
+PATTERN variable, so (per the fix guidance) we emit the clean, documented
+named-dashboard link that opens the correct dashboard with NO invalid-name
+error; the operator types the ``call_sid`` into the dashboard's ``CALL_SID``
+input box (the dashboard then scopes every widget to that call). The builder is
+a pure string construction -- no live AWS call, no new IAM -- and never raises.
 """
 
 from __future__ import annotations
@@ -72,22 +81,6 @@ def per_call_dashboard_name(stack_name: str | None = None) -> str:
     return f"{stack_name or DEFAULT_STACK_NAME}-per-call"
 
 
-def _console_token(value: str) -> str:
-    """Percent-encode ``value`` then rewrite ``%`` to the console ``*`` escape.
-
-    The CloudWatch console RISON-like fragment encodes literal strings by URL-
-    percent-encoding them and replacing the ``%`` prefix with ``*`` (so a space
-    is ``*20``, a slash ``*2F``). Only unreserved characters are left bare.
-    """
-    out: list[str] = []
-    for ch in value:
-        if ch.isalnum() or ch in "-_.":
-            out.append(ch)
-        else:
-            out.append("".join(f"*{b:02X}" for b in ch.encode("utf-8")))
-    return "".join(out)
-
-
 def call_dashboard_query(call_sid: str, app_log_group: str) -> str:
     """Return a per-call Logs Insights query filtered to one ``call_sid``.
 
@@ -119,28 +112,25 @@ def call_dashboard_url(
     """Build the deep-link that opens the CONSOLIDATED per-call dashboard.
 
     Pure string construction from config (region + stack name); no AWS API
-    call. The returned URL opens ``#dashboards:name=<stack>-per-call`` with the
-    dashboard's pattern variable overridden to ``call_sid`` via the console's
-    RISON-like URL token, so every log widget loads already scoped to the call.
-    ``app_log_group`` is accepted for signature parity with the client mirror
-    (the log group is baked into the dashboard widgets at deploy time).
+    call. Returns the documented named-dashboard deep-link
+
+        .../cloudwatch/home?region=<region>#dashboards:name=<stack>-per-call
+
+    whose fragment ``name`` segment is EXACTLY the dashboard name (valid
+    DashboardName chars only: alphanumerics, ``-``, ``_``) -- nothing is fused
+    onto it, so the console no longer rejects it with "DashboardName contains
+    invalid characters" (BUG 2). The ``call_sid`` is still returned to the
+    caller (and used in :func:`call_dashboard_query`) so the UI can show it and
+    the operator can paste it into the dashboard's ``CALL_SID`` input box to
+    scope every widget to the call. ``app_log_group`` is accepted for signature
+    parity with the client mirror (the log group is baked into the dashboard
+    widgets at deploy time).
     """
     region = aws_region or DEFAULT_REGION
     stack = stack_name or stack_name_from_log_group(app_log_group)
     name = per_call_dashboard_name(stack)
 
-    # Dashboard-variable override token tree the console reads from the URL:
-    #   ~(~(name~'CALL_SID_TOKEN~value~'<call_sid>))
-    # name = the pattern variable's token; value = the call_sid to scope to.
-    sid_tok = _console_token(call_sid)
-    token_tok = _console_token(CALL_SID_TOKEN)
-    variables = f"~(~(name~'{token_tok}~value~'{sid_tok}))"
-    name_tok = _console_token(name)
-
     base = f"https://{region}.console.aws.amazon.com/cloudwatch/home?region={region}"
-    # dashboards fragment with the name and the variable override applied; the
-    # $3F/$3D escapes carry the ?params=<token-tree> the console consumes.
-    return (
-        f"{base}#dashboards:name={name_tok}"
-        f"$3Fparams$3D{variables}"
-    )
+    # dashboards fragment: the name segment is the bare, valid dashboard name
+    # and nothing else, so it terminates cleanly and the console accepts it.
+    return f"{base}#dashboards:name={name}"
