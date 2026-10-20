@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from app import main as main_mod
 from app.config import Settings
 from app.main import app
 from app.store import InMemoryStore, set_default_store
@@ -251,16 +252,35 @@ async def test_launch_postcall_done_callback_logs_and_discards_on_error(store):
     assert task not in main_mod._POSTCALL_TASKS
 
 
-def test_index_serves_dashboard_html():
+def test_index_serves_html():
+    # The dashboard is now a compiled React/Vite/shadcn bundle emitted into
+    # web/ at image-build time. GET / serves web/index.html when the bundle has
+    # been built, otherwise the placeholder landing page. Either way it must be
+    # an HTML 200 that names the service and (when built) loads the module
+    # bundle from the /static mount with a <div id="root"> mount point.
     resp = client.get("/")
     assert resp.status_code == 200
-    # Dashboard root element and the JS bundle are present.
-    assert 'id="app"' in resp.text
-    assert "/static/app.js" in resp.text
-    assert "tiffany" in resp.text
+    assert resp.headers["content-type"].startswith("text/html")
+    body = resp.text
+    assert "AR Collections Nova Sonic 2.5 Agent" in body
+    web_index = main_mod._WEB_DIR / "index.html"
+    if web_index.is_file():
+        # Built bundle: React mount point + hashed JS served under /static/.
+        assert 'id="root"' in body
+        assert "/static/assets/" in body
+    else:
+        # Placeholder fallback (no frontend build present in this checkout).
+        assert "Service is running" in body
 
 
-def test_static_app_js_served():
-    resp = client.get("/static/app.js")
+def test_static_mount_serves_built_assets():
+    # The /static mount serves whatever the frontend build emitted into web/.
+    # When a bundle is present its hashed JS asset must be reachable under
+    # /static/assets/; otherwise this checkout has no built frontend and we skip.
+    assets_dir = main_mod._WEB_DIR / "assets"
+    if not assets_dir.is_dir():
+        pytest.skip("frontend bundle not built in this checkout")
+    js_files = list(assets_dir.glob("*.js"))
+    assert js_files, "expected a built JS asset in web/assets"
+    resp = client.get(f"/static/assets/{js_files[0].name}")
     assert resp.status_code == 200
-    assert "/api/dues" in resp.text

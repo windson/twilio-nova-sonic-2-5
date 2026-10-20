@@ -1,0 +1,1112 @@
+import { useCallback, useMemo, useState } from "react";
+import {
+  ChevronDown,
+  ExternalLink,
+  Info,
+  PhoneCall,
+  Settings2,
+} from "lucide-react";
+
+import {
+  apiPost,
+  cloudwatchLogsUrl,
+  DASH,
+  dispositionLabel,
+  fmtMoney,
+  fmtMs,
+  fmtText,
+  type CallRecord,
+  type DueRecord,
+} from "@/lib/api";
+import {
+  chatSegments,
+  connectionRestarts,
+  latencyPoints,
+} from "@/lib/selectors";
+import {
+  useCallDetail,
+  useCalls,
+  useConfig,
+  useDues,
+} from "@/hooks";
+
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Separator } from "@/components/ui/separator";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+
+import { DispositionBadge } from "@/components/DispositionBadge";
+import { LatencyChart } from "@/components/LatencyChart";
+import { MetricTile } from "@/components/MetricTile";
+
+// --- metric help text (preserves the old metrics-note explanatory content) --
+const METRIC_HELP = {
+  total:
+    "End-to-end wall-clock time of the whole call. It partitions into Nova Sonic total time plus its true complement, non-Nova time.",
+  nova: "Nova Sonic total time: the sum of active response (speaking) windows.",
+  nonnova:
+    "Everything that is not Nova speaking: caller speech, silence, and transport. Equals total minus Nova.",
+  twilio:
+    "Twilio mean transport delay: a separate per-frame measurement (mean, not a share of total), so it is shown on its own rather than as a half of the end-to-end split.",
+  ttft: "Time to first token / first audio of the agent's reply.",
+  turns: "Number of turns in the conversation (one caller utterance or one Nova reply each).",
+  barge: "Count of barge-ins (caller interrupting Nova mid-reply).",
+};
+
+function Toast({
+  toast,
+}: {
+  toast: { message: string; error: boolean } | null;
+}) {
+  if (!toast) return null;
+  return (
+    <div
+      className={
+        "mt-3 rounded-lg border px-4 py-2.5 text-sm " +
+        (toast.error
+          ? "border-destructive bg-destructive/15 text-red-300"
+          : "border-emerald-500/50 bg-emerald-500/15 text-emerald-300")
+      }
+    >
+      {toast.message}
+    </div>
+  );
+}
+
+export default function App() {
+  const config = useConfig();
+  const { dues, loading: duesLoading, error: duesError } = useDues();
+  const { calls, loading: callsLoading, error: callsError, reload: reloadCalls } =
+    useCalls();
+
+  const [selectedCallId, setSelectedCallId] = useState<string | null>(null);
+  const [live, setLive] = useState(false);
+  const [toast, setToast] = useState<{ message: string; error: boolean } | null>(
+    null
+  );
+  const [calling, setCalling] = useState<string | null>(null);
+
+  const showToast = useCallback((message: string, error = false) => {
+    setToast({ message, error });
+    window.setTimeout(() => setToast(null), 5000);
+  }, []);
+
+  const { record, isLive } = useCallDetail(
+    selectedCallId,
+    live,
+    reloadCalls
+  );
+
+  const placeCall = useCallback(
+    async (accountId?: string) => {
+      if (!accountId) return;
+      setCalling(accountId);
+      try {
+        const result = await apiPost<{ call_sid?: string }>("/api/calls", {
+          account_id: accountId,
+        });
+        showToast(
+          `Outbound call initiated for ${accountId}: ${result.call_sid ?? ""}`
+        );
+        await reloadCalls();
+        if (result.call_sid) {
+          setSelectedCallId(result.call_sid);
+          setLive(true);
+        }
+      } catch (e) {
+        showToast(`Could not place call: ${(e as Error).message}`, true);
+      } finally {
+        setCalling(null);
+      }
+    },
+    [reloadCalls, showToast]
+  );
+
+  const selectCall = useCallback((callId?: string) => {
+    if (!callId) return;
+    setSelectedCallId(callId);
+    setLive(false);
+  }, []);
+
+  // Debtor name for the header: prefer the matching due record.
+  const debtorName = useMemo(() => {
+    if (!record?.account_id) return undefined;
+    const due = dues.find((d) => d.account_id === record.account_id);
+    return due?.debtor_name;
+  }, [record?.account_id, dues]);
+
+  return (
+    <TooltipProvider delayDuration={150}>
+      <div className="mx-auto max-w-[1200px] px-5 pb-16 pt-6">
+        <Header
+          config={config}
+          twilioTrial={config?.twilio_trial_mode}
+        />
+        <Toast toast={toast} />
+
+        <div className="mt-6 grid grid-cols-1 gap-5 lg:grid-cols-2">
+          <DuesPanel
+            dues={dues}
+            loading={duesLoading}
+            error={duesError}
+            calling={calling}
+            onCall={placeCall}
+          />
+          <CallsPanel
+            calls={calls}
+            loading={callsLoading}
+            error={callsError}
+            selectedCallId={selectedCallId}
+            onSelect={selectCall}
+            config={config}
+          />
+        </div>
+
+        {selectedCallId && (
+          <CallDetail
+            callId={selectedCallId}
+            record={record}
+            isLive={isLive}
+            debtorName={debtorName}
+            config={config}
+          />
+        )}
+
+        <Footer config={config} />
+      </div>
+    </TooltipProvider>
+  );
+}
+
+// --- header -----------------------------------------------------------------
+
+function Header({
+  config,
+  twilioTrial,
+}: {
+  config: ReturnType<typeof useConfig>;
+  twilioTrial?: boolean;
+}) {
+  return (
+    <header className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+      <div>
+        <h1 className="text-2xl font-semibold tracking-tight">
+          AR Collections &middot; Nova Sonic 2.5
+        </h1>
+        <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
+          AI-first-initiated outbound collections calling. Twilio is telephony
+          transport only; Amazon Bedrock Nova Sonic 2.5 does speech
+          understanding, reasoning, and speech generation in the female voice{" "}
+          <strong className="text-foreground">tiffany</strong>.
+        </p>
+      </div>
+      <div className="flex shrink-0 items-center gap-2">
+        {config?.nova_model_id && (
+          <Badge variant="secondary" className="font-mono text-[0.7rem]">
+            {config.nova_model_id}
+          </Badge>
+        )}
+        {twilioTrial && (
+          <Badge variant="outline" className="text-[0.7rem] text-amber-300">
+            Twilio trial
+          </Badge>
+        )}
+      </div>
+    </header>
+  );
+}
+
+// --- dues panel -------------------------------------------------------------
+
+function statusClasses(status?: string | null): string {
+  switch (status) {
+    case "paid":
+    case "promised_to_pay":
+      return "border-emerald-500/40 bg-emerald-500/15 text-emerald-300";
+    case "disputed":
+      return "border-red-500/40 bg-red-500/15 text-red-300";
+    case "callback":
+      return "border-amber-500/40 bg-amber-500/15 text-amber-300";
+    default:
+      return "border-slate-500/40 bg-slate-500/15 text-slate-300";
+  }
+}
+
+function DuesPanel({
+  dues,
+  loading,
+  error,
+  calling,
+  onCall,
+}: {
+  dues: DueRecord[];
+  loading: boolean;
+  error: string | null;
+  calling: string | null;
+  onCall: (accountId?: string) => void;
+}) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">Due records</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Account</TableHead>
+              <TableHead>Debtor</TableHead>
+              <TableHead>Amount due</TableHead>
+              <TableHead>Due date</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead />
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {loading && (
+              <TableRow>
+                <TableCell colSpan={6}>
+                  <Skeleton className="h-5 w-full" />
+                </TableCell>
+              </TableRow>
+            )}
+            {error && (
+              <TableRow>
+                <TableCell colSpan={6} className="text-center text-muted-foreground">
+                  Failed to load dues: {error}
+                </TableCell>
+              </TableRow>
+            )}
+            {!loading && !error && dues.length === 0 && (
+              <TableRow>
+                <TableCell colSpan={6} className="text-center italic text-muted-foreground">
+                  No due records.
+                </TableCell>
+              </TableRow>
+            )}
+            {dues.map((due) => (
+              <TableRow key={due.account_id}>
+                <TableCell>{due.account_id || ""}</TableCell>
+                <TableCell>{due.debtor_name || ""}</TableCell>
+                <TableCell>{fmtMoney(due.amount_due, due.currency)}</TableCell>
+                <TableCell>{due.due_date || ""}</TableCell>
+                <TableCell>
+                  <Badge variant="outline" className={statusClasses(due.status)}>
+                    {due.status || ""}
+                  </Badge>
+                </TableCell>
+                <TableCell className="text-right">
+                  <Button
+                    size="sm"
+                    disabled={calling === due.account_id}
+                    onClick={() => onCall(due.account_id)}
+                  >
+                    <PhoneCall className="mr-1 h-3.5 w-3.5" />
+                    {calling === due.account_id ? "Calling\u2026" : "Call now"}
+                  </Button>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </CardContent>
+    </Card>
+  );
+}
+
+// --- calls panel ------------------------------------------------------------
+
+function CallsPanel({
+  calls,
+  loading,
+  error,
+  selectedCallId,
+  onSelect,
+  config,
+}: {
+  calls: ReturnType<typeof useCalls>["calls"];
+  loading: boolean;
+  error: string | null;
+  selectedCallId: string | null;
+  onSelect: (callId?: string) => void;
+  config: ReturnType<typeof useConfig>;
+}) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">Past calls</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Call SID</TableHead>
+              <TableHead>Account</TableHead>
+              <TableHead>Disposition</TableHead>
+              <TableHead>Turns</TableHead>
+              <TableHead>Total e2e</TableHead>
+              <TableHead>CloudWatch</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {loading && (
+              <TableRow>
+                <TableCell colSpan={6}>
+                  <Skeleton className="h-5 w-full" />
+                </TableCell>
+              </TableRow>
+            )}
+            {error && (
+              <TableRow>
+                <TableCell colSpan={6} className="text-center text-muted-foreground">
+                  Failed to load calls: {error}
+                </TableCell>
+              </TableRow>
+            )}
+            {!loading && !error && calls.length === 0 && (
+              <TableRow>
+                <TableCell colSpan={6} className="text-center italic text-muted-foreground">
+                  No calls yet.
+                </TableCell>
+              </TableRow>
+            )}
+            {calls.map((call) => {
+              const selected = call.call_sid === selectedCallId;
+              return (
+                <TableRow
+                  key={call.call_sid}
+                  onClick={() => onSelect(call.call_sid)}
+                  className={
+                    "cursor-pointer " + (selected ? "bg-primary/15" : "")
+                  }
+                >
+                  <TableCell className="font-mono text-xs">
+                    {call.call_sid || ""}
+                  </TableCell>
+                  <TableCell>{call.account_id || ""}</TableCell>
+                  <TableCell>
+                    {call.disposition ? (
+                      <DispositionBadge disposition={call.disposition} />
+                    ) : (
+                      <span className="text-muted-foreground">{DASH}</span>
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    {call.turn_count != null ? call.turn_count : DASH}
+                  </TableCell>
+                  <TableCell>{fmtMs(call.total_e2e_ms)}</TableCell>
+                  <TableCell>
+                    {call.call_sid && (
+                      <CloudWatchLink
+                        callSid={call.call_sid}
+                        config={config}
+                      />
+                    )}
+                  </TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      </CardContent>
+    </Card>
+  );
+}
+
+// CloudWatch deep link in a popover so the user can read exactly what it opens
+// (and the region/log group it targets) before following it.
+function CloudWatchLink({
+  callSid,
+  config,
+}: {
+  callSid: string;
+  config: ReturnType<typeof useConfig>;
+}) {
+  const url = cloudwatchLogsUrl(callSid, config?.aws_region, config?.app_log_group);
+  return (
+    <Popover>
+      <PopoverTrigger asChild onClick={(e) => e.stopPropagation()}>
+        <button className="inline-flex items-center gap-1 text-xs text-primary hover:underline">
+          Logs <ExternalLink className="h-3 w-3" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent
+        className="w-80 text-xs"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <p className="mb-2 text-muted-foreground">
+          Opens CloudWatch Logs filtered to this call.
+        </p>
+        <dl className="mb-3 space-y-1">
+          <div className="flex justify-between gap-2">
+            <dt className="text-muted-foreground">Region</dt>
+            <dd className="font-mono">{config?.aws_region || "us-east-1"}</dd>
+          </div>
+          <div className="flex justify-between gap-2">
+            <dt className="text-muted-foreground">Log group</dt>
+            <dd className="truncate font-mono">
+              {config?.app_log_group || "/ecs/ar-collections-nova-sonic/app"}
+            </dd>
+          </div>
+          <div className="flex justify-between gap-2">
+            <dt className="text-muted-foreground">Filter</dt>
+            <dd className="truncate font-mono">{callSid}</dd>
+          </div>
+        </dl>
+        <a
+          href={url}
+          target="_blank"
+          rel="noopener"
+          className="inline-flex items-center gap-1 font-medium text-primary hover:underline"
+        >
+          Open in CloudWatch <ExternalLink className="h-3 w-3" />
+        </a>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+// --- call detail ------------------------------------------------------------
+
+function CallDetail({
+  callId,
+  record,
+  isLive,
+  debtorName,
+  config,
+}: {
+  callId: string;
+  record: CallRecord | null;
+  isLive: boolean;
+  debtorName?: string;
+  config: ReturnType<typeof useConfig>;
+}) {
+  const r = record;
+  const status = r?.total_e2e_ms != null ? "COMPLETED" : "IN PROGRESS";
+  const restarts = r ? connectionRestarts(r) : 0;
+  const points = useMemo(() => (r ? latencyPoints(r) : []), [r]);
+  const segments = useMemo(() => (r ? chatSegments(r) : []), [r]);
+
+  return (
+    <Card className="mt-5">
+      <CardHeader>
+        <div className="flex flex-wrap items-center gap-2">
+          <CardTitle className="text-lg">Call attempt</CardTitle>
+          <span className="font-mono text-xs text-muted-foreground">{callId}</span>
+          {isLive && (
+            <Badge className="animate-pulse bg-destructive text-destructive-foreground">
+              live
+            </Badge>
+          )}
+        </div>
+        <CardDescription>
+          Transcript, summary, and the overdue balances discussed in the call
+        </CardDescription>
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          {debtorName && (
+            <span className="text-sm font-medium">{debtorName}</span>
+          )}
+          {r?.account_id && !debtorName && (
+            <span className="text-sm font-medium">{r.account_id}</span>
+          )}
+          <DispositionBadge disposition={r?.disposition} />
+          <IntelStatusBadge status={r?.intelligence_status} />
+        </div>
+        <ScheduledRow record={r} />
+      </CardHeader>
+
+      <CardContent>
+        <Tabs defaultValue="telemetry" className="w-full">
+          <TabsList>
+            <TabsTrigger value="telemetry">Call telemetry</TabsTrigger>
+            <TabsTrigger value="transcript">Transcript</TabsTrigger>
+            <TabsTrigger value="conversation">Conversation</TabsTrigger>
+            <TabsTrigger value="intelligence">Intelligence</TabsTrigger>
+          </TabsList>
+
+          {/* --- Call telemetry ------------------------------------------- */}
+          <TabsContent value="telemetry" className="space-y-5">
+            <MetricTiles record={r} />
+
+            <Separator />
+
+            <div>
+              <h3 className="mb-2 text-sm font-semibold">Summary</h3>
+              <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm sm:grid-cols-3">
+                <SummaryField label="Total duration" value={fmtMs(r?.total_e2e_ms)} />
+                <SummaryField label="Status" value={status} />
+                <SummaryField
+                  label="Outcome"
+                  value={r?.disposition ? dispositionLabel(r.disposition) : DASH}
+                />
+                <SummaryField label="Connection restarts" value={String(restarts)} />
+                <SummaryField label="Transport" value="MEDIA_STREAMS" />
+                <SummaryField
+                  label="Model"
+                  value={config?.nova_model_id || "amazon.nova-2-5-sonic"}
+                />
+              </dl>
+            </div>
+
+            <Separator />
+
+            <div>
+              <h3 className="mb-2 text-sm font-semibold">Turn-by-turn latency</h3>
+              <TurnLatencyTable record={r} />
+            </div>
+
+            <Separator />
+
+            <div>
+              <h3 className="mb-2 text-sm font-semibold">Latency timeline</h3>
+              <LatencyChart points={points} />
+            </div>
+
+            <RawEventLog record={r} />
+          </TabsContent>
+
+          {/* --- Transcript ----------------------------------------------- */}
+          <TabsContent value="transcript">
+            <TranscriptPanel segments={segments} />
+          </TabsContent>
+
+          {/* --- Conversation (chat + per-utterance table) ---------------- */}
+          <TabsContent value="conversation" className="space-y-5">
+            <ChatView record={r} />
+            <Separator />
+            <div>
+              <h3 className="mb-1 text-sm font-semibold">Per-turn timeline</h3>
+              <p className="mb-2 text-xs text-muted-foreground">
+                One row per utterance: a caller utterance is one turn and a Nova
+                Sonic reply is another, counted in spoken order with the duration
+                of each.
+              </p>
+              <PerUtteranceTable record={r} />
+            </div>
+          </TabsContent>
+
+          {/* --- Intelligence --------------------------------------------- */}
+          <TabsContent value="intelligence">
+            <IntelligenceBlocks record={r} />
+          </TabsContent>
+        </Tabs>
+      </CardContent>
+    </Card>
+  );
+}
+
+function ScheduledRow({ record }: { record: CallRecord | null }) {
+  // The record carries no explicit scheduled/started/ended wall-clock stamps,
+  // so we label honestly: Scheduled and Started are unknown (em-dash); Ended is
+  // derivable only once the call completed (total_e2e_ms present) but still has
+  // no absolute timestamp, so it too is em-dashed rather than invented.
+  void record;
+  return (
+    <div className="mt-2 flex flex-wrap gap-x-6 gap-y-1 text-xs text-muted-foreground">
+      <span>Scheduled: {DASH}</span>
+      <span>Started: {DASH}</span>
+      <span>Ended: {DASH}</span>
+    </div>
+  );
+}
+
+function SummaryField({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex flex-col">
+      <dt className="text-[0.68rem] uppercase tracking-wide text-muted-foreground">
+        {label}
+      </dt>
+      <dd className="font-medium">{value}</dd>
+    </div>
+  );
+}
+
+function IntelStatusBadge({ status }: { status?: string | null }) {
+  if (status === "pending") {
+    return (
+      <Badge variant="outline" className="text-primary">
+        extracting&hellip;
+      </Badge>
+    );
+  }
+  if (status === "failed") {
+    return (
+      <Badge variant="outline" className="text-muted-foreground">
+        extraction unavailable
+      </Badge>
+    );
+  }
+  if (status === "ready") {
+    return (
+      <Badge variant="outline" className="text-emerald-300">
+        Completed
+      </Badge>
+    );
+  }
+  return null;
+}
+
+function MetricTiles({ record }: { record: CallRecord | null }) {
+  const r = record;
+  return (
+    <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+      <MetricTile label="Total end-to-end" value={fmtMs(r?.total_e2e_ms)} help={METRIC_HELP.total} />
+      <MetricTile label="Nova Sonic total" value={fmtMs(r?.nova_total_ms)} help={METRIC_HELP.nova} />
+      <MetricTile label="Non-Nova time" value={fmtMs(r?.non_nova_ms)} help={METRIC_HELP.nonnova} />
+      <MetricTile label="Twilio transport" value={fmtMs(r?.twilio_latency_ms)} help={METRIC_HELP.twilio} />
+      <MetricTile label="TTFT" value={fmtMs(r?.ttft_ms)} help={METRIC_HELP.ttft} />
+      <MetricTile
+        label="Turn count"
+        value={r?.turn_count != null ? String(r.turn_count) : DASH}
+        help={METRIC_HELP.turns}
+      />
+      <MetricTile
+        label="Barge-ins"
+        value={r?.barge_in_count != null ? String(r.barge_in_count) : DASH}
+        help={METRIC_HELP.barge}
+      />
+    </div>
+  );
+}
+
+// Per-turn latency table from conversation_turns: # | Role | TTFT | Response |
+// Tool, with em-dashes for blank cells. Caller rows have no TTFT/Response.
+function TurnLatencyTable({ record }: { record: CallRecord | null }) {
+  const turns = (record?.conversation_turns || [])
+    .slice()
+    .sort(
+      (a, b) =>
+        (a.start_ms || 0) - (b.start_ms || 0) || (a.index || 0) - (b.index || 0)
+    );
+  if (!turns.length) {
+    return (
+      <p className="py-4 text-center text-sm italic text-muted-foreground">
+        No turns recorded.
+      </p>
+    );
+  }
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead className="w-10">#</TableHead>
+          <TableHead>Role</TableHead>
+          <TableHead>TTFT</TableHead>
+          <TableHead>Response</TableHead>
+          <TableHead>Tool</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {turns.map((t, i) => {
+          const isAgent = t.speaker === "assistant";
+          const ttft =
+            isAgent && t.ttft_ms != null
+              ? fmtMs(t.ttft_ms)
+              : isAgent && t.ttft_source === "unavailable"
+                ? "n/a (shared response)"
+                : DASH;
+          return (
+            <TableRow key={i}>
+              <TableCell>{i + 1}</TableCell>
+              <TableCell>
+                <Badge
+                  variant="outline"
+                  className={
+                    isAgent
+                      ? "border-emerald-500/40 text-emerald-300"
+                      : "border-primary/40 text-primary"
+                  }
+                >
+                  {isAgent ? "AGENT" : "CALLER"}
+                </Badge>
+              </TableCell>
+              <TableCell>{ttft}</TableCell>
+              <TableCell>{isAgent ? fmtMs(t.total_ms) : DASH}</TableCell>
+              <TableCell>{DASH}</TableCell>
+            </TableRow>
+          );
+        })}
+      </TableBody>
+    </Table>
+  );
+}
+
+function TranscriptPanel({
+  segments,
+}: {
+  segments: ReturnType<typeof chatSegments>;
+}) {
+  if (!segments.length) {
+    return (
+      <p className="py-6 text-sm italic text-muted-foreground">
+        No conversation recorded.
+      </p>
+    );
+  }
+  return (
+    <ScrollArea className="h-[420px] rounded-md border p-4">
+      <div className="space-y-3 text-sm leading-relaxed">
+        {segments.map((s, i) => (
+          <p key={i}>
+            <span
+              className={
+                "mr-2 font-semibold " +
+                (s.speaker === "assistant" ? "text-emerald-300" : "text-primary")
+              }
+            >
+              {s.speaker === "assistant" ? "Nova Sonic:" : "Caller:"}
+            </span>
+            <span className="whitespace-pre-wrap">{s.text}</span>
+          </p>
+        ))}
+      </div>
+    </ScrollArea>
+  );
+}
+
+function ChatView({ record }: { record: CallRecord | null }) {
+  const segments = record ? chatSegments(record) : [];
+  if (!segments.length) {
+    return (
+      <p className="py-4 text-sm italic text-muted-foreground">
+        No conversation recorded.
+      </p>
+    );
+  }
+  return (
+    <div className="flex flex-col gap-2.5">
+      {segments.map((seg, i) => {
+        const parts: string[] = [];
+        if (seg.totalMs != null) parts.push(`turn ${fmtMs(seg.totalMs)}`);
+        if (seg.speaker === "assistant") {
+          if (seg.latencyMs != null) parts.push(`latency ${fmtMs(seg.latencyMs)}`);
+          if (seg.ttftMs != null) {
+            const label =
+              seg.ttftSource === "response_window" ? "TTFT (response)" : "TTFT";
+            parts.push(`${label} ${fmtMs(seg.ttftMs)}`);
+          } else if (seg.ttftSource === "unavailable") {
+            parts.push("TTFT n/a (shared response)");
+          }
+        }
+        const isAgent = seg.speaker === "assistant";
+        return (
+          <div
+            key={i}
+            className={"flex " + (isAgent ? "justify-end" : "justify-start")}
+          >
+            <div
+              className={
+                "max-w-[72%] rounded-xl border px-3 py-2 " +
+                (isAgent
+                  ? "border-emerald-500/40 bg-emerald-500/10"
+                  : "border-primary/40 bg-primary/10")
+              }
+            >
+              <div className="text-[0.65rem] uppercase tracking-wide text-muted-foreground">
+                {isAgent ? "Nova Sonic" : "Caller"}
+              </div>
+              <div className="whitespace-pre-wrap break-words text-sm">
+                {seg.text}
+              </div>
+              {parts.length > 0 && (
+                <div className="mt-1 text-[0.7rem] text-muted-foreground">
+                  {parts.join(" \u00b7 ")}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// Per-UTTERANCE turn table from record.turns: Turn # | Speaker | Duration |
+// Transcript (ported from web/app.js renderTurns).
+function PerUtteranceTable({ record }: { record: CallRecord | null }) {
+  const turns = record?.turns || [];
+  if (!turns.length) {
+    return (
+      <p className="py-4 text-center text-sm italic text-muted-foreground">
+        No turns recorded.
+      </p>
+    );
+  }
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead className="w-16">Turn #</TableHead>
+          <TableHead>Speaker</TableHead>
+          <TableHead>Duration</TableHead>
+          <TableHead>Transcript</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {turns.map((turn, i) => (
+          <TableRow key={i}>
+            <TableCell>{turn.index != null ? turn.index + 1 : i + 1}</TableCell>
+            <TableCell>
+              {turn.speaker === "assistant" ? "Nova Sonic" : "Caller"}
+            </TableCell>
+            <TableCell>{fmtMs(turn.duration_ms)}</TableCell>
+            <TableCell className="font-mono text-xs">{turn.text || ""}</TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  );
+}
+
+// Call Disposition + Structured Data & Next-Best-Action blocks.
+function IntelligenceBlocks({ record }: { record: CallRecord | null }) {
+  const r = record;
+  const sd = r?.structured_data || {};
+  const pay = sd.payment_specifics || {};
+  const ctx = sd.contextual_data || {};
+
+  const triggerParts: string[] = [];
+  if (r?.ptp_sms_status) {
+    const smsLabel =
+      {
+        sent: "payment-link SMS sent",
+        blocked_trial: "payment-link SMS blocked (trial account)",
+        failed: "payment-link SMS failed",
+      }[r.ptp_sms_status] || `payment-link SMS ${r.ptp_sms_status}`;
+    triggerParts.push(
+      r.ptp_sms_to ? `${smsLabel} (to ${r.ptp_sms_to})` : smsLabel
+    );
+  }
+  if (r?.collection_paused) triggerParts.push("collection paused");
+  if (r?.escalated) triggerParts.push("escalated to specialist");
+
+  return (
+    <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+      <Card className="bg-background/60">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-1 text-sm">
+            Call Disposition
+            <HelpTip text="Standardized outcome tag that drives CRM updates and downstream automation (payment-link SMS, pause/escalate)." />
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <DispositionBadge disposition={r?.disposition} />
+          <p className="text-xs text-muted-foreground">
+            Downstream triggers:{" "}
+            {triggerParts.length ? triggerParts.join(" \u00b7 ") : DASH}
+          </p>
+        </CardContent>
+      </Card>
+
+      <Card className="bg-background/60">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-1 text-sm">
+            Structured Data &amp; Next-Best-Action
+            <HelpTip text="Extracted entities, payment details, behavioral insights, and the exact next step to move the debt toward resolution." />
+            <IntelStatusBadge status={r?.intelligence_status} />
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3 text-sm">
+          <FieldGroup title="Payment specifics">
+            <Field label="Promised amount">
+              {pay.promised_amount != null
+                ? fmtMoney(pay.promised_amount, r?.currency)
+                : DASH}
+            </Field>
+            <Field label="Agreed date">{fmtText(pay.agreed_date)}</Field>
+            <Field label="Preferred payment method">
+              {fmtText(pay.preferred_payment_method)}
+            </Field>
+          </FieldGroup>
+          <FieldGroup title="Contextual data">
+            <Field label="Reason for delinquency">
+              {fmtText(ctx.reason_for_delinquency)}
+            </Field>
+            <Field label="Customer sentiment">
+              {fmtText(ctx.customer_sentiment)}
+            </Field>
+          </FieldGroup>
+          <FieldGroup title="Next-best-action">
+            <Field label="Automated directive" wide>
+              {fmtText(r?.next_best_action)}
+            </Field>
+          </FieldGroup>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function FieldGroup({
+  title,
+  children,
+}: {
+  title: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div>
+      <div className="mb-1 text-[0.68rem] uppercase tracking-wide text-muted-foreground">
+        {title}
+      </div>
+      <dl className="space-y-1">{children}</dl>
+    </div>
+  );
+}
+
+function Field({
+  label,
+  children,
+  wide,
+}: {
+  label: string;
+  children: React.ReactNode;
+  wide?: boolean;
+}) {
+  return (
+    <div
+      className={
+        wide
+          ? "flex flex-col gap-0.5"
+          : "flex items-baseline justify-between gap-3 border-b border-dashed border-border/60 pb-1"
+      }
+    >
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd className={wide ? "" : "text-right"}>{children}</dd>
+    </div>
+  );
+}
+
+function HelpTip({ text }: { text: string }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          className="text-muted-foreground/70 hover:text-foreground"
+          aria-label="More info"
+        >
+          <Info className="h-3.5 w-3.5" />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-xs text-xs leading-relaxed">
+        {text}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+// Collapsible raw event log (was the <details> "In-depth event log").
+function RawEventLog({ record }: { record: CallRecord | null }) {
+  return (
+    <Collapsible className="rounded-md border">
+      <CollapsibleTrigger className="group flex w-full items-center justify-between px-4 py-2.5 text-sm text-muted-foreground">
+        In-depth event log
+        <ChevronDown className="h-4 w-4 transition-transform group-data-[state=open]:rotate-180" />
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <ScrollArea className="h-[320px] border-t">
+          <pre className="whitespace-pre-wrap break-words p-4 text-xs">
+            {JSON.stringify(record?.events_log || [], null, 2)}
+          </pre>
+        </ScrollArea>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
+// --- footer -----------------------------------------------------------------
+
+function Footer({ config }: { config: ReturnType<typeof useConfig> }) {
+  if (!config) return null;
+  const summary = [
+    `model: ${config.nova_model_id}`,
+    `region: ${config.aws_region}`,
+    `twilio: ${config.twilio_configured ? "configured" : "NOT configured"}`,
+    `public_base_url: ${config.public_base_url_set ? "set" : "missing"}`,
+  ].join(" \u00b7 ");
+
+  return (
+    <footer className="mt-8 border-t border-border pt-4 text-sm text-muted-foreground">
+      <Popover>
+        <PopoverTrigger asChild>
+          <button className="inline-flex items-center gap-1 hover:text-foreground">
+            <Settings2 className="h-3.5 w-3.5" />
+            {summary}
+          </button>
+        </PopoverTrigger>
+        <PopoverContent className="w-96 text-xs">
+          <h4 className="mb-2 font-semibold text-foreground">Configuration</h4>
+          <dl className="space-y-1">
+            <ConfigRow label="Nova model" value={config.nova_model_id} />
+            <ConfigRow label="Extraction model" value={config.extraction_model_id} />
+            <ConfigRow
+              label="Code interpreter"
+              value={
+                config.code_interpreter
+                  ? `${config.code_interpreter} (${config.code_interpreter_id ?? ""})`
+                  : undefined
+              }
+            />
+            <ConfigRow label="AWS region" value={config.aws_region} />
+            <ConfigRow label="App log group" value={config.app_log_group} />
+            <ConfigRow
+              label="Twilio"
+              value={config.twilio_configured ? "configured" : "NOT configured"}
+            />
+            <ConfigRow
+              label="Twilio trial mode"
+              value={config.twilio_trial_mode ? "on" : "off"}
+            />
+            <ConfigRow
+              label="Public base URL"
+              value={config.public_base_url_set ? "set" : "missing"}
+            />
+          </dl>
+        </PopoverContent>
+      </Popover>
+    </footer>
+  );
+}
+
+function ConfigRow({ label, value }: { label: string; value?: unknown }) {
+  return (
+    <div className="flex justify-between gap-3">
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd className="truncate font-mono text-foreground">{fmtText(value)}</dd>
+    </div>
+  );
+}
