@@ -72,6 +72,7 @@ import base64
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 from strands.bidi.types.events import (
@@ -165,6 +166,14 @@ class CallMetrics:
 
         self._session_start: float | None = None
         self._session_end: float | None = None
+        # Wall-clock (UTC, ISO-8601) timestamp of when the call session
+        # started. ASK 3 (calls-under-dues) needs a real "WHEN did this call
+        # happen" value; the monotonic clock above only measures elapsed
+        # durations and cannot be rendered as an absolute/relative time, so we
+        # capture an independent wall-clock stamp at session start. This is set
+        # once, off the audio hot path (on_session_start), and never mutated by
+        # per-frame handlers.
+        self.created_at: str | None = None
 
         # Nova response timing keyed by response_id (secondary signal; see the
         # conversational-turn comment in :meth:`_build_conversation_turns`).
@@ -238,6 +247,10 @@ class CallMetrics:
 
     def on_session_start(self) -> None:
         self._session_start = self._clock()
+        # ASK 3: capture the absolute wall-clock start time (UTC ISO-8601) so
+        # the calls-under-dues view can show WHEN the call happened. Independent
+        # of the monotonic clock used for durations.
+        self.created_at = datetime.now(timezone.utc).isoformat()
         self._emit("call_placed")
         self._emit("stream_start")
 
@@ -1087,6 +1100,9 @@ class CallMetrics:
         return {
             "call_sid": self.call_sid,
             "account_id": self.account_id,
+            # ASK 3: absolute wall-clock start time (UTC ISO-8601) for the
+            # calls-under-dues "WHEN" column (absolute + relative).
+            "created_at": self.created_at,
             "total_e2e_ms": self.total_e2e_ms,
             "nova_total_ms": round(self.nova_total_ms, 3),
             # ASK 6: accurate-named transport ESTIMATE + legacy alias (same

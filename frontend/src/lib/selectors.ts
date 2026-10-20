@@ -1,19 +1,29 @@
 // Pure data selectors ported from web/app.js so conversation ordering and the
 // latency-chart derivation behave identically.
 
-import type { CallRecord, ConversationTurn } from "./api";
+import type { CallRecord, ConversationTurn, ToolCall } from "./api";
 
+// ASK 1: field names use the accurate official terminology from FEAT-001 --
+// turnElapsedMs = how long the turn occupied the conversation (NOT latency),
+// responseWaitMs = time for Sonic to begin answering (a wait window, NOT
+// model/network latency), ttftMs = time to first audio. We deliberately do
+// NOT call any of these "latency".
 export interface ChatSegment {
   speaker: "user" | "assistant";
   text: string;
-  totalMs: number | null;
+  turnElapsedMs: number | null;
   ttftMs: number | null;
   ttftSource: string | null;
-  latencyMs: number | null;
+  responseWaitMs: number | null;
+  // ASK 7: assistant turns interrupted by a barge-in.
+  interrupted: boolean;
+  // ASK 5: sync in-call tool invocations attached to this turn.
+  toolCalls: ToolCall[];
 }
 
 // Prefer conversation_turns; fall back to deriving from transcripts for older
-// records (verbatim port of web/app.js chatSegments).
+// records (ported from web/app.js chatSegments, updated for FEAT-003 field
+// names with legacy aliases as fallbacks).
 export function chatSegments(record: CallRecord): ChatSegment[] {
   const turns = record.conversation_turns;
   if (Array.isArray(turns) && turns.length) {
@@ -27,10 +37,13 @@ export function chatSegments(record: CallRecord): ChatSegment[] {
       .map((t) => ({
         speaker: t.speaker === "assistant" ? "assistant" : "user",
         text: t.text || "",
-        totalMs: t.total_ms ?? null,
+        // Prefer the accurate name, fall back to the deprecated alias.
+        turnElapsedMs: t.turn_elapsed_ms ?? t.total_ms ?? null,
         ttftMs: t.ttft_ms ?? null,
         ttftSource: t.ttft_source ?? null,
-        latencyMs: t.latency_ms ?? null,
+        responseWaitMs: t.response_wait_ms ?? t.latency_ms ?? null,
+        interrupted: Boolean(t.interrupted),
+        toolCalls: Array.isArray(t.tool_calls) ? t.tool_calls : [],
       }));
   }
   const transcripts = Array.isArray(record.transcripts) ? record.transcripts : [];
@@ -42,10 +55,12 @@ export function chatSegments(record: CallRecord): ChatSegment[] {
     .map((t) => ({
       speaker: (t.role === "assistant" ? "assistant" : "user") as "user" | "assistant",
       text: t.text || "",
-      totalMs: null,
+      turnElapsedMs: null,
       ttftMs: null,
       ttftSource: null,
-      latencyMs: null,
+      responseWaitMs: null,
+      interrupted: false,
+      toolCalls: [] as ToolCall[],
     }))
     .filter((s) => s.text);
 }

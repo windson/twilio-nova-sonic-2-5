@@ -159,6 +159,10 @@ def _call_summary(record: dict[str, Any]) -> dict[str, Any]:
     return {
         "call_sid": record.get("call_sid"),
         "account_id": record.get("account_id"),
+        # ASK 3: absolute wall-clock start time so the calls-under-dues view can
+        # render WHEN each call happened (absolute + relative) via a
+        # client-side join on account_id against this list endpoint.
+        "created_at": record.get("created_at"),
         "total_e2e_ms": record.get("total_e2e_ms"),
         "nova_total_ms": record.get("nova_total_ms"),
         # ASK 6: accurate-named transport ESTIMATE (legacy alias kept for the UI

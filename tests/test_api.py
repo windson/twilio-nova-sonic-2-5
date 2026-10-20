@@ -138,6 +138,10 @@ def test_get_calls_and_get_call_by_id_return_persisted_analytics(store):
     summary = next(c for c in calls if c["call_sid"] == "CA_persisted")
     assert summary["turn_count"] == 3
     assert summary["total_e2e_ms"] == 12345.0
+    # ASK 3: the list summary exposes the created_at key (None when the
+    # persisted record carried no wall-clock stamp) so the UI can join calls
+    # under their due record and render WHEN each call happened.
+    assert "created_at" in summary
 
     detail_resp = client.get("/api/calls/CA_persisted")
     assert detail_resp.status_code == 200
@@ -259,6 +263,30 @@ def test_calls_serialize_feat003_fields(store):
     # ASK 7 interrupted + inline barge-in markers.
     assert asst["interrupted"] is True
     assert full["barge_in_events"] == [{"type": "barge_in", "t_ms": 1500.0}]
+
+
+def test_call_record_carries_created_at_for_calls_under_dues(store):
+    """ASK 3: CallMetrics stamps an absolute wall-clock created_at at session
+    start, it is serialized on the full record, and the /api/calls list summary
+    exposes it so the UI can join calls under their due record and show WHEN
+    each call happened. Fails if created_at is dropped from either the record
+    or the summary.
+    """
+    from app.metrics import CallMetrics
+
+    m = CallMetrics(call_sid="CA_when", account_id="ACC-1001")
+    m.on_session_start()
+    m.on_session_end()
+    record = m.to_call_analytics()
+    assert isinstance(record.get("created_at"), str) and record["created_at"]
+    store.save_call_analytics(record)
+
+    calls = client.get("/api/calls").json()["calls"]
+    summary = next(c for c in calls if c["call_sid"] == "CA_when")
+    assert summary["created_at"] == record["created_at"]
+
+    full = client.get("/api/calls/CA_when").json()
+    assert full["created_at"] == record["created_at"]
 
 
 def test_get_call_unknown_id_returns_404(store):
