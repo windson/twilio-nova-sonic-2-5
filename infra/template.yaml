@@ -1089,10 +1089,9 @@ Resources:
         {"type":"log","x":0,"y":18,"width":24,"height":6,"properties":{"title":"Recent call timeline (lifecycle / metrics JSON lines)","region":"${AWS::Region}","view":"table","query":"SOURCE '${AppLogGroup}' | fields @timestamp, call_sid, event_type, t_ms, ttft_ms, turn_latency_ms, duration_ms, tool, total_tokens | sort @timestamp desc | limit 100"}}
         ]}
 
-  # Consolidated PER-CALL dashboard (D3): multi-widget view of ONE call (per-turn
-  # timeline, TTFT+turns, tokens, barge-ins, tool calls, Twilio/transport). Each
-  # query filters on the pattern variable token CALL_SID_TOKEN; the per-call UI
-  # link overrides it with the call_sid (app/dashboard.py) to scope every widget.
+  # Consolidated PER-CALL dashboard (D3): multi-widget view of ONE call. Each
+  # query filters on token CALL_SID_TOKEN, overridden with the call_sid by the
+  # per-call UI link (app/dashboard.py) to scope every widget at once.
   PerCallDashboard:
     Type: AWS::CloudWatch::Dashboard
     Properties:
@@ -1100,11 +1099,11 @@ Resources:
       DashboardBody: !Sub |
         {"variables":[{"type":"pattern","pattern":"CALL_SID_TOKEN","inputType":"input","id":"call_sid","label":"Call SID","defaultValue":"CALL_SID_TOKEN","visible":true}],"widgets":[
         {"type":"log","x":0,"y":0,"width":24,"height":6,"properties":{"title":"Per-turn timeline (events in call order)","region":"${AWS::Region}","view":"table","query":"SOURCE '${AppLogGroup}' | fields t_ms, event_type, role, ttft_ms, turn_latency_ms, duration_ms, tool, message | filter call_sid = 'CALL_SID_TOKEN' | sort t_ms asc | limit 500"}},
-        {"type":"log","x":0,"y":6,"width":12,"height":6,"properties":{"title":"TTFT and turns","region":"${AWS::Region}","view":"table","query":"SOURCE '${AppLogGroup}' | filter call_sid = 'CALL_SID_TOKEN' | stats avg(ttft_ms) as avg_ttft_ms, max(ttft_ms) as max_ttft_ms, avg(turn_latency_ms) as avg_response_wait_ms, count(turn_complete) as turns"}},
+        {"type":"log","x":0,"y":6,"width":12,"height":6,"properties":{"title":"TTFT and turns","region":"${AWS::Region}","view":"table","query":"SOURCE '${AppLogGroup}' | filter call_sid = 'CALL_SID_TOKEN' and event_type = 'turn_complete' | stats avg(ttft_ms) as avg_ttft_ms, max(ttft_ms) as max_ttft_ms, avg(turn_latency_ms) as avg_response_wait_ms, count(*) as turns"}},
         {"type":"log","x":12,"y":6,"width":12,"height":6,"properties":{"title":"Token usage (input / output / total)","region":"${AWS::Region}","view":"table","query":"SOURCE '${AppLogGroup}' | filter call_sid = 'CALL_SID_TOKEN' and event_type = 'usage' | stats sum(input_tokens) as input_tokens, sum(output_tokens) as output_tokens, sum(total_tokens) as total_tokens"}},
         {"type":"log","x":0,"y":12,"width":12,"height":6,"properties":{"title":"Barge-ins","region":"${AWS::Region}","view":"table","query":"SOURCE '${AppLogGroup}' | filter call_sid = 'CALL_SID_TOKEN' and event_type = 'barge_in' | fields t_ms | sort t_ms asc | limit 100"}},
         {"type":"log","x":12,"y":12,"width":12,"height":6,"properties":{"title":"Tool calls (count by tool)","region":"${AWS::Region}","view":"table","query":"SOURCE '${AppLogGroup}' | filter call_sid = 'CALL_SID_TOKEN' and event_type = 'tool_invocation' | stats count(*) as calls by tool | sort calls desc"}},
-        {"type":"log","x":0,"y":18,"width":24,"height":6,"properties":{"title":"Twilio insights / transport","region":"${AWS::Region}","view":"table","query":"SOURCE '${AppLogGroup}' | filter call_sid = 'CALL_SID_TOKEN' and (event_type like /twilio/ or event_type = 'call_end_summary') | fields t_ms, event_type, transport_delay_estimate_ms, twilio_latency_ms, total_e2e_ms, nova_total_ms, message | sort t_ms asc | limit 100"}}
+        {"type":"log","x":0,"y":18,"width":24,"height":6,"properties":{"title":"Twilio insights / transport","region":"${AWS::Region}","view":"table","query":"SOURCE '${AppLogGroup}' | filter call_sid = 'CALL_SID_TOKEN' and (event_type like /twilio/ or event_type = 'call_end_summary') | fields t_ms, event_type, summary.transport_delay_estimate_ms as transport_delay_estimate_ms, summary.twilio_latency_ms as twilio_latency_ms, summary.total_e2e_ms as total_e2e_ms, summary.nova_total_ms as nova_total_ms, message | sort t_ms asc | limit 100"}}
         ]}
 
   # --- CloudTrail (management events) ---------------------------------------
