@@ -373,6 +373,40 @@ def test_second_tuesday_of_next_month_resolves_correctly_anchored():
     assert captured and captured[0].started and captured[0].stopped
 
 
+def test_code_gen_request_steers_a_focused_complete_program():
+    """Regression guard for the live truncation/general-parser bug (FEAT-007).
+
+    The live model was emitting an over-long general-purpose parser that got cut
+    off at the old 512-token cap, so the sandbox raised SyntaxError. Assert the
+    code-generation request now (a) steers AWAY from a general parser, (b) ships
+    the worked calendar.monthcalendar example that fixes the Nth-weekday math,
+    and (c) allows enough output tokens for a complete program. These fail if
+    the prompt/token fix is reverted.
+    """
+    bedrock = FakeBedrock(program="print('2024-06-11')")
+
+    def factory(region):
+        return ExecutingCodeInterpreter(region)
+
+    code_interpreter.resolve_date_phrase(
+        "second tuesday of next month",
+        reference_date="2024-05-15",
+        region="us-east-1",
+        bedrock_client=bedrock,
+        client_factory=factory,
+    )
+
+    assert bedrock.calls, "the model should have been asked to write the program"
+    call = bedrock.calls[0]
+    system_text = call["system"][0]["text"]
+    # (a) steer away from a general-purpose parser.
+    assert "general-purpose parser" in system_text
+    # (b) the worked monthcalendar example that corrects the ordinal-weekday math.
+    assert "monthcalendar" in system_text
+    # (c) enough tokens so the program is not truncated mid-expression.
+    assert call["inferenceConfig"]["maxTokens"] >= 1024
+
+
 def test_empty_phrase_short_circuits_without_model_or_session():
     bedrock = FakeBedrock()
     called = {"n": 0}
