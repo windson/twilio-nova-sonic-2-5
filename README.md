@@ -11,6 +11,12 @@ built-in analytics dashboard.
 
 ## Architecture
 
+A full, numbered AWS architecture diagram (Twilio -> CloudFront -> ALB -> ECS ->
+Nova Sonic, the in-call tools, DynamoDB, the async post-call intelligence path,
+the downstream triggers, and observability) is in
+[docs/architecture.md](docs/architecture.md). The quick picture of the live
+audio path:
+
 ```
   PSTN caller                Twilio Media Streams            This app (FastAPI)
   (phone)  <----- audio ----> (telephony transport) <== WebSocket /media ==>  |
@@ -145,7 +151,11 @@ The IaC (`infra/template.yaml`) provisions an **ECS Fargate** service behind an
 **dashboard**, a **CloudTrail** management-event trail to an S3 bucket, and a
 **least-privilege IAM task role** granting
 `bedrock:InvokeModelWithBidirectionalStream` + `bedrock:InvokeModel` on the Nova
-Sonic model ARN, DynamoDB RW on just the two tables, and CloudWatch Logs write.
+Sonic model ARN, a separate scoped `bedrock:InvokeModel` grant on the text
+extraction model ARN(s) (`amazon.nova-lite-v1:0` / `amazon.nova-micro-v1:0`) for
+the post-call Converse extraction, DynamoDB RW on just the two tables, and
+CloudWatch Logs write. The post-call PTP payment-link SMS needs no new IAM (it
+reuses existing egress + the Secrets-Manager Twilio credentials).
 
 `scripts/deploy.sh` wraps the steps (run the pieces yourself as needed):
 
@@ -290,6 +300,112 @@ Sonic model ARN, DynamoDB RW on just the two tables, and CloudWatch Logs write.
 > If you prefer AWS CDK, you can author an equivalent stack; this project ships
 > a CloudFormation template because it validates cleanly with `cfn-lint`
 > **without** needing `cdk bootstrap`. (Recorded in FEAT-005 findings.)
+
+## Post-call intelligence (disposition, structured data, next-best-action)
+
+After a call ends, the app extracts two key artifacts and runs the matching
+downstream automation. All of this runs **asynchronously, off the real-time
+audio path** (see the no-latency guarantee below), so it cannot add to call
+latency. The full flow is drawn as phases 6-9 in
+[docs/architecture.md](docs/architecture.md).
+
+### 1. Call Disposition (the "what happened")
+
+A standardized, high-level outcome tag used to update the CRM, route/stop
+automated workflows, and stay compliant. The taxonomy is the `CALL_DISPOSITIONS`
+tuple in `app/store.py` (disposition is richer than, and separate from, the
+`DUE_STATUSES` on the due record):
+
+| Disposition | Meaning | Downstream directive |
+| --- | --- | --- |
+| `promise_to_pay` (PTP) | Debtor committed to a date/amount | **Send a payment-link SMS and pause** further automated collection (`collection_paused = true`) |
+| `dispute_raised` | Debtor disputes the balance | **Escalate to a human specialist** (`escalated = true`) + escalation event |
+| `refusal_to_pay` | Debtor explicitly refuses | Route to a human collections strategy queue |
+| `inbound_callback_requested` | Debtor will call back / asked for a callback | Schedule a follow-up touchpoint |
+| `wrong_number` | Reached the wrong party | Flag so the number is not re-dialed |
+| `no_answer` | Nobody picked up | Reschedule per retry policy |
+| `left_voicemail` | Voicemail left | Reschedule and wait for callback |
+| `already_paid` | Debtor says it is already paid | Verify/reconcile; pause collection |
+| `undetermined` | Could not be classified | Leave for human review; no automated trigger |
+
+The two key triggers (`app/postcall.py`):
+
+- **PTP ->** pause auto-collection on the account, then attempt a **real**
+  payment-link SMS via `app/twilio_client.send_sms` (reusing the existing Twilio
+  REST client + Secrets-Manager credentials; the link is built from
+  `PAYMENT_LINK_BASE_URL` + `account_id`).
+- **Dispute Raised ->** set `escalated = true` and emit an
+  `escalation_to_human_specialist` event.
+
+> **Twilio TRIAL limitation.** The Twilio account is a trial account, so SMS and
+> calls can only go to the **verified number**. The SMS send is attempted for
+> real; when Twilio blocks a send to any other destination it is **logged and
+> flagged** via `ptp_sms_status` (`sent` | `blocked_trial` | `failed`), **never
+> faked** as a success.
+
+### 2. Structured Conversation Data & Next-Best-Action (the "why & what's next")
+
+The extracted entities, payment details, and behavioral insights, plus the exact
+next step. Stored on the CallAnalytics record (`app/store.py`) as:
+
+```
+structured_data:
+  payment_specifics:
+    promised_amount             # number (stored as Decimal in DynamoDB)
+    agreed_date                 # resolved YYYY-MM-DD
+    preferred_payment_method    # e.g. card, bank transfer
+  contextual_data:
+    reason_for_delinquency      # e.g. medical emergency, temporary unemployment
+    customer_sentiment          # e.g. cooperative, hostile
+next_best_action                # e.g. "Schedule follow-up call on YYYY-MM-DD"
+```
+
+These fields are **extracted post-call via the Bedrock Converse API on the TEXT
+model `amazon.nova-lite-v1:0`** (`EXTRACTION_MODEL_ID`; `app/postcall.py` prompts
+for a strict JSON object and parses it defensively). Until extraction completes
+they stay blank (`intelligence_status = pending`); the dashboard renders blank
+placeholders and fills them in when `intelligence_status` becomes `ready`.
+
+### 3. The `compute_future_date` code-interpreter tool
+
+To turn relative phrases the debtor speaks (e.g. "I'll pay next month, the first
+Monday") into a concrete date, the agent calls a **custom Strands `@tool`**,
+`compute_future_date(phrase, reference_date=None)` in `app/collections_agent.py`
+(same `@tool` decorator pattern as `update_due_record`, which Nova Sonic already
+invokes in-call). It does deterministic, purely-local **stdlib `datetime`** math
+(no network, no sandbox), so it returns within the turn.
+
+**Why a custom `@tool` and not the vended `python_repl` or AgentCore:** Strands'
+vended `strands.vended_tools.python_repl` requires a configured Sandbox (local
+Docker / microVM / SSH host) to execute code. Local Docker is broken in this
+environment (podman shim) and a sandbox is heavy overkill for a tiny date
+computation; AWS Bedrock AgentCore's code interpreter is likewise unnecessary
+infrastructure here. A custom `@tool` is the correct, lowest-risk API.
+
+Example: with a reference date in May 2024, `"next month 1st Monday"` resolves to
+`2024-06-03`. Other handled phrases include `"in two weeks"`, `"next Friday"`,
+`"end of next month"`, and `"tomorrow"`.
+
+The **same date math** is reused post-call in `app/postcall.py` to resolve a
+relative `agreed_date` phrase returned by the extraction model into a concrete
+ISO date.
+
+### Async / no-latency guarantee
+
+The in-call tools (`update_due_record`, `compute_future_date`) are cheap and
+local, but the **expensive work** (LLM disposition classification + structured
+extraction + the downstream triggers) runs **after the call ends**, off the
+audio/turn path, as a fire-and-forget `asyncio` task launched from the `/media`
+WebSocket finally-block in `app/main.py` (`extract_and_apply` in
+`app/postcall.py`). The call-latency metrics (`total_e2e_ms`, `nova_total_ms`,
+`ttft_ms`) are computed on the audio path (`session_start`..`session_end`) and
+are frozen before the post-call task runs, so it provably cannot inflate them.
+
+This is enforced by a test:
+`tests/test_postcall.py::test_no_added_latency_postcall_does_not_touch_call_metrics`
+drives a synthetic `CallMetrics` session to fixed values, then runs
+`extract_and_apply` and asserts the three metrics are **byte-for-byte
+unchanged**.
 
 ## Observability
 

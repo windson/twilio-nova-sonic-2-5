@@ -204,6 +204,25 @@ Resources:
                   - bedrock:InvokeModel
                 Resource:
                   - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${NovaModelId}"
+        # Separate, narrowly-scoped grant for the OFF-PATH post-call intelligence
+        # (app/postcall.py), which calls the Bedrock Converse API on a TEXT model
+        # (default amazon.nova-lite-v1:0, EXTRACTION_MODEL_ID). Kept distinct from
+        # the Nova Sonic bidi statement above so the extraction grant stays scoped
+        # to just the text model ARN(s) and the two policies evolve independently.
+        - PolicyName: bedrock-text-extraction
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.nova-lite-v1:0"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.nova-micro-v1:0"
+        # Note: the PTP payment-link SMS (app/twilio_client.send_sms) needs NO new
+        # IAM. It reuses the task's existing egress (ServiceSecurityGroup allows
+        # all outbound to the Twilio API) and the Twilio credentials already
+        # injected from Secrets Manager via the TaskDefinition Secrets block.
         - PolicyName: dynamodb-rw
           PolicyDocument:
             Version: "2012-10-17"
@@ -474,6 +493,16 @@ Resources:
             # by call_sid. Keep in sync with the awslogs-group below.
             - Name: APP_LOG_GROUP
               Value: !Ref AppLogGroup
+            # TEXT model used by the off-path post-call intelligence extraction
+            # (Bedrock Converse). Non-secret; matches app/config.py
+            # EXTRACTION_MODEL_ID and the bedrock-text-extraction grant above.
+            - Name: EXTRACTION_MODEL_ID
+              Value: amazon.nova-lite-v1:0
+            # Base URL for the PTP payment-link SMS. Non-secret placeholder;
+            # override with the real pay URL at deploy time. Matches
+            # app/config.py PAYMENT_LINK_BASE_URL.
+            - Name: PAYMENT_LINK_BASE_URL
+              Value: https://pay.example.com/
             # PUBLIC_BASE_URL drives the TwiML wss://<host>/media URL.
             # Precedence: (1) CloudFront domain when Option 1 is enabled (free
             # managed TLS); (2) the ACM-covered TLS hostname when PublicHostname
