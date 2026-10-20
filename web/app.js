@@ -315,7 +315,7 @@ async function renderDetail() {
 
   renderIntelligence(record);
   renderChat(record);
-  renderTurns(record.turns || [], record.transcripts || []);
+  renderTurns(record.turns || []);
   $("log-pre").textContent = JSON.stringify(record.events_log || [], null, 2);
 
   // Poll lifecycle: the call ending (total_e2e_ms present) is NOT enough to
@@ -337,38 +337,6 @@ async function renderDetail() {
     // post-call tick, not only once at call end.
     loadCalls();
   }
-}
-
-function transcriptForTurn(turn, turnIndex, turns, transcripts) {
-  // Align final assistant transcripts to a turn by timestamp rather than by
-  // position. Each turn has a start time (start_ms); the turn's window runs
-  // from its start to the next turn's start (or the end of the call). We join
-  // every final assistant transcript whose t_ms falls inside that window, so
-  // barge-ins and tool-only turns no longer shift transcripts off by one.
-  const start = turn.start_ms;
-  if (start === null || start === undefined) {
-    // Fall back to positional alignment when timing is unavailable.
-    const assistant = transcripts.filter((t) => t.role === "assistant" && t.is_final);
-    return assistant.length > turnIndex ? assistant[turnIndex].text || "" : "";
-  }
-  const next = turns[turnIndex + 1];
-  const end =
-    next && next.start_ms !== null && next.start_ms !== undefined
-      ? next.start_ms
-      : Infinity;
-  const texts = transcripts
-    .filter(
-      (t) =>
-        t.role === "assistant" &&
-        t.is_final &&
-        t.t_ms !== null &&
-        t.t_ms !== undefined &&
-        t.t_ms >= start &&
-        t.t_ms < end
-    )
-    .map((t) => t.text || "")
-    .filter(Boolean);
-  return texts.join(" ");
 }
 
 // Build an ordered chat model from the full call record. Prefer the
@@ -555,22 +523,31 @@ function renderChat(record) {
   }
 }
 
-function renderTurns(turns, transcripts) {
+// Render the per-turn timeline table from the PER-UTTERANCE turn model
+// (record.turns). Per the user's definition, a caller utterance is one turn
+// and a Nova Sonic reply is another: each item is one row, counted in spoken
+// order. Each per-utterance turn item carries its own speaker/text/duration
+// (index, speaker 'user'|'assistant', text, start_ms, duration_ms), so we read
+// them directly off the item rather than aligning assistant-only transcripts
+// against the old response-window turns. These turns do not carry
+// latency/TTFT, so those columns are intentionally not shown here (per-Sonic
+// latency/TTFT still appears in the Conversation chat view above).
+function renderTurns(turns) {
   const body = $("turns-body");
   if (!turns.length) {
-    body.innerHTML = '<tr><td colspan="5" class="empty">No turns recorded.</td></tr>';
+    body.innerHTML = '<tr><td colspan="4" class="empty">No turns recorded.</td></tr>';
     return;
   }
   body.innerHTML = "";
   turns.forEach((turn, i) => {
     const tr = document.createElement("tr");
-    const text = transcriptForTurn(turn, i, turns, transcripts);
+    const speaker = turn.speaker === "assistant" ? "Nova Sonic" : "Caller";
+    const text = (turn.text || "").replace(/</g, "&lt;");
     tr.innerHTML = `
       <td>${turn.index != null ? turn.index + 1 : i + 1}</td>
+      <td>${speaker}</td>
       <td>${fmtMs(turn.duration_ms)}</td>
-      <td>${fmtMs(turn.turn_latency_ms)}</td>
-      <td>${fmtMs(turn.ttft_ms)}</td>
-      <td class="transcript">${(text || "").replace(/</g, "&lt;")}</td>`;
+      <td class="transcript">${text}</td>`;
     body.appendChild(tr);
   });
 }

@@ -32,8 +32,11 @@ Approximations (documented here and in FEAT-003 findings):
   ``response_start``. "User finished speaking" is approximated as the timestamp
   of the last inbound Twilio media frame seen before ``response_start`` (or, if
   present, the last final user transcript before it).
-- ``nova_total_ms`` = sum of active response windows (response_start..complete),
-  i.e. the wall-clock time Nova Sonic was actively producing a response.
+- ``nova_total_ms`` = the wall-clock time Nova Sonic was actively producing
+  speech, computed as the sum of outbound ``BidiAudioStreamEvent`` PCM
+  durations (see the ``nova_total_ms`` property for why the old
+  response_start..complete window sum under-counted). The legacy window sum is
+  retained as ``nova_response_window_ms`` for diagnostics.
 - ``twilio_latency_ms`` = transport delay derived from Twilio media ``timestamp``
   (stream-relative ms) vs local receive wall-clock. Twilio's ``timestamp`` is
   milliseconds since the stream started; comparing its growth to locally
@@ -44,6 +47,7 @@ Approximations (documented here and in FEAT-003 findings):
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import time
@@ -157,7 +161,14 @@ class CallMetrics:
 
         # Conversation-level aggregates.
         self.first_ttft_ms: float | None = None
-        self.nova_total_ms: float = 0.0
+        # HEADLINE Nova speaking time: sum of outbound audio-frame durations.
+        # See :meth:`_on_audio` and the :attr:`nova_total_ms` property for why
+        # the old response-window sum was wrong and this replaces it.
+        self.nova_speaking_ms: float = 0.0
+        # SECONDARY (legacy) measure: sum of matched response_start..complete
+        # windows keyed by response_id. Accumulated in :meth:`_finalize_turn`.
+        # Kept for diagnostics only; NOT the headline nova_total_ms.
+        self.nova_response_window_ms: float = 0.0
         self.barge_in_count: int = 0
         self.usage: dict[str, Any] = {}
         self.transcripts: list[dict[str, Any]] = []
@@ -309,6 +320,24 @@ class CallMetrics:
         )
 
     def _on_audio(self, event: BidiAudioStreamEvent, now: float) -> None:
+        # HEADLINE Nova speaking time: accumulate the real duration of each
+        # outbound audio frame. Nova Sonic emits PCM16 mono at 24 kHz, so the
+        # frame duration (ms) = decoded_bytes / (2 * sample_rate * channels) *
+        # 1000 (2 bytes per PCM16 sample). This is O(1) per frame and must never
+        # raise -- record_event is wrapped in try/except by the bridge, but we
+        # stay defensive here too so one malformed frame cannot drop metrics.
+        try:
+            audio_b64 = getattr(event, "audio", None)
+            if audio_b64:
+                decoded_bytes = len(base64.b64decode(audio_b64))
+                sample_rate = getattr(event, "sample_rate", None) or 24000
+                channels = getattr(event, "channels", None) or 1
+                denom = 2 * sample_rate * channels
+                if denom > 0:
+                    self.nova_speaking_ms += decoded_bytes / denom * 1000.0
+        except Exception:  # noqa: BLE001 - never break the audio path
+            pass
+
         # Attribute first audio to the most-recently-started still-open turn.
         #
         # The installed BidiAudioStreamEvent carries no response_id (only
@@ -347,7 +376,11 @@ class CallMetrics:
             return
         end = now if now is not None else self._clock()
         duration_ms = round((end - turn["start"]) * 1000.0, 3)
-        self.nova_total_ms += duration_ms
+        # SECONDARY measure only. Nova Sonic reuses ONE response_id for the whole
+        # call and fires many response_start events but a single response_complete
+        # at call end, so this window sum under-counts Nova's real speaking time;
+        # the headline nova_total_ms is derived from audio durations instead.
+        self.nova_response_window_ms += duration_ms
         record = {
             "response_id": response_id,
             "index": len(self.turns),
@@ -618,6 +651,84 @@ class CallMetrics:
         used.add(best_i)
         return timings[best_i]
 
+    # ------------------------------------------------------------------------
+    # Three distinct "turn" notions live in this class; do not confuse them:
+    #
+    # 1. PER-UTTERANCE turns (HEADLINE) -- :meth:`_build_utterance_turns`.
+    #    The user's authoritative definition: "a user speaking is one turn and
+    #    Sonic speaking is another." Each individual FINAL user transcript is
+    #    one turn and each individual FINAL assistant transcript is a separate
+    #    turn, counted in spoken order, each with its own duration. Same-role
+    #    utterances are NOT merged. This drives ``turn_count`` and the ``turns``
+    #    list the UI renders.
+    # 2. GROUPED conversation_turns -- :meth:`_build_conversation_turns`.
+    #    Consecutive same-role finals merged into one segment; used only for the
+    #    chat view, not the headline count.
+    # 3. response_id WINDOWS -- :attr:`turns` (built in :meth:`_finalize_turn`).
+    #    Nova-response timing (response_start..complete), surfaced as
+    #    ``nova_response_count``; a diagnostics-only signal.
+    # ------------------------------------------------------------------------
+
+    def _build_utterance_turns(self) -> list[dict[str, Any]]:
+        """Build the PER-UTTERANCE (headline) turn model.
+
+        Rule: A turn = one utterance. Each user final transcript is one turn;
+        each Sonic/assistant final transcript is one turn; counted in spoken
+        order; duration = span to the next utterance start (last utterance falls
+        back to its own span then session end).
+
+        Unlike :meth:`_build_conversation_turns`, consecutive same-role
+        utterances are NOT merged -- every final transcript becomes its own
+        turn. Each turn dict carries: ``index``, ``speaker`` ('user' |
+        'assistant'), ``text``, ``start_ms`` and ``duration_ms``.
+        """
+        finals = [
+            t
+            for t in self.transcripts
+            if t.get("is_final") and t.get("role") in ("user", "assistant") and t.get("text")
+        ]
+
+        # Reuse the partial-user-transcript fallback so a user turn is not
+        # dropped when only non-final user transcripts arrived.
+        if self._last_user_partial_text and not any(
+            t.get("role") == "user" for t in finals
+        ):
+            finals.append(
+                {
+                    "role": "user",
+                    "text": self._last_user_partial_text,
+                    "is_final": False,
+                    "t_ms": self._last_user_partial_t_ms,
+                }
+            )
+
+        finals.sort(key=lambda t: (t.get("t_ms") if t.get("t_ms") is not None else 0.0))
+
+        session_end_ms = self.total_e2e_ms
+        turns: list[dict[str, Any]] = []
+        for i, item in enumerate(finals):
+            start_ms = item.get("t_ms")
+            # duration_ms = span to the NEXT utterance's start. For the last
+            # utterance (no next) fall back to its own transcript span, then to
+            # the session end, mirroring _build_conversation_turns so a single
+            # final utterance is not shown as 0.
+            duration_ms: float | None = None
+            next_start = finals[i + 1].get("t_ms") if i + 1 < len(finals) else None
+            if start_ms is not None and next_start is not None:
+                duration_ms = round(max(next_start - start_ms, 0.0), 3)
+            elif start_ms is not None and session_end_ms is not None and session_end_ms >= start_ms:
+                duration_ms = round(session_end_ms - start_ms, 3)
+            turns.append(
+                {
+                    "index": i,
+                    "speaker": item["role"],
+                    "text": (item.get("text") or "").strip(),
+                    "start_ms": start_ms,
+                    "duration_ms": duration_ms,
+                }
+            )
+        return turns
+
     @property
     def conversation_turn_count(self) -> int:
         """Number of conversational (user<->assistant) turns."""
@@ -639,6 +750,27 @@ class CallMetrics:
         return round(sum(self._transport_delays_ms) / len(self._transport_delays_ms), 3)
 
     @property
+    def nova_total_ms(self) -> float:
+        """HEADLINE "Total Nova Sonic speaking time" (ms).
+
+        This is the SUM OF OUTBOUND AUDIO durations
+        (:attr:`nova_speaking_ms`), i.e. the wall-clock time Nova was actually
+        producing speech.
+
+        Why this replaces the old response-window sum: Nova Sonic reuses ONE
+        ``response_id`` for the entire call and emits MANY
+        ``BidiResponseStartEvent`` (one per speech burst), each overwriting the
+        previous open-turn start time, while only ONE
+        ``BidiResponseCompleteEvent`` fires at call end
+        (``stop_reason=incomplete``). ``_finalize_turn`` therefore measured only
+        the final "Goodbye" window (~6 s) instead of the ~30 s Nova actually
+        spoke, badly under-counting. Summing the duration of every audio frame
+        Nova emitted is the trustworthy measure. The old window sum is kept as
+        :attr:`nova_response_window_ms` for diagnostics.
+        """
+        return round(self.nova_speaking_ms, 3)
+
+    @property
     def non_nova_ms(self) -> float | None:
         """Share of total e2e time not spent in active Nova responses."""
         total = self.total_e2e_ms
@@ -649,11 +781,14 @@ class CallMetrics:
     def summary(self) -> dict[str, Any]:
         """Compact metrics summary (the headline numbers).
 
-        ``turn_count`` reflects CONVERSATIONAL turns (user<->assistant
-        alternation). The old response_id-based count is preserved as
-        ``nova_response_count``.
+        ``turn_count`` reflects PER-UTTERANCE turns (each user utterance and
+        each Sonic utterance counted separately, per the user's definition). The
+        response_id-based window count is preserved as ``nova_response_count``.
         """
-        conversation_turns = self._build_conversation_turns()
+        # Build the grouped conversation turns too so the chat view
+        # (``self.conversation_turns``) stays populated after on_session_end().
+        self._build_conversation_turns()
+        utterance_turns = self._build_utterance_turns()
         return {
             "call_sid": self.call_sid,
             "account_id": self.account_id,
@@ -662,7 +797,7 @@ class CallMetrics:
             "twilio_latency_ms": self.twilio_latency_ms,
             "non_nova_ms": self.non_nova_ms,
             "ttft_ms": self.first_ttft_ms,
-            "turn_count": len(conversation_turns),
+            "turn_count": len(utterance_turns),
             "nova_response_count": len(self.turns),
             "barge_in_count": self.barge_in_count,
             "usage": self.usage,
@@ -671,11 +806,14 @@ class CallMetrics:
     def to_call_analytics(self) -> dict[str, Any]:
         """Serializable CallAnalytics record for the store/UI (FEAT-003/004).
 
-        ``turn_count`` is the conversational-turn count; ``nova_response_count``
-        preserves the response_id-based count. ``conversation_turns`` carries
-        the chat-style user<->assistant model for the UI.
+        ``turn_count`` is the PER-UTTERANCE turn count and ``turns`` is the
+        per-utterance list the per-turn UI table renders (each user utterance
+        and each Sonic utterance is its own row). ``nova_response_count``
+        preserves the response_id window count and ``conversation_turns``
+        carries the grouped chat-style user<->assistant model for the chat view.
         """
         conversation_turns = self._build_conversation_turns()
+        utterance_turns = self._build_utterance_turns()
         # Post-call intelligence fields (FEAT-002) start BLANK here and are
         # filled asynchronously, OFF the audio path, by app.postcall after the
         # call ends. total_e2e_ms / nova_total_ms / ttft_ms above are computed
@@ -689,12 +827,15 @@ class CallMetrics:
             "twilio_latency_ms": self.twilio_latency_ms,
             "non_nova_ms": self.non_nova_ms,
             "ttft_ms": self.first_ttft_ms,
-            "turn_count": len(conversation_turns),
+            "turn_count": len(utterance_turns),
             "nova_response_count": len(self.turns),
             "barge_in_count": self.barge_in_count,
             "usage": self.usage,
             "conversation_turns": list(conversation_turns),
-            "turns": list(self.turns),
+            # HEADLINE per-turn data: one row per utterance (user or Sonic).
+            "turns": list(utterance_turns),
+            # SECONDARY: response_id window timings (Nova-response diagnostics).
+            "nova_response_turns": list(self.turns),
             "transcripts": list(self.transcripts),
             "events_log": list(self.events_log),
             # -- post-call intelligence (blank at call end) ------------------

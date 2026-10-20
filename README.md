@@ -49,6 +49,15 @@ audio path:
   transport latency vs Nova Sonic active time split, TTFT (time to first audio),
   turn count, and per-turn duration/latency. Emitted as one JSON object per line
   to stdout (CloudWatch-friendly) and persisted for the dashboard.
+  - **Turns are per utterance.** A user utterance is one turn and a Sonic
+    utterance is another; the dashboard shows the total count of such turns and
+    the duration of each. Consecutive same-role utterances are counted
+    separately (not merged). The grouped user<->assistant view is kept
+    separately as `conversation_turns` for the chat transcript.
+  - **Nova Sonic total time = sum of the durations of Nova's outbound audio
+    frames** (PCM16 mono 24 kHz: `ms = bytes / (2 * 24000)`). This replaces the
+    earlier response-window sum, which under-counted because Nova reuses a
+    single `response_id` across the call.
 
 > **Verified AWS fact:** `amazon.nova-2-5-sonic` is available in Amazon Bedrock
 > in **us-east-1** with **streaming = true**. The bi-di operation to grant in
@@ -141,7 +150,10 @@ audio path:
 6. **Watch the dashboard** at `http://localhost:8080/` — it lists due records and
    past calls, and shows per-call metrics (total e2e, Twilio-vs-Nova split, TTFT,
    turn count), a per-turn timeline, and an in-depth event log that updates live
-   while a call is active.
+   while a call is active. The turn count is per utterance (each user utterance
+   and each Sonic utterance is one turn) and the per-turn table shows the
+   duration of each; "Nova Sonic total time" is the summed duration of Nova's
+   outbound audio frames.
 
 ## AWS deploy
 

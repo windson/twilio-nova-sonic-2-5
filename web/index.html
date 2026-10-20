@@ -158,18 +158,21 @@
       </div>
 
       <h3>Per-turn timeline</h3>
+      <p class="muted metrics-note">
+        One row per utterance: a caller utterance is one turn and a Nova Sonic
+        reply is another, counted in spoken order with the duration of each.
+      </p>
       <table class="data-table" id="turns-table">
         <thead>
           <tr>
             <th>Turn #</th>
+            <th>Speaker</th>
             <th>Duration</th>
-            <th>Latency</th>
-            <th>TTFT</th>
-            <th>Speaker transcript</th>
+            <th>Transcript</th>
           </tr>
         </thead>
         <tbody id="turns-body">
-          <tr><td colspan="5" class="empty">No turns recorded.</td></tr>
+          <tr><td colspan="4" class="empty">No turns recorded.</td></tr>
         </tbody>
       </table>
 
