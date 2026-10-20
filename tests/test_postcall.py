@@ -868,11 +868,24 @@ async def test_extract_and_apply_records_async_tool_call_for_date_resolution(sto
 
 
 async def test_agreed_date_backfilled_from_captured_phrase_when_llm_null(store):
-    """ASK 8 backfill: when the LLM returns agreed_date=null but the in-call
-    capture tool stored a resolvable promised_date_phrase on the due record,
-    the resolved ISO date backfills structured_data.payment_specifics.agreed_date
+    """ASK 8 backfill via the HYBRID path: when the LLM returns agreed_date=null
+    but the in-call capture tool stored a resolvable promised_date_phrase, the
+    resolved ISO date backfills structured_data.payment_specifics.agreed_date
     (the field the UI reads), not only due.promised_date.
+
+    'second tuesday of next month' is a DETERMINISTIC hit, so the resolution is
+    computed by app.date_resolver with NO code-interpreter invocation: the
+    injected interpreter stub must remain untouched. The expected date is the
+    deterministic resolution anchored on the real post-call reference date (the
+    same code path proven to yield 2026-11-10 for reference 2026-10-19).
     """
+    from datetime import datetime, timezone
+
+    from app.date_resolver import resolve_deterministic
+
+    reference = datetime.now(timezone.utc).date()
+    expected = resolve_deterministic("second tuesday of next month", reference)
+
     store.update_due("ACC-1001", promised_date_phrase="second tuesday of next month")
     bedrock = FakeBedrock(
         {
@@ -884,19 +897,81 @@ async def test_agreed_date_backfilled_from_captured_phrase_when_llm_null(store):
         }
     )
 
+    # A code-interpreter stub that FAILS the test if the deterministic hit leaks
+    # into the fallback: the hybrid path must never construct it.
+    built = {"n": 0}
+
+    def ci_factory(region):
+        built["n"] += 1
+        raise AssertionError("deterministic hit must not call the code interpreter")
+
     changes = await extract_and_apply(
         _call_record(account_id="ACC-1001"),
         store,
         _settings(),
         bedrock_client=bedrock,
         twilio_client_factory=lambda *a: _InsightsTwilioClient(),
-        code_interpreter_factory=_ci_factory("2024-07-09"),
+        code_interpreter_factory=ci_factory,
     )
 
-    # The UI field is backfilled from the captured phrase resolution.
-    assert changes["structured_data"]["payment_specifics"]["agreed_date"] == "2024-07-09"
-    # due.promised_date also resolved to the ISO date.
-    assert store.get_due("ACC-1001")["promised_date"] == "2024-07-09"
+    # The UI field is backfilled from the deterministic resolution.
+    assert changes["structured_data"]["payment_specifics"]["agreed_date"] == expected
+    # due.promised_date also resolved to the same ISO date.
+    assert store.get_due("ACC-1001")["promised_date"] == expected
+    # The deterministic fast path resolved it; the interpreter was never built.
+    assert built["n"] == 0
+    resolve_entries = [
+        c for c in changes["async_tool_calls"] if c["tool"] == "resolve_date_phrase"
+    ]
+    assert resolve_entries, "an async resolve_date_phrase entry should be recorded"
+    assert all(c["resolved_via"] == "deterministic" for c in resolve_entries)
+
+
+async def test_ask8_second_tuesday_resolves_deterministically_pinned(store):
+    """Explicit ASK 8 regression pin at the fixed reference 2026-10-19.
+
+    Proves the hybrid path resolves 'second tuesday of next month' to the live
+    ASK 8 value 2026-11-10 (call CA7893e62ca50768dcfc789ebfd50d3e2c) via the
+    DETERMINISTIC tier, with the interpreter stub never invoked. The reference
+    date is pinned by monkeypatching the post-call 'today'.
+    """
+    import app.postcall as postcall_mod
+
+    class _FixedDate(postcall_mod.datetime):  # type: ignore[misc]
+        @classmethod
+        def now(cls, tz=None):
+            return postcall_mod.datetime(2026, 10, 19, 12, 0, 0, tzinfo=tz)
+
+    store.update_due("ACC-1001", promised_date_phrase="second tuesday of next month")
+    bedrock = FakeBedrock(
+        {
+            "disposition": "promise_to_pay",
+            "payment_specifics": {"promised_amount": 625, "agreed_date": None,
+                                  "preferred_payment_method": None},
+            "contextual_data": {"reason_for_delinquency": None, "customer_sentiment": None},
+            "next_best_action": "Follow up",
+        }
+    )
+
+    def ci_factory(region):
+        raise AssertionError("deterministic hit must not call the code interpreter")
+
+    original = postcall_mod.datetime
+    postcall_mod.datetime = _FixedDate
+    try:
+        changes = await extract_and_apply(
+            _call_record(account_id="ACC-1001"),
+            store,
+            _settings(),
+            bedrock_client=bedrock,
+            twilio_client_factory=lambda *a: _InsightsTwilioClient(),
+            code_interpreter_factory=ci_factory,
+        )
+    finally:
+        postcall_mod.datetime = original
+
+    assert changes["structured_data"]["payment_specifics"]["agreed_date"] == "2026-11-10"
+    assert store.get_due("ACC-1001")["promised_date"] == "2026-11-10"
 
 
 class SequencingBedrock:
@@ -921,16 +996,26 @@ class SequencingBedrock:
         return {"output": {"message": {"content": [{"text": payload}]}}}
 
 
-async def test_ask8_backfill_resolves_real_program_end_to_end(store):
-    """ASK 8 end-to-end (OFFLINE): LLM agreed_date=null + captured phrase
-    'second tuesday of next month' -> the resolver asks the model to author a
-    program, the sandbox RUNS it for real, and the concrete ISO date backfills
-    structured_data.payment_specifics.agreed_date AND due.promised_date. The
-    anchor is pinned inside the program (2024-05-15) so the expected date is the
-    2nd Tuesday of June 2024 = 2024-06-11. Fails if either the resolution math
-    or the backfill wiring is reverted.
+async def test_fallback_unparseable_phrase_resolves_real_program_end_to_end(store):
+    """HYBRID FALLBACK end-to-end (OFFLINE): an OPEN-ENDED captured phrase the
+    deterministic tier cannot parse ('the second tuesday after my next payday')
+    -> the resolver asks the model to author a program, the sandbox RUNS it for
+    real, and the concrete ISO date backfills structured_data.payment_specifics.
+    agreed_date AND due.promised_date, labelled resolved_via='code_interpreter'.
+
+    The anchor is pinned inside the program (2024-05-15) so the expected date is
+    the 2nd Tuesday of June 2024 = 2024-06-11. Fails if the fallback wiring or
+    the resolution math is reverted. This complements the DETERMINISTIC ASK 8
+    pin in test_ask8_second_tuesday_resolves_deterministically_pinned.
     """
-    store.update_due("ACC-1001", promised_date_phrase="second tuesday of next month")
+    # A phrase deliberately OUTSIDE the deterministic grammar so the fallback
+    # fires (the deterministic resolver returns None for it).
+    from app.date_resolver import resolve_deterministic
+
+    open_ended = "the second tuesday after my next payday"
+    assert resolve_deterministic(open_ended, "2024-05-15") is None
+
+    store.update_due("ACC-1001", promised_date_phrase=open_ended)
     bedrock = SequencingBedrock(
         {
             "disposition": "promise_to_pay",
@@ -963,3 +1048,9 @@ async def test_ask8_backfill_resolves_real_program_end_to_end(store):
     # The sandbox actually ran (and was cleaned up) at least once.
     assert captured and captured[0].started and captured[0].stopped
     assert changes["intelligence_status"] == "ready"
+    # The async tool-call entry is labelled as resolved via the code interpreter.
+    resolve_entries = [
+        c for c in changes["async_tool_calls"] if c["tool"] == "resolve_date_phrase"
+    ]
+    assert resolve_entries
+    assert any(c["resolved_via"] == "code_interpreter" for c in resolve_entries)

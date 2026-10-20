@@ -52,6 +52,11 @@ export interface ToolCall {
   // Present and true on async (post-call) entries: they do NOT add call
   // latency.
   off_path?: boolean;
+  // FEAT-003/FEAT-005: on async date-resolution entries, which tier of the
+  // hybrid resolver produced the answer ('deterministic' | 'code_interpreter'
+  // | 'unresolved'), surfaced on the async tool chip so the resolution path is
+  // visible in the turn-by-turn view.
+  resolved_via?: string | null;
 }
 
 // ASK 7: an inline barge-in marker interleaved into the conversation timeline.
@@ -70,6 +75,11 @@ export interface ConversationTurn {
   // same values and are kept until the backend drops them).
   turn_elapsed_ms?: number | null;
   total_ms?: number | null;
+  // FEAT-004: caller->reply gap (time from the caller finishing speaking to
+  // the agent beginning its reply), present only when a genuine caller turn
+  // precedes this assistant turn. response_wait_ms / latency_ms are kept as
+  // backward-compatible aliases carrying the same value.
+  caller_reply_gap_ms?: number | null;
   response_wait_ms?: number | null;
   latency_ms?: number | null;
   transcript_span_ms?: number | null;
@@ -314,18 +324,23 @@ export function dispositionLabel(disposition?: string | null): string {
     .join(" ");
 }
 
-// ASK 4: build the consolidated per-call CloudWatch DASHBOARD deep-link scoped
-// to a single call_sid. This opens a CloudWatch Logs Insights view filtered to
-// the call that surfaces TTFT, turns, token usage, barge-ins, tool invocations,
-// transport and the call timeline by parsing the app's JSON-line logs. The
-// backend returns this same URL on each call record (dashboard_url); this
-// client-side builder mirrors that construction exactly and is used as a
-// fallback when the backend field is absent.
+// ASK 4 / D3: build the deep-link that OPENS the CONSOLIDATED per-call
+// CloudWatch DASHBOARD (<stack>-per-call, provisioned in infra/template.yaml)
+// with its multi-widget view scoped to a single call_sid: per-turn timeline,
+// TTFT + turns, token usage, barge-ins, tool calls and Twilio/transport. The
+// dashboard's log widgets filter on a pattern dashboard variable whose token
+// (CALL_SID_TOKEN) this link overrides with the call_sid, so every widget loads
+// already filtered to the call. The backend returns this same URL on each call
+// record (dashboard_url); this client-side builder mirrors that construction
+// exactly and is used as a fallback when the backend field is absent.
 //
 // Encoding mirrors app/dashboard.py: each literal is percent-encoded then "%"
 // is rewritten to the console's "*" escape; "?"/"=" in the fragment use the
-// console's "$3F"/"$3D" escapes; the queryDetail value is the console's
-// RISON-like "~(...)" token tree.
+// console's "$3F"/"$3D" escapes; the params value is the console's RISON-like
+// "~(...)" token tree carrying the dashboard-variable override.
+const CALL_SID_TOKEN = "CALL_SID_TOKEN";
+const DEFAULT_STACK_NAME = "ar-collections-nova-sonic";
+
 function consoleToken(value: string): string {
   let out = "";
   for (const ch of value) {
@@ -340,6 +355,8 @@ function consoleToken(value: string): string {
   return out;
 }
 
+// The per-call Logs Insights query the dashboard widgets are built from; kept
+// mirrored with app/dashboard.py so the two stay in lock-step.
 export function callDashboardQuery(callSid: string, appLogGroup: string): string {
   return (
     `SOURCE '${appLogGroup}'` +
@@ -351,18 +368,30 @@ export function callDashboardQuery(callSid: string, appLogGroup: string): string
   );
 }
 
+// Derive the stack name from the app log group "/ecs/<stack>/app" (mirrors
+// app/dashboard.stack_name_from_log_group) so the dashboard name resolves
+// without an extra config field.
+function stackNameFromLogGroup(appLogGroup?: string | null): string {
+  if (!appLogGroup) return DEFAULT_STACK_NAME;
+  const parts = appLogGroup.replace(/^\/+|\/+$/g, "").split("/");
+  if (parts.length === 3 && parts[0] === "ecs" && parts[2] === "app" && parts[1]) {
+    return parts[1];
+  }
+  return DEFAULT_STACK_NAME;
+}
+
 export function callDashboardUrl(
   callSid: string,
   awsRegion?: string | null,
   appLogGroup?: string | null
 ): string {
   const region = awsRegion || "us-east-1";
-  const logGroup = appLogGroup || "/ecs/ar-collections-nova-sonic/app";
-  const query = callDashboardQuery(callSid, logGroup);
-  const detail =
-    "~(end~0~start~-3600~timeType~'RELATIVE~unit~'seconds" +
-    `~editorString~'${consoleToken(query)}` +
-    `~source~(~'${consoleToken(logGroup)}))`;
+  const name = `${stackNameFromLogGroup(appLogGroup)}-per-call`;
+  // Dashboard-variable override token tree the console reads from the URL:
+  //   ~(~(name~'CALL_SID_TOKEN~value~'<call_sid>))
+  const variables =
+    `~(~(name~'${consoleToken(CALL_SID_TOKEN)}` +
+    `~value~'${consoleToken(callSid)}))`;
   const base = `https://${region}.console.aws.amazon.com/cloudwatch/home?region=${region}`;
-  return `${base}#logsV2:logs-insights$3FqueryDetail$3D${detail}`;
+  return `${base}#dashboards:name=${consoleToken(name)}$3Fparams$3D${variables}`;
 }

@@ -89,9 +89,9 @@ const METRIC_HELP = {
   ttft: "Time to first audio (TTFT): from the response start to the first audio frame of Nova's reply.",
   turns: "Number of turns in the conversation (one caller utterance or one Nova reply each).",
   barge: "Count of barge-ins (caller interrupting Nova mid-reply).",
-  // ASK 1: per-turn chat-bubble meta.
-  responseWait:
-    "Response wait: time for Nova Sonic to begin answering after the caller stopped speaking. A wait window, NOT model or network latency.",
+  // FEAT-004: per-turn chat-bubble meta.
+  callerReplyGap:
+    "Caller\u2192reply gap: time from the caller finishing speaking to the agent beginning its reply. Shown only when a caller turn precedes the agent turn (blank for back-to-back agent turns). This is NOT the same thing as TTFT (time to first audio).",
   turnElapsed:
     "Turn elapsed: how long this turn occupied the conversation (to the next turn's start). An elapsed window, NOT latency.",
 };
@@ -566,9 +566,11 @@ function CallsPanel({
   );
 }
 
-// ASK 4: per-call CloudWatch DASHBOARD deep link in a popover so the user can
-// read exactly what it opens (region/log group) before following it. Prefers
-// the backend-built dashboard_url and falls back to the client-side builder.
+// ASK 4 / D3: opens the CONSOLIDATED per-call CloudWatch dashboard in a popover
+// so the user can read exactly what it opens (region/log group/call) before
+// following it. Prefers the backend-built dashboard_url and falls back to the
+// client-side builder (both target the <stack>-per-call dashboard scoped to the
+// call_sid).
 function CloudWatchLink({
   callSid,
   dashboardUrl,
@@ -593,8 +595,9 @@ function CloudWatchLink({
         onClick={(e) => e.stopPropagation()}
       >
         <p className="mb-2 text-muted-foreground">
-          Opens a CloudWatch dashboard scoped to this call (TTFT, turns, token
-          usage, barge-ins, transport, timeline).
+          Opens the consolidated CloudWatch dashboard scoped to this call: a
+          multi-widget view (per-turn timeline, TTFT &amp; turns, token usage,
+          barge-ins, tool calls, Twilio transport), not a single logs stream.
         </p>
         <dl className="mb-3 space-y-1">
           <div className="flex justify-between gap-2">
@@ -927,6 +930,8 @@ function ToolCalls({ calls }: { calls: ToolCall[] }) {
     <div className="flex flex-wrap gap-1">
       {calls.map((c, i) => {
         const async = c.kind === "async" || c.off_path === true;
+        const resolvedVia =
+          async && c.resolved_via ? String(c.resolved_via) : null;
         return (
           <Badge
             key={i}
@@ -939,15 +944,16 @@ function ToolCalls({ calls }: { calls: ToolCall[] }) {
             }
             title={
               async
-                ? "async / post-call tool (off-path, adds no call latency)"
+                ? "async / off-path tool (post-call, adds no call latency)" +
+                  (resolvedVia ? ` \u2014 resolved via ${resolvedVia}` : "")
                 : c.t_ms != null
                   ? `sync in-call tool at ${fmtMs(c.t_ms)}`
                   : "sync in-call tool"
             }
           >
-            {c.tool || "tool"} &middot; {async ? "async" : "sync"}
+            {c.tool || "tool"} &middot; {async ? "async / off-path" : "sync"}
             {!async && c.t_ms != null ? ` \u00b7 ${fmtMs(c.t_ms)}` : ""}
-            {async ? " \u00b7 off-path" : ""}
+            {resolvedVia ? ` \u00b7 via ${resolvedVia}` : ""}
           </Badge>
         );
       })}
@@ -996,7 +1002,7 @@ function TurnLatencyTable({ record }: { record: CallRecord | null }) {
           <TableHead className="w-10">#</TableHead>
           <TableHead>Role</TableHead>
           <TableHead>TTFT</TableHead>
-          <TableHead>Response wait</TableHead>
+          <TableHead>Caller&rarr;reply gap</TableHead>
           <TableHead>Turn elapsed</TableHead>
           <TableHead>Tool</TableHead>
         </TableRow>
@@ -1010,7 +1016,11 @@ function TurnLatencyTable({ record }: { record: CallRecord | null }) {
               : isAgent && t.ttft_source === "unavailable"
                 ? "n/a (single response window)"
                 : DASH;
-          const responseWait = t.response_wait_ms ?? t.latency_ms ?? null;
+          // FEAT-004: prefer the accurate caller->reply gap; the value is only
+          // present when a genuine caller turn precedes an assistant turn
+          // (null for assistant-after-assistant turns -> DASH).
+          const callerReplyGap =
+            t.caller_reply_gap_ms ?? t.response_wait_ms ?? t.latency_ms ?? null;
           const turnElapsed = t.turn_elapsed_ms ?? t.total_ms ?? null;
           return (
             <TableRow key={i}>
@@ -1039,7 +1049,9 @@ function TurnLatencyTable({ record }: { record: CallRecord | null }) {
                 </div>
               </TableCell>
               <TableCell>{ttft}</TableCell>
-              <TableCell>{isAgent ? fmtMs(responseWait) : DASH}</TableCell>
+              <TableCell>
+                {isAgent && callerReplyGap != null ? fmtMs(callerReplyGap) : DASH}
+              </TableCell>
               <TableCell>{isAgent ? fmtMs(turnElapsed) : DASH}</TableCell>
               <TableCell>
                 <ToolCalls calls={t.tool_calls || []} />
@@ -1111,14 +1123,14 @@ function ChatView({ record }: { record: CallRecord | null }) {
   return (
     <div className="flex flex-col gap-2.5">
       {segments.map((seg, i) => {
-        // ASK 1: truthful meta labels. The large numbers are a wait/elapsed
+        // FEAT-004: truthful meta labels. The large numbers are a gap/elapsed
         // window, NOT "latency", so they no longer contradict a small TTFT.
         const parts: string[] = [];
         if (seg.turnElapsedMs != null)
           parts.push(`turn elapsed ${fmtMs(seg.turnElapsedMs)}`);
         if (seg.speaker === "assistant") {
-          if (seg.responseWaitMs != null)
-            parts.push(`response wait ${fmtMs(seg.responseWaitMs)}`);
+          if (seg.callerReplyGapMs != null)
+            parts.push(`caller\u2192reply gap ${fmtMs(seg.callerReplyGapMs)}`);
           if (seg.ttftMs != null) {
             parts.push(`TTFT ${fmtMs(seg.ttftMs)}`);
           } else if (seg.ttftSource === "unavailable") {

@@ -37,7 +37,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
-from app import code_interpreter
+from app import date_resolver
 from app.config import Settings, get_settings
 from app.store import CALL_DISPOSITIONS, Store, blank_structured_data
 
@@ -170,26 +170,45 @@ def _resolve_date_phrase(
     bedrock_client: Any | None,
     async_tool_calls: list[dict[str, Any]] | None = None,
 ) -> str | None:
-    """Resolve a date ``phrase`` to a concrete ISO date.
+    """Resolve a date ``phrase`` to a concrete ISO date via the HYBRID resolver.
 
-    Fast path: an already-ISO date is parsed with ``strptime`` and both the
-    code-generation model and the code interpreter are skipped entirely (and NO
-    async tool call is recorded because no tool ran).
-    Otherwise the natural-language phrase is handed to
-    :func:`app.code_interpreter.resolve_date_phrase` (off the real-time path),
-    where a model WRITES a Python program on the fly and the AWS Bedrock
-    AgentCore Code Interpreter EXECUTES it to compute the date. ASK 5: that
+    Routes through :func:`app.date_resolver.resolve_date_hybrid`, which is a
+    two-tier resolver (both tiers OFF the real-time audio path):
+
+    * TIER 1 - a pure, sub-millisecond deterministic resolver
+      (:func:`app.date_resolver.resolve_deterministic`) covering the common/
+      enumerable grammar ("second Tuesday of next month", "next Friday", "in
+      two weeks", "end of next month", ...). It uses NO network and NO AWS, and
+      an already-ISO phrase short-circuits here too.
+    * TIER 2 - ONLY on a deterministic miss, the UNCHANGED model-authored AWS
+      Bedrock AgentCore Code Interpreter (:func:`app.code_interpreter.
+      resolve_date_phrase`), where a model WRITES a Python program on the fly
+      and the sandbox EXECUTES it.
+
+    ASK 5: when a tool actually ran (i.e. the phrase was not already ISO), the
     invocation is recorded as an ASYNC (off-path) tool call in
-    ``async_tool_calls`` when a list is provided, so the dashboard can show it
-    without counting it toward call latency.
+    ``async_tool_calls`` (when a list is provided), carrying a ``resolved_via``
+    label (``'deterministic'`` | ``'code_interpreter'`` | ``'unresolved'``) so
+    the dashboard (FEAT-005) can surface which tier resolved it, without
+    counting it toward call latency.
     """
     text = (phrase or "").strip()
     if not text:
         return None
+    # Already-ISO fast path: no tool runs at all, so record no async tool call.
     try:
         return datetime.strptime(text, "%Y-%m-%d").date().isoformat()
     except ValueError:
         pass
+
+    resolved, resolved_via = date_resolver.resolve_date_hybrid(
+        text,
+        reference_date,
+        region=settings.aws_region,
+        model_id=settings.extraction_model_id,
+        bedrock_client=bedrock_client,
+        code_interpreter_factory=code_interpreter_factory,
+    )
     if async_tool_calls is not None:
         async_tool_calls.append(
             {
@@ -197,16 +216,10 @@ def _resolve_date_phrase(
                 "kind": "async",
                 "t_ms": None,
                 "off_path": True,
+                "resolved_via": resolved_via,
             }
         )
-    return code_interpreter.resolve_date_phrase(
-        text,
-        reference_date=reference_date.isoformat(),
-        region=settings.aws_region,
-        model_id=settings.extraction_model_id,
-        bedrock_client=bedrock_client,
-        client_factory=code_interpreter_factory,
-    )
+    return resolved
 
 
 def _enrich_twilio_insights(

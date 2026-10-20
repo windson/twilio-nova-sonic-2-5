@@ -1,17 +1,14 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
-  AR Collections Nova Sonic 2.5 Agent - ECS Fargate service behind an
-  Application Load Balancer (WebSocket/WSS capable) bridging Twilio Media
-  Streams to Amazon Bedrock Nova Sonic 2.5. Provisions DynamoDB persistence,
-  CloudWatch logs + dashboard, a CloudTrail management-event trail, an in-stack
-  CodeBuild image build + demo-dues seeding (both via Lambda custom resources),
-  and a least-privilege IAM task role scoped to the Nova Sonic model. Pure
-  CloudFormation: see DEPLOYMENT.md for the single create-stack command.
+  AR Collections Nova Sonic 2.5 Agent - ECS Fargate service behind a WSS-capable
+  ALB bridging Twilio Media Streams to Amazon Bedrock Nova Sonic 2.5. Provisions
+  DynamoDB, CloudWatch logs + dashboards, a CloudTrail trail, in-stack CodeBuild
+  image build + demo-dues seeding (Lambda custom resources), and a
+  least-privilege IAM task role. Pure CloudFormation (see DEPLOYMENT.md).
 
 Parameters:
-  # Optional explicit ECR image URI. Leave blank (default) to use the image the
-  # in-stack CodeBuild project builds and pushes to the stack's own ECR repo at
-  # <acct>.dkr.ecr.<region>.amazonaws.com/<AppEcrRepo>:<ImageTag>. See DEPLOYMENT.md.
+  # Optional explicit ECR image URI. Blank = use the in-stack CodeBuild image
+  # in the stack's ECR repo tagged ImageTag. See DEPLOYMENT.md.
   ContainerImage:
     Type: String
     Default: ""
@@ -216,12 +213,10 @@ Resources:
       ImageScanningConfiguration:
         ScanOnPush: true
 
-  # --- In-stack image build (replaces scripts/codebuild_image.sh) ------------
-  # CodeBuild clones the GitHub repo (GitHubRepoUrl@SourceVersion; add an
-  # AWS::CodeBuild::SourceCredential if the repo is private) and runs
-  # infra/buildspec.yml to build + push the image to AppEcrRepo. Triggered on
-  # Create/Update by the ImageBuildTrigger custom resource. When a ContainerImage
-  # override is supplied, the trigger skips the build (SkipBuild=true).
+  # --- In-stack image build --------------------------------------------------
+  # CodeBuild clones GitHubRepoUrl@SourceVersion and runs infra/buildspec.yml to
+  # build + push the image to AppEcrRepo, driven by the ImageBuildTrigger custom
+  # resource. A ContainerImage override skips the build (SkipBuild=true).
   CodeBuildLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -389,8 +384,8 @@ Resources:
               except Exception as e:
                   return send(event, context, "FAILED", {}, event.get("PhysicalResourceId"), str(e))
 
-  # Triggering custom resource. ImageTag is a property so changing the tag (or
-  # SourceVersion) on a stack update re-runs the build for the new source.
+  # Trigger. ImageTag/SourceVersion are properties so changing either re-runs
+  # the build on a stack update.
   ImageBuildTrigger:
     Type: AWS::CloudFormation::CustomResource
     Properties:
@@ -443,9 +438,8 @@ Resources:
   TaskRole:
     Type: AWS::IAM::Role
     Metadata:
-      # W3037: bedrock:InvokeModelWithBidirectionalStream and the
-      # bedrock-agentcore:*CodeInterpreter* actions are valid IAM actions not yet
-      # in cfn-lint's bundled catalog (false positive).
+      # W3037: bidi + agentcore CodeInterpreter actions not yet in cfn-lint's
+      # catalog (false positive).
       cfn-lint:
         config:
           ignore_checks:
@@ -469,8 +463,7 @@ Resources:
                   - bedrock:InvokeModel
                 Resource:
                   - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${NovaModelId}"
-        # Off-path post-call extraction (app/postcall.py) on the TEXT model, also
-        # reused by app/code_interpreter.py. Scoped to exactly ExtractionModelId.
+        # Off-path post-call extraction (app/postcall.py) on the TEXT model.
         - PolicyName: bedrock-text-extraction
           PolicyDocument:
             Version: "2012-10-17"
@@ -480,10 +473,8 @@ Resources:
                   - bedrock:InvokeModel
                 Resource:
                   - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${ExtractionModelId}"
-        # Off-path date resolution (app/code_interpreter.py), post-call only. The
-        # BUILT-IN interpreter arn uses the literal account segment "aws" (per the
-        # official CFN pattern (aws|[0-9]{12})), not the caller account; also allow
-        # custom in-account interpreters + the per-session resource. See DEPLOYMENT.md.
+        # Off-path date resolution (app/code_interpreter.py). Built-in arn uses
+        # the literal "aws" account segment; also allow in-account + session.
         - PolicyName: agentcore-code-interpreter
           PolicyDocument:
             Version: "2012-10-17"
@@ -497,8 +488,7 @@ Resources:
                   - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:aws:code-interpreter/aws.codeinterpreter.v1"
                   - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:code-interpreter/*"
                   - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:code-interpreter-session/*"
-        # Note: the PTP payment-link SMS (app/twilio_client.send_sms) needs NO new
-        # IAM (reuses task egress + the Twilio secrets injected into the task).
+        # PTP payment-link SMS (app/twilio_client.send_sms) needs no new IAM.
         - PolicyName: dynamodb-rw
           PolicyDocument:
             Version: "2012-10-17"
@@ -643,8 +633,7 @@ Resources:
       SourcePrefixListId: !Ref CloudFrontOriginFacingPrefixListId
       Description: HTTP from CloudFront origin-facing edge IPs only (Option 1).
 
-  # Option 2 (CloudFront VPC origin): internal ALB reached only via the VPC origin
-  # ENI; origin SG opened to the origin-facing prefix list. See DEPLOYMENT.md.
+  # Option 2 (VPC origin): internal ALB reached via the VPC origin ENI.
   AlbIngressHttpVpcOriginV4:
     Type: AWS::EC2::SecurityGroupIngress
     Condition: UseVpcOriginCond
@@ -814,7 +803,6 @@ Resources:
     Properties:
       Type: application
       Scheme: !If [UseVpcOriginCond, internal, internet-facing]
-      # IPv4 in both postures (sufficient for the VPC-origin path). See DEPLOYMENT.md.
       IpAddressType: ipv4
       Subnets: !If
         - UseVpcOriginCond
@@ -902,12 +890,10 @@ Resources:
         OriginProtocolPolicy: http-only
         IpAddressType: ipv4
 
-  # --- CloudFront distribution (Option 1: free AWS-managed TLS front door) ---
+  # --- CloudFront distribution (free AWS-managed TLS front door) -------------
   # Fronts the HTTP:80 ALB so Twilio connects over wss://<dist>.cloudfront.net/
-  # media with the free managed cert (no domain/ACM). WebSockets pass through
-  # via the managed AllViewer origin-request policy (forwards Sec-WebSocket-*/
-  # Upgrade/Connection) and CachingDisabled; 60s origin timeouts keep the WS 101
-  # handshake open.
+  # media with the free managed cert. WebSockets pass through via the managed
+  # AllViewer policy + CachingDisabled; 60s origin timeouts keep the 101 open.
   Distribution:
     Type: AWS::CloudFront::Distribution
     Condition: EnableCf
@@ -919,10 +905,8 @@ Resources:
         HttpVersion: http2and3
         IPV6Enabled: true
         Origins:
-          # Single origin; connection style selected by UseVpcOrigin. Option 2:
-          # VpcOriginConfig -> the internal ALB via the service-managed ENI.
-          # Option 1/plain: public CustomOriginConfig to the ALB DNS. DomainName
-          # is required by CloudFront in both styles.
+          # Single origin; style selected by UseVpcOrigin (Option 2 VpcOrigin
+          # ENI vs Option 1 public CustomOrigin to ALB DNS).
           - Id: alb-origin
             DomainName: !GetAtt LoadBalancer.DNSName
             VpcOriginConfig: !If
@@ -1002,20 +986,17 @@ Resources:
               Value: !Ref DuesTable
             - Name: CALLS_TABLE
               Value: !Ref CallsTable
-            # APP_LOG_GROUP -> /api/config -> per-call CloudWatch Logs Insights
-            # deep link. Keep in sync with the awslogs-group below.
+            # APP_LOG_GROUP -> /api/config -> per-call dashboard link; keep in
+            # sync with the awslogs-group below.
             - Name: APP_LOG_GROUP
               Value: !Ref AppLogGroup
-            # TEXT model for off-path post-call extraction; driven by
-            # ExtractionModelId so this env var and the IAM grant never drift.
+            # TEXT model for off-path extraction; driven by ExtractionModelId.
             - Name: EXTRACTION_MODEL_ID
               Value: !Ref ExtractionModelId
-            # PTP payment-link SMS base URL (non-secret placeholder; override at
-            # deploy). Matches app/config.py PAYMENT_LINK_BASE_URL.
+            # PTP payment-link SMS base URL (non-secret placeholder).
             - Name: PAYMENT_LINK_BASE_URL
               Value: https://pay.example.com/
-            # PUBLIC_BASE_URL -> TwiML wss://<host>/media. Precedence: CloudFront
-            # domain (Option 1) -> ACM hostname -> raw ALB DNS.
+            # PUBLIC_BASE_URL -> TwiML wss. CloudFront -> ACM hostname -> ALB DNS.
             - Name: PUBLIC_BASE_URL
               Value: !If
                 - EnableCf
@@ -1024,9 +1005,8 @@ Resources:
                   - HasPublicHostname
                   - !Ref PublicHostname
                   - !GetAtt LoadBalancer.DNSName
-            # GA Strands OTEL telemetry. Default console exporter -> stdout ->
-            # awslogs -> CloudWatch (no new IAM/infra). Only otlp needs a
-            # collector. See DEPLOYMENT.md.
+            # GA Strands OTEL telemetry. console exporter -> stdout -> awslogs
+            # -> CloudWatch (no new IAM); only otlp needs a collector.
             - Name: OTEL_ENABLED
               Value: !Ref OtelEnabled
             - Name: OTEL_EXPORTER
@@ -1058,9 +1038,7 @@ Resources:
     Type: AWS::ECS::Service
     DependsOn: Listener
     Metadata:
-      # W1030: false positive - !If false branch !Ref PrivateSubnetIds empty
-      # default resolved against the subnet-id regex (only taken when
-      # UseVpcOrigin=true with real subnet ids).
+      # W1030: false positive on the !If false branch empty-default !Ref.
       cfn-lint:
         config:
           ignore_checks:
@@ -1091,79 +1069,42 @@ Resources:
           ContainerPort: 8080
           TargetGroupArn: !Ref TargetGroup
 
-  # --- CloudWatch dashboard --------------------------------------------------
-  # Static, aggregate (not per-call) observability dashboard. The per-call
-  # drill-down link in the UI is a client/backend-built CloudWatch Logs Insights
-  # deep link scoped to one call_sid (no new IAM, no PutMetricData). The log
-  # widgets below parse the app's one-JSON-object-per-line logs (fields such as
-  # event_type, ttft_ms, turn_latency_ms, duration_ms, tool, input_tokens,
-  # output_tokens, total_tokens -- see app/metrics.py) for TTFT, turns, token
-  # usage, barge-ins, transport and a recent call timeline across ALL calls.
+  # --- CloudWatch dashboards -------------------------------------------------
+  # Aggregate (all-calls) observability dashboard. Log widgets parse the app's
+  # one-JSON-object-per-line logs (event_type, ttft_ms, turn_latency_ms,
+  # duration_ms, tool, *_tokens -- see app/metrics.py) for TTFT, turns, tokens,
+  # barge-ins, transport and a recent timeline across ALL calls.
   Dashboard:
     Type: AWS::CloudWatch::Dashboard
     Properties:
       DashboardName: !Sub "${AWS::StackName}-observability"
       DashboardBody: !Sub |
-        {
-          "widgets": [
-            {
-              "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
-              "properties": {
-                "title": "Call volume (ALB requests)",
-                "region": "${AWS::Region}", "stat": "Sum",
-                "metrics": [ [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ] ]
-              }
-            },
-            {
-              "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
-              "properties": {
-                "title": "Request latency (ALB target response time)",
-                "region": "${AWS::Region}", "stat": "Average",
-                "metrics": [ [ "AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ] ]
-              }
-            },
-            {
-              "type": "log", "x": 0, "y": 6, "width": 12, "height": 6,
-              "properties": {
-                "title": "TTFT (time to first audio, ms) over time",
-                "region": "${AWS::Region}", "view": "timeSeries", "stacked": false,
-                "query": "SOURCE '${AppLogGroup}' | filter event_type = 'ttft_measured' | stats avg(ttft_ms) as avg_ttft_ms, max(ttft_ms) as max_ttft_ms by bin(5m)"
-              }
-            },
-            {
-              "type": "log", "x": 12, "y": 6, "width": 12, "height": 6,
-              "properties": {
-                "title": "Turns: response wait and turn elapsed (ms)",
-                "region": "${AWS::Region}", "view": "timeSeries", "stacked": false,
-                "query": "SOURCE '${AppLogGroup}' | filter event_type = 'turn_complete' | stats avg(turn_latency_ms) as avg_response_wait_ms, avg(duration_ms) as avg_turn_elapsed_ms, count(*) as turns by bin(5m)"
-              }
-            },
-            {
-              "type": "log", "x": 0, "y": 12, "width": 12, "height": 6,
-              "properties": {
-                "title": "Token usage (input / output / total)",
-                "region": "${AWS::Region}", "view": "timeSeries", "stacked": false,
-                "query": "SOURCE '${AppLogGroup}' | filter event_type = 'usage' | stats sum(input_tokens) as input_tokens, sum(output_tokens) as output_tokens, sum(total_tokens) as total_tokens by bin(5m)"
-              }
-            },
-            {
-              "type": "log", "x": 12, "y": 12, "width": 12, "height": 6,
-              "properties": {
-                "title": "Barge-ins and tool invocations per call",
-                "region": "${AWS::Region}", "view": "table",
-                "query": "SOURCE '${AppLogGroup}' | filter event_type = 'barge_in' or event_type = 'tool_invocation' | stats count(*) as events by call_sid, event_type | sort call_sid desc | limit 100"
-              }
-            },
-            {
-              "type": "log", "x": 0, "y": 18, "width": 24, "height": 6,
-              "properties": {
-                "title": "Recent call timeline (lifecycle / metrics JSON lines)",
-                "region": "${AWS::Region}", "view": "table",
-                "query": "SOURCE '${AppLogGroup}' | fields @timestamp, call_sid, event_type, t_ms, ttft_ms, turn_latency_ms, duration_ms, tool, total_tokens | sort @timestamp desc | limit 100"
-              }
-            }
-          ]
-        }
+        {"widgets":[
+        {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"Call volume (ALB requests)","region":"${AWS::Region}","stat":"Sum","metrics":[["AWS/ApplicationELB","RequestCount","LoadBalancer","${LoadBalancer.LoadBalancerFullName}"]]}},
+        {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Request latency (ALB target response time)","region":"${AWS::Region}","stat":"Average","metrics":[["AWS/ApplicationELB","TargetResponseTime","LoadBalancer","${LoadBalancer.LoadBalancerFullName}"]]}},
+        {"type":"log","x":0,"y":6,"width":12,"height":6,"properties":{"title":"TTFT (time to first audio, ms) over time","region":"${AWS::Region}","view":"timeSeries","stacked":false,"query":"SOURCE '${AppLogGroup}' | filter event_type = 'ttft_measured' | stats avg(ttft_ms) as avg_ttft_ms, max(ttft_ms) as max_ttft_ms by bin(5m)"}},
+        {"type":"log","x":12,"y":6,"width":12,"height":6,"properties":{"title":"Turns: response wait and turn elapsed (ms)","region":"${AWS::Region}","view":"timeSeries","stacked":false,"query":"SOURCE '${AppLogGroup}' | filter event_type = 'turn_complete' | stats avg(turn_latency_ms) as avg_response_wait_ms, avg(duration_ms) as avg_turn_elapsed_ms, count(*) as turns by bin(5m)"}},
+        {"type":"log","x":0,"y":12,"width":12,"height":6,"properties":{"title":"Token usage (input / output / total)","region":"${AWS::Region}","view":"timeSeries","stacked":false,"query":"SOURCE '${AppLogGroup}' | filter event_type = 'usage' | stats sum(input_tokens) as input_tokens, sum(output_tokens) as output_tokens, sum(total_tokens) as total_tokens by bin(5m)"}},
+        {"type":"log","x":12,"y":12,"width":12,"height":6,"properties":{"title":"Barge-ins and tool invocations per call","region":"${AWS::Region}","view":"table","query":"SOURCE '${AppLogGroup}' | filter event_type = 'barge_in' or event_type = 'tool_invocation' | stats count(*) as events by call_sid, event_type | sort call_sid desc | limit 100"}},
+        {"type":"log","x":0,"y":18,"width":24,"height":6,"properties":{"title":"Recent call timeline (lifecycle / metrics JSON lines)","region":"${AWS::Region}","view":"table","query":"SOURCE '${AppLogGroup}' | fields @timestamp, call_sid, event_type, t_ms, ttft_ms, turn_latency_ms, duration_ms, tool, total_tokens | sort @timestamp desc | limit 100"}}
+        ]}
+
+  # Consolidated PER-CALL dashboard (D3): multi-widget view of ONE call. Each
+  # query filters on token CALL_SID_TOKEN, overridden with the call_sid by the
+  # per-call UI link (app/dashboard.py) to scope every widget at once.
+  PerCallDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${AWS::StackName}-per-call"
+      DashboardBody: !Sub |
+        {"variables":[{"type":"pattern","pattern":"CALL_SID_TOKEN","inputType":"input","id":"call_sid","label":"Call SID","defaultValue":"CALL_SID_TOKEN","visible":true}],"widgets":[
+        {"type":"log","x":0,"y":0,"width":24,"height":6,"properties":{"title":"Per-turn timeline (events in call order)","region":"${AWS::Region}","view":"table","query":"SOURCE '${AppLogGroup}' | fields t_ms, event_type, role, ttft_ms, turn_latency_ms, duration_ms, tool, message | filter call_sid = 'CALL_SID_TOKEN' | sort t_ms asc | limit 500"}},
+        {"type":"log","x":0,"y":6,"width":12,"height":6,"properties":{"title":"TTFT and turns","region":"${AWS::Region}","view":"table","query":"SOURCE '${AppLogGroup}' | filter call_sid = 'CALL_SID_TOKEN' and event_type = 'turn_complete' | stats avg(ttft_ms) as avg_ttft_ms, max(ttft_ms) as max_ttft_ms, avg(turn_latency_ms) as avg_response_wait_ms, count(*) as turns"}},
+        {"type":"log","x":12,"y":6,"width":12,"height":6,"properties":{"title":"Token usage (input / output / total)","region":"${AWS::Region}","view":"table","query":"SOURCE '${AppLogGroup}' | filter call_sid = 'CALL_SID_TOKEN' and event_type = 'usage' | stats sum(input_tokens) as input_tokens, sum(output_tokens) as output_tokens, sum(total_tokens) as total_tokens"}},
+        {"type":"log","x":0,"y":12,"width":12,"height":6,"properties":{"title":"Barge-ins","region":"${AWS::Region}","view":"table","query":"SOURCE '${AppLogGroup}' | filter call_sid = 'CALL_SID_TOKEN' and event_type = 'barge_in' | fields t_ms | sort t_ms asc | limit 100"}},
+        {"type":"log","x":12,"y":12,"width":12,"height":6,"properties":{"title":"Tool calls (count by tool)","region":"${AWS::Region}","view":"table","query":"SOURCE '${AppLogGroup}' | filter call_sid = 'CALL_SID_TOKEN' and event_type = 'tool_invocation' | stats count(*) as calls by tool | sort calls desc"}},
+        {"type":"log","x":0,"y":18,"width":24,"height":6,"properties":{"title":"Twilio insights / transport","region":"${AWS::Region}","view":"table","query":"SOURCE '${AppLogGroup}' | filter call_sid = 'CALL_SID_TOKEN' and (event_type like /twilio/ or event_type = 'call_end_summary') | fields t_ms, event_type, summary.transport_delay_estimate_ms as transport_delay_estimate_ms, summary.twilio_latency_ms as twilio_latency_ms, summary.total_e2e_ms as total_e2e_ms, summary.nova_total_ms as nova_total_ms, message | sort t_ms asc | limit 100"}}
+        ]}
 
   # --- CloudTrail (management events) ---------------------------------------
   TrailBucket:
@@ -1242,6 +1183,9 @@ Outputs:
   DashboardUrl:
     Description: CloudWatch dashboard console URL.
     Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${Dashboard}"
+  PerCallDashboardUrl:
+    Description: Consolidated per-call CloudWatch dashboard console URL.
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${PerCallDashboard}"
   EcrRepositoryUri:
     Description: ECR repo the in-stack CodeBuild build pushes the app image to.
     Value: !GetAtt AppEcrRepo.RepositoryUri

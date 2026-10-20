@@ -3,18 +3,19 @@
 
 import type { CallRecord, ConversationTurn, ToolCall } from "./api";
 
-// ASK 1: field names use the accurate official terminology from FEAT-001 --
+// ASK 1 / FEAT-004: field names use the accurate official terminology --
 // turnElapsedMs = how long the turn occupied the conversation (NOT latency),
-// responseWaitMs = time for Sonic to begin answering (a wait window, NOT
-// model/network latency), ttftMs = time to first audio. We deliberately do
-// NOT call any of these "latency".
+// callerReplyGapMs = time from the caller finishing speaking to the agent
+// beginning its reply (present only when a genuine caller turn precedes an
+// assistant turn; NOT the same thing as TTFT), ttftMs = time to first audio.
+// We deliberately do NOT call any of these "latency".
 export interface ChatSegment {
   speaker: "user" | "assistant";
   text: string;
   turnElapsedMs: number | null;
   ttftMs: number | null;
   ttftSource: string | null;
-  responseWaitMs: number | null;
+  callerReplyGapMs: number | null;
   // ASK 7: assistant turns interrupted by a barge-in.
   interrupted: boolean;
   // ASK 5: sync in-call tool invocations attached to this turn.
@@ -41,7 +42,9 @@ export function chatSegments(record: CallRecord): ChatSegment[] {
         turnElapsedMs: t.turn_elapsed_ms ?? t.total_ms ?? null,
         ttftMs: t.ttft_ms ?? null,
         ttftSource: t.ttft_source ?? null,
-        responseWaitMs: t.response_wait_ms ?? t.latency_ms ?? null,
+        // Prefer the new accurate field, fall back to the deprecated aliases.
+        callerReplyGapMs:
+          t.caller_reply_gap_ms ?? t.response_wait_ms ?? t.latency_ms ?? null,
         interrupted: Boolean(t.interrupted),
         toolCalls: Array.isArray(t.tool_calls) ? t.tool_calls : [],
       }));
@@ -58,7 +61,7 @@ export function chatSegments(record: CallRecord): ChatSegment[] {
       turnElapsedMs: null,
       ttftMs: null,
       ttftSource: null,
-      responseWaitMs: null,
+      callerReplyGapMs: null,
       interrupted: false,
       toolCalls: [] as ToolCall[],
     }))

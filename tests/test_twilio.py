@@ -16,6 +16,7 @@ from app.config import Settings
 from app.twilio_client import (
     ADVANCED_QOS_UNAVAILABLE_REASON,
     fetch_call_insights,
+    hangup_call,
 )
 
 
@@ -192,6 +193,115 @@ def test_fetch_call_insights_unavailable_without_call_sid_or_creds():
 
     # The client factory was never invoked in either short-circuit path.
     assert built == []
+
+
+# --- FEAT-002: end-of-call Twilio hangup (Status=completed) ------------------
+
+
+class _FakeCallUpdateContext:
+    """Stand-in for ``client.calls(sid)`` exposing ``.update(status=...)``."""
+
+    def __init__(self, call_sid, recorder):
+        self.call_sid = call_sid
+        self._recorder = recorder
+
+    def update(self, status=None, **kwargs):
+        self._recorder.append((self.call_sid, status))
+        return object()
+
+
+class _FakeHangupClient:
+    """Mock ``twilio.rest.Client`` exposing ``.calls(sid).update(...)``."""
+
+    def __init__(self, account_sid, auth_token):
+        self.account_sid = account_sid
+        self.auth_token = auth_token
+        self.updates: list[tuple[str, str]] = []
+
+    def calls(self, call_sid):
+        return _FakeCallUpdateContext(call_sid, self.updates)
+
+
+def test_hangup_call_updates_status_completed():
+    """hangup_call issues client.calls(sid).update(status='completed') with the
+    Twilio client injected/stubbed (no live call placed)."""
+    created = []
+
+    def factory(account_sid, auth_token):
+        c = _FakeHangupClient(account_sid, auth_token)
+        created.append(c)
+        return c
+
+    marker = hangup_call("CA_live", settings=_settings(), client_factory=factory)
+
+    assert marker["hung_up"] is True
+    assert marker["status"] == "completed"
+    assert marker["call_sid"] == "CA_live"
+    assert created and created[0].updates == [("CA_live", "completed")]
+
+
+def test_hangup_call_missing_sid_is_benign_noop():
+    """No call_sid -> benign marker, never raises, client never built."""
+    built = []
+
+    def factory(*a):
+        built.append(a)
+        return _FakeHangupClient(*a)
+
+    marker = hangup_call(None, settings=_settings(), client_factory=factory)
+    assert marker["hung_up"] is False
+    assert marker["status"] == "no_call_sid"
+    assert built == []
+
+
+def test_hangup_call_failure_safe_when_update_raises():
+    """A Twilio error (e.g. call already completed/gone) must NOT raise; it
+    returns an explicit marker instead."""
+
+    class _Raiser:
+        def __init__(self, *_a):
+            pass
+
+        def calls(self, _sid):
+            raise RuntimeError("Unable to update record: Call is not in-progress")
+
+    marker = hangup_call(
+        "CA_gone",
+        settings=_settings(),
+        client_factory=lambda *a: _Raiser(),
+    )
+    assert marker["hung_up"] is False
+    assert marker["status"] == "error"
+    assert marker["error"] == "RuntimeError"
+
+
+def test_hangup_call_unconfigured_is_benign_noop():
+    """Twilio not configured -> benign marker, client never built."""
+    built = []
+
+    def factory(*a):
+        built.append(a)
+        return _FakeHangupClient(*a)
+
+    not_configured = _settings(twilio_account_sid=None, twilio_auth_token=None)
+    marker = hangup_call("CA_live", settings=not_configured, client_factory=factory)
+    assert marker["hung_up"] is False
+    assert marker["status"] == "twilio_not_configured"
+    assert built == []
+
+
+def test_hangup_call_never_logs_auth_token(caplog):
+    """The auth token must never appear in any emitted log record."""
+    import logging
+
+    with caplog.at_level(logging.INFO):
+        hangup_call(
+            "CA_live",
+            settings=_settings(),
+            client_factory=lambda sid, tok: _FakeHangupClient(sid, tok),
+        )
+    for rec in caplog.records:
+        assert "test_token_value" not in rec.getMessage()
 
 
 def test_fetch_call_insights_never_logs_auth_token(caplog):

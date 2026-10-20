@@ -28,7 +28,7 @@ from app.postcall import extract_and_apply
 from app.sonic_bridge import DEFAULT_KICKOFF_TEXT, SonicSession
 from app.store import get_default_store
 from app.telemetry import setup_telemetry
-from app.twilio_client import place_outbound_call
+from app.twilio_client import hangup_call, place_outbound_call
 
 logger = logging.getLogger(__name__)
 
@@ -158,10 +158,11 @@ def _launch_postcall(
 def _dashboard_url(call_sid: str | None) -> str | None:
     """Build the per-call CloudWatch dashboard deep-link from config (ASK 4).
 
-    Pure string construction (no AWS call): a consolidated CloudWatch Logs
-    Insights view scoped to ``call_sid`` against the configured app log group +
-    region, surfacing TTFT, turns, token usage, barge-ins, tool invocations,
-    transport and the call timeline. ``None`` when the record has no call_sid.
+    Pure string construction (no AWS call): opens the CONSOLIDATED per-call
+    CloudWatch dashboard (``<stack>-per-call``, provisioned in infra) with its
+    multi-widget view scoped to ``call_sid`` -- per-turn timeline, TTFT + turns,
+    token usage, barge-ins, tool calls, Twilio/transport. ``None`` when the
+    record has no call_sid. The stack name is derived from the app log group.
     """
     if not call_sid:
         return None
@@ -358,7 +359,46 @@ async def media_stream(websocket: WebSocket) -> None:
                 # metrics collector tagged to this call/account.
                 due_record = store.get_due(account_id) if account_id else None
                 system_prompt = get_system_prompt(due_record) if due_record else None
-                tools = build_tools(store)
+
+                # FEAT-002 end-of-call flow: capture the running loop so the
+                # end_conversation tool's on_end callback can safely schedule the
+                # terminal Twilio hangup + session close even if strands delivers
+                # the tool call on a different (model) thread. The callback NEVER
+                # blocks the real-time audio callback; the REST hangup is the
+                # intended terminal action and runs as its own task.
+                loop = asyncio.get_running_loop()
+                end_call_sid = call_sid
+
+                async def _end_session() -> None:
+                    # Terminal action: drop the Twilio call (idempotent + failure
+                    # safe), then close the SonicSession so the existing
+                    # finally-block teardown (save_call_analytics + _launch_postcall)
+                    # runs exactly as today. close() is itself idempotent, so this
+                    # never double-runs teardown.
+                    try:
+                        hangup_call(end_call_sid)
+                    except Exception:  # noqa: BLE001 - hangup must never crash teardown
+                        logger.exception(
+                            "call_sid=<%s> | end_session hangup failed", end_call_sid
+                        )
+                    if session is not None:
+                        await session.close()
+
+                def on_end() -> None:
+                    # Called from the end_conversation tool (possibly on the model
+                    # thread). Schedule the async teardown on the websocket's event
+                    # loop; do not block the caller.
+                    try:
+                        loop.call_soon_threadsafe(
+                            lambda: loop.create_task(_end_session())
+                        )
+                    except RuntimeError:  # pragma: no cover - loop already closed
+                        logger.warning(
+                            "call_sid=<%s> | could not schedule end_session (loop closed)",
+                            end_call_sid,
+                        )
+
+                tools = build_tools(store, call_sid=call_sid, on_end=on_end)
                 metrics = CallMetrics(call_sid=call_sid, account_id=account_id)
 
                 session = SonicSession(
