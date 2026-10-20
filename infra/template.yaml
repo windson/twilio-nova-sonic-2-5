@@ -193,9 +193,12 @@ Resources:
   TaskRole:
     Type: AWS::IAM::Role
     Metadata:
-      # bedrock:InvokeModelWithBidirectionalStream is a valid Bedrock action
-      # (Nova Sonic bi-di streaming) that cfn-lint's bundled IAM action catalog
-      # does not yet list, so W3037 is a false positive here.
+      # bedrock:InvokeModelWithBidirectionalStream (Nova Sonic bi-di streaming)
+      # and the bedrock-agentcore:*CodeInterpreterSession /
+      # bedrock-agentcore:InvokeCodeInterpreter actions (AgentCore Code
+      # Interpreter, used off-path for date resolution) are all valid IAM
+      # actions that cfn-lint's bundled action catalog does not yet list, so
+      # W3037 is a false positive for this role.
       cfn-lint:
         config:
           ignore_checks:
@@ -238,6 +241,32 @@ Resources:
                 # at invoke time.
                 Resource:
                   - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${ExtractionModelId}"
+        # Separate, least-privilege grant for the OFF-PATH natural-language date
+        # resolution (app/code_interpreter.py), which ships a generated Python
+        # program to the AWS Bedrock AgentCore Code Interpreter sandbox and reads
+        # back the computed ISO date. The SDK path used
+        # (bedrock_agentcore.tools.code_interpreter_client.CodeInterpreter:
+        # start() -> invoke("executeCode", ...) -> stop()) maps to EXACTLY these
+        # three session actions; no Create/Delete/List/Get is used because the
+        # app targets the MANAGED default interpreter (aws.codeinterpreter.v1),
+        # which requires no CreateCodeInterpreter. This ~1.9s call runs only in
+        # the post-call async task (app/postcall.py), never on the real-time
+        # audio/turn path, so it adds zero call latency. Kept distinct from the
+        # Nova Sonic bidi and text-extraction grants so each evolves on its own.
+        - PolicyName: agentcore-code-interpreter
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:StartCodeInterpreterSession
+                  - bedrock-agentcore:InvokeCodeInterpreter
+                  - bedrock-agentcore:StopCodeInterpreterSession
+                # Scoped to the code-interpreter resource namespace in this
+                # account/region, which covers the managed aws.codeinterpreter.v1
+                # default the app uses (arn:...:code-interpreter/*).
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:code-interpreter/*"
         # Note: the PTP payment-link SMS (app/twilio_client.send_sms) needs NO new
         # IAM. It reuses the task's existing egress (ServiceSecurityGroup allows
         # all outbound to the Twilio API) and the Twilio credentials already

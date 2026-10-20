@@ -93,7 +93,13 @@ flowchart TB
    the call it writes a Python program on the fly that reasons from today's date
    + the captured phrase and `executeCode`-runs it in the sandbox to resolve a
    concrete `YYYY-MM-DD`. The ~1.9s session is why this runs only post-call,
-   never on the real-time turn.
+   never on the real-time turn. The task role carries a dedicated
+   least-privilege `agentcore-code-interpreter` grant
+   (`bedrock-agentcore:StartCodeInterpreterSession` /
+   `InvokeCodeInterpreter` / `StopCodeInterpreterSession`, scoped to
+   `code-interpreter/*`) for exactly this SDK path - no
+   Create/Delete/List, because the managed `aws.codeinterpreter.v1` default
+   needs none.
 7. **DynamoDB persistence.** `DuesTable` holds due/account records and
    `CallsTable` holds the CallAnalytics record (numeric fields stored as
    `Decimal` via float->Decimal conversion).
@@ -108,6 +114,27 @@ flowchart TB
     (`/ecs/ar-collections-nova-sonic/app`), the
     `ar-collections-nova-sonic-observability` dashboard, and a CloudTrail trail
     record activity; Twilio credentials live in Secrets Manager.
+
+## IAM (least privilege)
+
+The ECS **task role** holds four separate, independently-scoped policy blocks so
+each permission tracks exactly one capability (see `infra/template.yaml`):
+
+- `bedrock-nova-sonic-bidi` - `bedrock:InvokeModelWithBidirectionalStream` /
+  `InvokeModel` on just the Nova Sonic foundation-model ARN (phase 5).
+- `bedrock-text-extraction` - `bedrock:InvokeModel` on just the configured
+  `ExtractionModelId` text-model ARN (phase 8); the grant and the
+  `EXTRACTION_MODEL_ID` env var derive from the same parameter so they cannot
+  drift.
+- `agentcore-code-interpreter` - the three AgentCore Code Interpreter session
+  actions the off-path date tool uses (phase 6b), scoped to
+  `arn:aws:bedrock-agentcore:<region>:<account>:code-interpreter/*`.
+- `dynamodb-rw` / `cloudwatch-logs-write` - DynamoDB RW on the two tables and
+  log-stream writes on the app log group.
+
+`bedrock:InvokeModelWithBidirectionalStream` and the `bedrock-agentcore` session
+actions are valid IAM actions not yet in cfn-lint's bundled catalog, so a scoped
+`W3037` ignore lives in the TaskRole `Metadata` with an explanatory comment.
 
 ## Async / no-latency guarantee
 

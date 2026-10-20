@@ -7,7 +7,8 @@ speech understanding, reasoning, and speech generation; **Strands bi-di agents**
 orchestrate the real-time session. The agent greets the debtor by name, states
 the exact amount due and due date, converses, and writes the outcome back to the
 due record via a tool. Every call is tagged with detailed metrics shown on a
-built-in analytics dashboard.
+built-in analytics dashboard (a **shadcn/ui** React + Tailwind + Vite SPA,
+compiled at image-build time and served by the same FastAPI app).
 
 ## Architecture
 
@@ -74,7 +75,10 @@ audio path:
 | `app/metrics.py` | Per-call / per-turn metrics + JSON-line logging |
 | `app/store.py` | Pluggable store: in-memory by default, **DynamoDB on AWS** |
 | `app/twilio_client.py` | Places the outbound call with `<Connect><Stream>` TwiML |
-| `web/` | Dependency-light vanilla-JS analytics dashboard |
+| `app/code_interpreter.py` | Off-path AgentCore Code Interpreter wrapper (resolves relative date phrases) |
+| `app/postcall.py` | Async post-call intelligence (disposition, structured data, NBA, date resolution) |
+| `frontend/` | shadcn/ui React + Tailwind + Vite dashboard source (built at image-build time) |
+| `web/` | Compiled dashboard bundle served by FastAPI at `/` + `/static/assets/` (git-ignored; produced by the Docker node build stage) |
 | `scripts/place_call.py` | CLI to initiate an outbound collections call |
 | `scripts/deploy.sh` | Operator wrapper for build/lint/push/deploy |
 | `infra/template.yaml` | AWS CloudFormation IaC (ECS Fargate + ALB + DynamoDB + CloudWatch + CloudTrail) |
@@ -155,6 +159,33 @@ audio path:
    duration of each; "Nova Sonic total time" is the summed duration of Nova's
    outbound audio frames.
 
+## Dashboard (shadcn/ui redesign)
+
+The analytics dashboard is a **shadcn/ui** single-page app (React + TypeScript +
+Tailwind, bundled with Vite) living in `frontend/`. It replaces the earlier
+dependency-light vanilla-JS page while preserving every capability (due records,
+past calls, per-call metrics, the chat transcript, the per-turn latency table,
+and the in-depth event log) and adds a more interactive information architecture:
+a call-attempt header with status/disposition **badges**, the transcript and
+telemetry panels, a per-turn latency table, a latency chart, and
+**tooltips / collapsibles / popovers** to surface detail on demand. It polls the
+same REST API (`/api/config`, `/api/dues`, `/api/calls`, `/api/calls/{id}`) every
+few seconds, so a call updates live.
+
+- **Source vs. served bundle.** `frontend/` holds the TypeScript source and
+  `shadcn` config; `vite.config.ts` sets `base: "/static/"` and emits the
+  compiled bundle into `web/` (`index.html` + `assets/`), which FastAPI serves
+  unchanged (`GET /` -> `web/index.html`, `/static` -> `web/`). The compiled
+  `web/` bundle is **git-ignored** and produced at image-build time, so no large
+  generated assets are committed.
+- **Built in the container (multi-stage Docker).** The `Dockerfile` has a
+  `node:22-slim` **web-build** stage that runs `npm ci && npm run build` in
+  `frontend/` (npm runs at image-build time, where the network is available),
+  then the `python:3.12-slim` runtime stage `COPY --from=web-build`s the emitted
+  `web/` bundle. Because the node build runs inside `docker build`, the CodeBuild
+  environment only needs Docker - no host node toolchain and no local
+  `docker build` (the image is built remotely via `scripts/codebuild_image.sh`).
+
 ## AWS deploy
 
 The IaC (`infra/template.yaml`) provisions an **ECS Fargate** service behind an
@@ -164,10 +195,24 @@ The IaC (`infra/template.yaml`) provisions an **ECS Fargate** service behind an
 **least-privilege IAM task role** granting
 `bedrock:InvokeModelWithBidirectionalStream` + `bedrock:InvokeModel` on the Nova
 Sonic model ARN, a separate scoped `bedrock:InvokeModel` grant on the text
-extraction model ARN for the post-call Converse extraction, DynamoDB RW on just
-the two tables, and CloudWatch Logs write. The post-call PTP payment-link SMS
-needs no new IAM (it reuses existing egress + the Secrets-Manager Twilio
-credentials).
+extraction model ARN for the post-call Converse extraction, a separate
+least-privilege `agentcore-code-interpreter` grant
+(`bedrock-agentcore:StartCodeInterpreterSession` / `InvokeCodeInterpreter` /
+`StopCodeInterpreterSession`, scoped to `code-interpreter/*`) for the off-path
+date resolution, DynamoDB RW on just the two tables, and CloudWatch Logs write.
+The post-call PTP payment-link SMS needs no new IAM (it reuses existing egress +
+the Secrets-Manager Twilio credentials).
+
+> **Code Interpreter / IAM.** The off-path natural-language date tool
+> (`app/code_interpreter.py`) targets the **managed** AgentCore interpreter
+> `aws.codeinterpreter.v1`, so the task role grants only the three session
+> actions its SDK path actually calls
+> (`start()` -> `StartCodeInterpreterSession`,
+> `invoke("executeCode", ...)` -> `InvokeCodeInterpreter`,
+> `stop()` -> `StopCodeInterpreterSession`) and **no** Create/Delete/List/Get.
+> Both `bedrock:InvokeModelWithBidirectionalStream` and the `bedrock-agentcore`
+> session actions are valid IAM actions missing from cfn-lint's bundled catalog,
+> so a scoped `W3037` ignore sits in the TaskRole `Metadata` with a comment.
 
 > **Extraction model / IAM coupling.** The text-extraction model is set once via
 > the `ExtractionModelId` CloudFormation parameter (default
