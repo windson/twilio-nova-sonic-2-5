@@ -117,6 +117,35 @@ flowchart TB
     `ar-collections-nova-sonic-observability` dashboard, and a CloudTrail trail
     record activity; Twilio credentials live in Secrets Manager.
 
+## Telemetry: GA Strands OTEL spans vs. CallMetrics
+
+The GA `strands.bidi` agent loop auto-emits OpenTelemetry (OTEL) spans once
+`StrandsTelemetry` is configured **before** the agent runs. The app configures
+it exactly once at startup (`app/telemetry.py`, guarded so a failure never
+crashes startup or the real-time audio path) and defaults to the **console
+exporter**: spans are written to stdout, which the ECS `awslogs` driver already
+ships to CloudWatch Logs. That means session token usage and per-response TTFT
+land in CloudWatch with **no new IAM and no new infrastructure**. Set
+`OTEL_EXPORTER=otlp` (with `OTEL_EXPORTER_OTLP_ENDPOINT`) to send to a collector
+instead, or `OTEL_ENABLED=false` to turn telemetry off. These are non-secret
+knobs surfaced via `/api/config`.
+
+Two sources of truth, each owning what it measures best:
+
+| Signal | Authoritative source | Notes |
+| --- | --- | --- |
+| Session token usage (`gen_ai.usage.*`) | **OTEL** `bidi_session` span | Reported by the model; emitted automatically. |
+| Per-response TTFT (`gen_ai.server.time_to_first_audio`) | **OTEL** `bidi_response` span | Native time-to-first-audio, measured inside the agent loop. |
+| Tool-call / connection-restart / barge-in | **OTEL** spans + span events | Emitted automatically by the GA loop. |
+| Per-utterance `turn_count`, conversational turns | **CallMetrics** | Derived from transcript-role alternation; OTEL spans do not model per-utterance chat turns. |
+| Nova speaking time (`nova_total_ms`) | **CallMetrics** | Summed from outbound audio-frame durations. |
+| Disposition + structured post-call data | **CallMetrics** / post-call extraction | Business signals, not in OTEL. |
+| Twilio transport latency (`twilio_latency_ms`) | **CallMetrics** | Derived from Twilio media timestamps. |
+
+The user-facing dashboard continues to read from `CallMetrics` unchanged; OTEL
+now provides TTFT and session token usage **authoritatively** alongside it, for
+cross-checking in CloudWatch, without altering the audio path.
+
 ## IAM (least privilege)
 
 The ECS **task role** holds four separate, independently-scoped policy blocks so

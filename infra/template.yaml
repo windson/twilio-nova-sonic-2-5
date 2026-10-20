@@ -37,6 +37,35 @@ Parameters:
       intelligence_status=failed). Constrained to the TEXT models verified
       available in us-east-1; to use another model, add it here so the grant
       and the env var stay in lockstep.
+  OtelEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: >-
+      Master switch for GA Strands OTEL telemetry. When true the GA bidi agent
+      loop auto-emits OTEL spans (session token usage, per-response
+      time-to-first-audio/TTFT, tool-call and connection-restart spans).
+  OtelExporter:
+    Type: String
+    Default: console
+    AllowedValues:
+      - console
+      - otlp
+      - none
+    Description: >-
+      OTEL span exporter. "console" (default) writes spans to stdout, which the
+      ECS awslogs driver already ships to CloudWatch Logs - so NO new IAM and NO
+      new infrastructure are required for telemetry. "otlp" ships to the
+      collector named by OtelExporterOtlpEndpoint; "none" disables export.
+  OtelExporterOtlpEndpoint:
+    Type: String
+    Default: ""
+    Description: >-
+      OTLP collector endpoint URL. Only used when OtelExporter=otlp; read by the
+      OpenTelemetry SDK via OTEL_EXPORTER_OTLP_ENDPOINT. Leave blank for the
+      console exporter.
   TwilioAccountSidArn:
     Type: String
     Description: >-
@@ -119,6 +148,9 @@ Conditions:
   # Inverse of EnableCf: open ALB ingress (0.0.0.0/0) only when CloudFront is
   # off. When CloudFront is on, ingress is locked to the managed prefix list.
   CloudFrontDisabled: !Not [!Equals [!Ref EnableCloudFront, "true"]]
+  # Wire the OTLP endpoint env var only when an endpoint is actually supplied,
+  # so the console/stdout path (the default) carries no empty OTLP config.
+  HasOtelEndpoint: !Not [!Equals [!Ref OtelExporterOtlpEndpoint, ""]]
 
 Resources:
   # --- DynamoDB persistence --------------------------------------------------
@@ -573,6 +605,26 @@ Resources:
                   - HasPublicHostname
                   - !Ref PublicHostname
                   - !GetAtt LoadBalancer.DNSName
+            # GA Strands OTEL telemetry. The app configures StrandsTelemetry
+            # once at startup (before any BidiAgent.run) so the GA bidi agent
+            # loop auto-emits OTEL spans: a bidi_session span with reported token
+            # usage (gen_ai.usage.*), a bidi_response span with native TTFT
+            # (gen_ai.server.time_to_first_audio), plus tool-call and
+            # connection-restart spans. With the default OTEL_EXPORTER=console,
+            # spans are written to stdout and the awslogs LogDriver below already
+            # ships them to CloudWatch Logs -- so NO new IAM and NO new
+            # infrastructure are required for telemetry. OTEL_EXPORTER=otlp is
+            # the only setting that needs an external collector; if you adopt it,
+            # that collector's auth (not this task role) governs access.
+            - Name: OTEL_ENABLED
+              Value: !Ref OtelEnabled
+            - Name: OTEL_EXPORTER
+              Value: !Ref OtelExporter
+            - !If
+              - HasOtelEndpoint
+              - Name: OTEL_EXPORTER_OTLP_ENDPOINT
+                Value: !Ref OtelExporterOtlpEndpoint
+              - !Ref AWS::NoValue
           # Twilio credentials are injected from Secrets Manager/SSM by ARN;
           # no secret value appears in this template.
           Secrets:

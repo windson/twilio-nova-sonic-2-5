@@ -52,6 +52,9 @@ def _settings(**overrides) -> Settings:
         twilio_from_number="+15005550006",
         twilio_verified_caller_id="+15005550010",
         public_base_url="https://example.ngrok.app",
+        otel_enabled=True,
+        otel_exporter="console",
+        otel_endpoint=None,
     )
     base.update(overrides)
     return Settings(**base)

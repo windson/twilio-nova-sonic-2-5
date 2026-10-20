@@ -30,6 +30,17 @@ DEFAULT_CODE_INTERPRETER_ID = "aws.codeinterpreter.v1"
 # TWILIO_TRIAL_MODE=false on a full account to address the debtor's own number
 # (falling back to the verified id only when the record carries no phone).
 DEFAULT_TWILIO_TRIAL_MODE = True
+# GA Strands OTEL telemetry (non-secret). When enabled, StrandsTelemetry is
+# configured once at startup so the GA bidi agent loop auto-emits OTEL spans
+# (session token usage, per-response time-to-first-audio/TTFT, tool-call and
+# connection-restart spans). The default console exporter writes spans to
+# stdout, which the ECS awslogs driver ships to CloudWatch Logs -- no new infra
+# and no new IAM. Set OTEL_EXPORTER=otlp (and OTEL_EXPORTER_OTLP_ENDPOINT) to
+# send to an OTLP collector instead, or OTEL_EXPORTER=none / OTEL_ENABLED=false
+# to turn telemetry off.
+DEFAULT_OTEL_ENABLED = True
+DEFAULT_OTEL_EXPORTER = "console"
+_VALID_OTEL_EXPORTERS = ("console", "otlp", "none")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -60,6 +71,10 @@ class Settings:
     twilio_from_number: str | None
     twilio_verified_caller_id: str | None
     public_base_url: str | None
+    # GA Strands OTEL telemetry knobs (non-secret).
+    otel_enabled: bool
+    otel_exporter: str
+    otel_endpoint: str | None
 
     @property
     def twilio_configured(self) -> bool:
@@ -84,6 +99,12 @@ class Settings:
             "from_number_set": bool(self.twilio_from_number),
             "verified_caller_id_set": bool(self.twilio_verified_caller_id),
             "public_base_url_set": bool(self.public_base_url),
+            # Non-secret markers so the dashboard/API can surface that GA Strands
+            # OTEL telemetry is on and which exporter it uses (console spans land
+            # in CloudWatch Logs; otlp ships to a collector).
+            "otel_enabled": self.otel_enabled,
+            "otel_exporter": self.otel_exporter,
+            "otel_endpoint_set": bool(self.otel_endpoint),
         }
 
 
@@ -110,4 +131,13 @@ def get_settings() -> Settings:
         twilio_from_number=os.environ.get("TWILIO_FROM_NUMBER") or None,
         twilio_verified_caller_id=os.environ.get("TWILIO_VERIFIED_CALLER_ID") or None,
         public_base_url=os.environ.get("PUBLIC_BASE_URL") or None,
+        otel_enabled=_env_bool("OTEL_ENABLED", DEFAULT_OTEL_ENABLED),
+        otel_exporter=_otel_exporter(),
+        otel_endpoint=os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") or None,
     )
+
+
+def _otel_exporter() -> str:
+    """Parse OTEL_EXPORTER, falling back to the default for unknown values."""
+    raw = (os.environ.get("OTEL_EXPORTER") or DEFAULT_OTEL_EXPORTER).strip().lower()
+    return raw if raw in _VALID_OTEL_EXPORTERS else DEFAULT_OTEL_EXPORTER

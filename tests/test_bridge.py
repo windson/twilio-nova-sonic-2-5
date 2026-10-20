@@ -36,6 +36,9 @@ def _settings() -> Settings:
         twilio_from_number=None,
         twilio_verified_caller_id=None,
         public_base_url=None,
+        otel_enabled=True,
+        otel_exporter="console",
+        otel_endpoint=None,
     )
 
 
