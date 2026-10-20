@@ -198,24 +198,71 @@ def _emit(event_type: str, **data: Any) -> None:
     logger.info(json.dumps({"event_type": event_type, **data}, default=str))
 
 
+def _mask_number(number: str | None) -> str | None:
+    """Mask a phone number for logging/record-keeping (keep last 4 digits).
+
+    We record WHICH number the PTP SMS targeted on the call record, but never
+    store the full E.164 destination as plaintext. e.g. "+15551234567" ->
+    "+1******4567".
+    """
+    if not number:
+        return None
+    digits = [c for c in number if c.isdigit()]
+    if len(digits) <= 4:
+        return "*" * len(number)
+    keep_tail = "".join(digits[-4:])
+    prefix = number[0] if number[0] == "+" else ""
+    return f"{prefix}{'*' * 6}{keep_tail}"
+
+
+def _ptp_sms_destination(
+    due_record: Mapping[str, Any] | None, settings: Settings
+) -> str | None:
+    """Pick the PTP payment-link SMS destination (trial-aware, explicit).
+
+    - TRIAL account (``settings.twilio_trial_mode`` true, the POC default): the
+      verified caller id is the ONLY number a trial account may legally message,
+      so the SMS is pinned to ``TWILIO_VERIFIED_CALLER_ID`` regardless of the
+      debtor. This is intentional and documented; sending to any other
+      destination would raise on a trial account.
+    - FULL account (trial mode off): prefer the debtor's own ``phone`` from the
+      due/account record so the real debtor receives their payment link, and
+      fall back to the verified caller id only when the record carries no phone.
+    """
+    verified = settings.twilio_verified_caller_id
+    if settings.twilio_trial_mode:
+        return verified
+    debtor_phone = (due_record or {}).get("phone")
+    if isinstance(debtor_phone, str) and debtor_phone.strip():
+        return debtor_phone.strip()
+    return verified
+
+
 def _apply_ptp_trigger(
     account_id: str | None,
     structured_data: Mapping[str, Any],
     store: Store,
     settings: Settings,
     twilio_client_factory: Any | None,
-) -> str | None:
+) -> dict[str, Any]:
     """PTP downstream trigger: pause collection + send a payment-link SMS.
 
-    Returns the ``ptp_sms_status`` ('sent'|'blocked_trial'|'failed') or ``None``
-    when no destination/config is available to attempt a send.
+    Returns a dict with ``status`` ('sent'|'blocked_trial'|'failed' or ``None``
+    when no destination/config is available) and ``to_masked`` (the masked
+    destination the SMS targeted, or ``None``).
     """
-    # Pause further automated collection on the account.
+    # Pause further automated collection on the account and read the debtor's
+    # contact number for the (trial-aware) SMS destination.
+    due_record: Mapping[str, Any] | None = None
     if account_id:
         try:
-            store.update_due(account_id, collection_paused=True)
+            due_record = store.update_due(account_id, collection_paused=True)
         except KeyError:
             logger.warning("account_id=<%s> | PTP pause: unknown account", account_id)
+            try:
+                due_record = store.get_due(account_id)
+            except Exception:  # noqa: BLE001 - best effort
+                due_record = None
 
     # Build the payment link and attempt the REAL SMS (do not fake success).
     base = (settings.payment_link_base_url or "").rstrip("/")
@@ -225,14 +272,15 @@ def _apply_ptp_trigger(
         f"securely here: {link}"
     )
 
-    to = settings.twilio_verified_caller_id
+    to = _ptp_sms_destination(due_record, settings)
+    to_masked = _mask_number(to)
     if not (settings.twilio_configured and settings.twilio_from_number and to):
         _emit(
             "ptp_sms_skipped_unconfigured",
             account_id=account_id,
             reason="twilio_not_configured_or_no_destination",
         )
-        return None
+        return {"status": None, "to_masked": to_masked}
 
     from app.twilio_client import send_sms
 
@@ -245,18 +293,25 @@ def _apply_ptp_trigger(
             account_id=account_id,
             message_sid=result.message_sid,
             payment_link=link,
+            to_masked=to_masked,
+            trial_mode=settings.twilio_trial_mode,
         )
-        return "sent"
+        return {"status": "sent", "to_masked": to_masked}
     except Exception as exc:  # noqa: BLE001 - trial restriction / API error
         # Twilio trial accounts can only message the verified number; a send to
-        # any other destination raises. Flag it honestly, never fake success.
+        # any other destination raises. On a trial account we classify this as
+        # 'blocked_trial'; off trial a send failure is a genuine 'failed'. Flag
+        # it honestly, never fake success.
+        status = "blocked_trial" if settings.twilio_trial_mode else "failed"
         _emit(
-            "ptp_sms_blocked_trial",
+            f"ptp_sms_{status}",
             account_id=account_id,
             error=str(exc),
             error_type=type(exc).__name__,
+            to_masked=to_masked,
+            trial_mode=settings.twilio_trial_mode,
         )
-        return "blocked_trial"
+        return {"status": status, "to_masked": to_masked}
 
 
 def _apply_dispute_trigger(account_id: str | None, store: Store) -> None:
@@ -307,6 +362,7 @@ async def extract_and_apply(
         "collection_paused": False,
         "escalated": False,
         "ptp_sms_status": None,
+        "ptp_sms_to": None,
         "triggers": [],
     }
 
@@ -335,11 +391,15 @@ async def extract_and_apply(
         triggers: list[str] = []
         # -- downstream triggers ------------------------------------------
         if disposition == "promise_to_pay":
-            ptp_status = _apply_ptp_trigger(
+            ptp = _apply_ptp_trigger(
                 account_id, structured_data, store, settings, twilio_client_factory
             )
+            ptp_status = ptp["status"]
             changes["collection_paused"] = True
             changes["ptp_sms_status"] = ptp_status
+            # Record (masked) which number the payment link was sent to so an
+            # auditor can see the destination without the full number leaking.
+            changes["ptp_sms_to"] = ptp["to_masked"]
             triggers.append("ptp_pause_collection")
             if ptp_status is not None:
                 triggers.append(f"ptp_sms_{ptp_status}")

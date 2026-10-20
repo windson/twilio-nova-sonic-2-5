@@ -9,10 +9,20 @@
 //   GET  /api/config        -> non-secret config summary
 
 const POLL_INTERVAL_MS = 3000;
+// After a call ends (total_e2e_ms present) the inline intelligence blocks are
+// still blank until the OFF-PATH async extraction finishes and flips
+// intelligence_status to a terminal value. We therefore keep polling past the
+// call end until intelligence is terminal, but cap how long we wait for it so
+// a record that never gets intelligence does not poll forever. At a 3s tick
+// this keeps polling for ~2.5 minutes after the call ends.
+const MAX_POST_CALL_INTEL_TICKS = 50;
 
 const state = {
   selectedCallId: null,
   pollTimer: null,
+  // Count of poll ticks observed AFTER the call ended while intelligence was
+  // still non-terminal; used to bound the post-call wait (see above).
+  postCallIntelTicks: 0,
   // Populated from GET /api/config so the per-call CloudWatch link uses the
   // region + log group the running service actually reports.
   awsRegion: "us-east-1",
@@ -273,6 +283,7 @@ function selectCall(callId, live) {
 
 function startPolling() {
   $("live-badge").hidden = false;
+  state.postCallIntelTicks = 0;
   state.pollTimer = setInterval(renderDetail, POLL_INTERVAL_MS);
 }
 
@@ -307,9 +318,23 @@ async function renderDetail() {
   renderTurns(record.turns || [], record.transcripts || []);
   $("log-pre").textContent = JSON.stringify(record.events_log || [], null, 2);
 
-  // If the call has finished (total e2e known), stop the live polling.
+  // Poll lifecycle: the call ending (total_e2e_ms present) is NOT enough to
+  // stop, because the two intelligence blocks are still blank until the async
+  // extraction completes. Keep polling until the call is over AND the
+  // intelligence is terminal ('ready'/'failed'), so the blocks visibly fill in
+  // on the live poll without the user re-selecting the call. Guard against a
+  // record that never gets intelligence with a bounded number of post-call
+  // ticks, after which we stop regardless.
   if (record.total_e2e_ms != null) {
-    stopPolling();
+    const intelTerminal =
+      record.intelligence_status === "ready" ||
+      record.intelligence_status === "failed";
+    state.postCallIntelTicks += 1;
+    if (intelTerminal || state.postCallIntelTicks >= MAX_POST_CALL_INTEL_TICKS) {
+      stopPolling();
+    }
+    // Keep the calls list fresh (disposition badge / summary) on each
+    // post-call tick, not only once at call end.
     loadCalls();
   }
 }
@@ -436,7 +461,10 @@ function renderIntelligence(record) {
       blocked_trial: "payment-link SMS blocked (trial account)",
       failed: "payment-link SMS failed",
     }[record.ptp_sms_status] || `payment-link SMS ${record.ptp_sms_status}`;
-    triggerParts.push(smsLabel);
+    // Show the masked destination the payment link targeted when known.
+    triggerParts.push(
+      record.ptp_sms_to ? `${smsLabel} (to ${record.ptp_sms_to})` : smsLabel
+    );
   }
   if (record.collection_paused) triggerParts.push("collection paused");
   if (record.escalated) triggerParts.push("escalated to specialist");

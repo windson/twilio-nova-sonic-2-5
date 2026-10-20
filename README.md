@@ -152,10 +152,20 @@ The IaC (`infra/template.yaml`) provisions an **ECS Fargate** service behind an
 **least-privilege IAM task role** granting
 `bedrock:InvokeModelWithBidirectionalStream` + `bedrock:InvokeModel` on the Nova
 Sonic model ARN, a separate scoped `bedrock:InvokeModel` grant on the text
-extraction model ARN(s) (`amazon.nova-lite-v1:0` / `amazon.nova-micro-v1:0`) for
-the post-call Converse extraction, DynamoDB RW on just the two tables, and
-CloudWatch Logs write. The post-call PTP payment-link SMS needs no new IAM (it
-reuses existing egress + the Secrets-Manager Twilio credentials).
+extraction model ARN for the post-call Converse extraction, DynamoDB RW on just
+the two tables, and CloudWatch Logs write. The post-call PTP payment-link SMS
+needs no new IAM (it reuses existing egress + the Secrets-Manager Twilio
+credentials).
+
+> **Extraction model / IAM coupling.** The text-extraction model is set once via
+> the `ExtractionModelId` CloudFormation parameter (default
+> `amazon.nova-lite-v1:0`; also allows `amazon.nova-micro-v1:0`). That single
+> parameter drives BOTH the `EXTRACTION_MODEL_ID` container env var AND the
+> `Resource` ARN of the `bedrock-text-extraction` IAM grant, so the model the
+> app invokes and the model IAM permits can never drift. To use a different
+> model, add it to the parameter's `AllowedValues` and redeploy — do not set
+> `EXTRACTION_MODEL_ID` out of band, or the Converse call will be access-denied
+> at runtime (surfacing as `intelligence_status = failed`).
 
 `scripts/deploy.sh` wraps the steps (run the pieces yourself as needed):
 
@@ -337,11 +347,23 @@ The two key triggers (`app/postcall.py`):
 - **Dispute Raised ->** set `escalated = true` and emit an
   `escalation_to_human_specialist` event.
 
-> **Twilio TRIAL limitation.** The Twilio account is a trial account, so SMS and
-> calls can only go to the **verified number**. The SMS send is attempted for
-> real; when Twilio blocks a send to any other destination it is **logged and
-> flagged** via `ptp_sms_status` (`sent` | `blocked_trial` | `failed`), **never
-> faked** as a success.
+> **Twilio TRIAL limitation + SMS destination.** The SMS destination is
+> **trial-aware** (`TWILIO_TRIAL_MODE`, default `true`):
+>
+> - **Trial mode (`true`)** — the verified number is the only legal destination,
+>   so the payment link is pinned to `TWILIO_VERIFIED_CALLER_ID` regardless of
+>   the debtor.
+> - **Full account (`false`)** — the SMS addresses the **debtor's own `phone`**
+>   from the account record, falling back to the verified id only when the
+>   record carries no phone.
+>
+> The send is always attempted for real; the outcome is **logged and flagged**
+> via `ptp_sms_status` (`sent` | `blocked_trial` on a trial block | `failed` on a
+> genuine error), **never faked**. The destination is recorded on the call
+> record as `ptp_sms_to` in a **masked** form (last four digits only) so an
+> auditor can see where the link went without the full number leaking. The demo
+> seed records (`ACC-1001`/`ACC-1002`) ship with `phone = null`, so they fall
+> back to the verified id until a real number is set.
 
 ### 2. Structured Conversation Data & Next-Best-Action (the "why & what's next")
 

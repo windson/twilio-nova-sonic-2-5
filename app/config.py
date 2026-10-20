@@ -19,6 +19,21 @@ DEFAULT_EXTRACTION_MODEL_ID = "amazon.nova-lite-v1:0"
 # Base URL used to build the payment link embedded in the PTP SMS. Non-secret
 # placeholder; overridable via PAYMENT_LINK_BASE_URL.
 DEFAULT_PAYMENT_LINK_BASE_URL = "https://pay.example.com/"
+# Twilio TRIAL accounts may only message/dial the single verified number. When
+# trial mode is on (the default, matching the account this POC runs against),
+# the PTP payment-link SMS is pinned to TWILIO_VERIFIED_CALLER_ID regardless of
+# the debtor's real number (sending to any other destination raises). Set
+# TWILIO_TRIAL_MODE=false on a full account to address the debtor's own number
+# (falling back to the verified id only when the record carries no phone).
+DEFAULT_TWILIO_TRIAL_MODE = True
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse a boolean env var (true/1/yes/on -> True), else the default."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 @dataclass(frozen=True)
@@ -34,6 +49,7 @@ class Settings:
     app_log_group: str
     extraction_model_id: str
     payment_link_base_url: str
+    twilio_trial_mode: bool
     twilio_account_sid: str | None
     twilio_auth_token: str | None
     twilio_from_number: str | None
@@ -55,6 +71,7 @@ class Settings:
             # a per-call Logs Insights deep link client-side (no IAM needed).
             "app_log_group": self.app_log_group,
             "twilio_configured": self.twilio_configured,
+            "twilio_trial_mode": self.twilio_trial_mode,
             "from_number_set": bool(self.twilio_from_number),
             "verified_caller_id_set": bool(self.twilio_verified_caller_id),
             "public_base_url_set": bool(self.public_base_url),
@@ -75,6 +92,7 @@ def get_settings() -> Settings:
         payment_link_base_url=os.environ.get(
             "PAYMENT_LINK_BASE_URL", DEFAULT_PAYMENT_LINK_BASE_URL
         ),
+        twilio_trial_mode=_env_bool("TWILIO_TRIAL_MODE", DEFAULT_TWILIO_TRIAL_MODE),
         twilio_account_sid=os.environ.get("TWILIO_ACCOUNT_SID") or None,
         twilio_auth_token=os.environ.get("TWILIO_AUTH_TOKEN") or None,
         twilio_from_number=os.environ.get("TWILIO_FROM_NUMBER") or None,

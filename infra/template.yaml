@@ -22,6 +22,21 @@ Parameters:
     Type: String
     Default: amazon.nova-2-5-sonic
     Description: Bedrock Nova Sonic 2.5 model id (verified streaming in us-east-1).
+  ExtractionModelId:
+    Type: String
+    Default: amazon.nova-lite-v1:0
+    AllowedValues:
+      - amazon.nova-lite-v1:0
+      - amazon.nova-micro-v1:0
+    Description: >-
+      Bedrock TEXT model id for the OFF-PATH post-call intelligence extraction
+      (Bedrock Converse). This SAME value feeds BOTH the EXTRACTION_MODEL_ID
+      container env var AND the Resource ARN in the bedrock-text-extraction IAM
+      grant, so the app's configured model and its IAM permission can never
+      drift (an unpermitted model would otherwise surface at runtime as
+      intelligence_status=failed). Constrained to the TEXT models verified
+      available in us-east-1; to use another model, add it here so the grant
+      and the env var stay in lockstep.
   TwilioAccountSidArn:
     Type: String
     Description: >-
@@ -216,9 +231,13 @@ Resources:
               - Effect: Allow
                 Action:
                   - bedrock:InvokeModel
+                # Scoped to EXACTLY the configured ExtractionModelId so the grant
+                # and the EXTRACTION_MODEL_ID env var (both derived from the same
+                # parameter) cannot drift. An override there is permitted here in
+                # the same deploy, so a configured model is never access-denied
+                # at invoke time.
                 Resource:
-                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.nova-lite-v1:0"
-                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.nova-micro-v1:0"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${ExtractionModelId}"
         # Note: the PTP payment-link SMS (app/twilio_client.send_sms) needs NO new
         # IAM. It reuses the task's existing egress (ServiceSecurityGroup allows
         # all outbound to the Twilio API) and the Twilio credentials already
@@ -494,10 +513,11 @@ Resources:
             - Name: APP_LOG_GROUP
               Value: !Ref AppLogGroup
             # TEXT model used by the off-path post-call intelligence extraction
-            # (Bedrock Converse). Non-secret; matches app/config.py
-            # EXTRACTION_MODEL_ID and the bedrock-text-extraction grant above.
+            # (Bedrock Converse). Non-secret; driven by the ExtractionModelId
+            # parameter so this env var and the bedrock-text-extraction IAM
+            # grant Resource above are ALWAYS the same model (no drift).
             - Name: EXTRACTION_MODEL_ID
-              Value: amazon.nova-lite-v1:0
+              Value: !Ref ExtractionModelId
             # Base URL for the PTP payment-link SMS. Non-secret placeholder;
             # override with the real pay URL at deploy time. Matches
             # app/config.py PAYMENT_LINK_BASE_URL.

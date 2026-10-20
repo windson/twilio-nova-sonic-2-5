@@ -16,6 +16,7 @@ Due/Account record::
         "due_date": str,            # ISO date, e.g. "2024-05-01"
         "status": str,              # open|promised_to_pay|paid|disputed|callback
         "notes": str,
+        "phone": str | None,        # debtor's E.164 number (PTP SMS destination)
         "collection_paused": bool,  # true when a PTP pauses auto-collection
         "escalated": bool,          # true when a dispute escalates to a human
         "last_updated": str,        # ISO timestamp
@@ -46,6 +47,7 @@ CallAnalytics record (produced by :mod:`app.metrics`, enriched post-call by
         "collection_paused": bool,           # downstream trigger result (PTP)
         "escalated": bool,                   # downstream trigger result (dispute)
         "ptp_sms_status": str | None,        # sent|blocked_trial|failed
+        "ptp_sms_to": str | None,            # masked PTP SMS destination
         "triggers": [str, ...],              # which downstream triggers ran
     }
 
@@ -176,6 +178,11 @@ def _seed_dues() -> dict[str, dict[str, Any]]:
             "due_date": "2024-05-15",
             "status": "open",
             "notes": "",
+            # Debtor contact number. On a Twilio trial the PTP SMS can only go
+            # to the verified number, so these demo records carry None and the
+            # trial path falls back to TWILIO_VERIFIED_CALLER_ID; populate with
+            # a real E.164 number for production/off-trial sends.
+            "phone": None,
             "collection_paused": False,
             "escalated": False,
             "last_updated": now,
@@ -188,6 +195,7 @@ def _seed_dues() -> dict[str, dict[str, Any]]:
             "due_date": "2024-06-01",
             "status": "open",
             "notes": "",
+            "phone": None,
             "collection_paused": False,
             "escalated": False,
             "last_updated": now,
@@ -222,6 +230,7 @@ class InMemoryStore:
         rec.setdefault("currency", "USD")
         rec.setdefault("status", "open")
         rec.setdefault("notes", "")
+        rec.setdefault("phone", None)
         rec.setdefault("collection_paused", False)
         rec.setdefault("escalated", False)
         rec["account_id"] = account_id
@@ -396,6 +405,7 @@ class DynamoDbStore:
         rec.setdefault("currency", "USD")
         rec.setdefault("status", "open")
         rec.setdefault("notes", "")
+        rec.setdefault("phone", None)
         rec.setdefault("collection_paused", False)
         rec.setdefault("escalated", False)
         rec["last_updated"] = _utcnow_iso()

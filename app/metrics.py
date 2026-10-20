@@ -705,6 +705,7 @@ class CallMetrics:
             "collection_paused": False,
             "escalated": False,
             "ptp_sms_status": None,
+            "ptp_sms_to": None,
             "triggers": [],
         }
 

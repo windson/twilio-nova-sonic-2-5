@@ -17,6 +17,7 @@ def _settings(**overrides) -> Settings:
         app_log_group="/ecs/ar-collections-nova-sonic/app",
         extraction_model_id="amazon.nova-lite-v1:0",
         payment_link_base_url="https://pay.example.com/",
+        twilio_trial_mode=True,
         twilio_account_sid="AC_test_sid",
         twilio_auth_token="test_token_value",
         twilio_from_number="+15005550006",

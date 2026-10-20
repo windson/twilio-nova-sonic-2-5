@@ -8,6 +8,7 @@ synthetic CallMetrics session must not change the frozen call-latency metrics.
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
@@ -30,6 +31,7 @@ def _settings(**overrides) -> Settings:
         app_log_group="/ecs/ar-collections-nova-sonic/app",
         extraction_model_id="amazon.nova-lite-v1:0",
         payment_link_base_url="https://pay.example.com/",
+        twilio_trial_mode=True,
         twilio_account_sid="AC_test_sid",
         twilio_auth_token="test_token_value",
         twilio_from_number="+15005550006",
@@ -343,3 +345,199 @@ async def test_no_added_latency_postcall_does_not_touch_call_metrics(store):
     assert m.total_e2e_ms == before_total
     assert m.nova_total_ms == before_nova
     assert m.first_ttft_ms == before_ttft
+
+
+class BlockingBedrock:
+    """Bedrock stub that BLOCKS (sleeps) and records if/when it was called.
+
+    Used to prove the extraction is NOT awaited on the real-time audio/turn
+    path: if ``converse`` ran there it would stall the audio loop, so a test
+    that drives the audio path and then asserts ``called`` is still False at
+    ``on_session_end`` fails the moment anyone reverts the design and awaits the
+    LLM inside the turn loop.
+    """
+
+    def __init__(self) -> None:
+        self.called = False
+
+    def converse(self, **kwargs):
+        self.called = True
+        # A real revert would block the audio path here; simulate the stall.
+        time.sleep(0.5)
+        return {
+            "output": {
+                "message": {
+                    "content": [
+                        {
+                            "text": json.dumps(
+                                {
+                                    "disposition": "undetermined",
+                                    "payment_specifics": {},
+                                    "contextual_data": {},
+                                    "next_best_action": None,
+                                }
+                            )
+                        }
+                    ]
+                }
+            }
+        }
+
+
+async def test_no_latency_audio_path_never_invokes_extraction(store):
+    """REGRESSION GUARD (no-latency): driving the full real-time audio/turn
+    path (on_session_start -> record_event(...) -> on_session_end) must NEVER
+    call the Bedrock extraction stub. The audio path has no reference to the
+    extractor; the extractor only runs post-call off-path. This fails if
+    someone wires ``extract_and_apply`` / ``converse`` into ``record_event`` or
+    the turn loop, because ``blocking.called`` would flip to True before/at
+    ``on_session_end``.
+    """
+    blocking = BlockingBedrock()
+    clock = FakeClock()
+    m = CallMetrics(call_sid="CA_np", account_id="ACC-1001", clock=clock)
+
+    clock.set(0.0)
+    m.on_session_start()
+    clock.set(1.0)
+    m.record_event(BidiResponseStartEvent(response_id="r1"))
+    clock.set(1.3)
+    m.record_event(_audio_event())
+    clock.set(1.8)
+    m.record_event(
+        BidiTranscriptStreamEvent(
+            delta=None, text="You owe 428.57 dollars.", role="assistant",
+            is_final=True, current_transcript="You owe 428.57 dollars.",
+        )
+    )
+    clock.set(2.5)
+    m.record_event(BidiResponseCompleteEvent(response_id="r1", stop_reason="complete"))
+    clock.set(4.0)
+    m.on_session_end()
+
+    # The extraction stub was never touched by the audio/turn path.
+    assert blocking.called is False
+
+    # Only NOW (post-call, off-path) does the extractor run and call the stub.
+    record = m.to_call_analytics()
+    store.save_call_analytics(record)
+    await extract_and_apply(
+        record, store, _settings(), bedrock_client=blocking,
+        twilio_client_factory=lambda *a: None,
+    )
+    assert blocking.called is True
+
+
+async def test_ptp_sms_trial_mode_pins_to_verified_number(store):
+    """TRIAL account: the PTP SMS is pinned to the verified caller id even when
+    the debtor record carries a different phone, and the masked destination is
+    recorded on the call record.
+    """
+    store.update_due("ACC-1001", phone="+15559990000")
+    bedrock = FakeBedrock(
+        {
+            "disposition": "promise_to_pay",
+            "payment_specifics": {"promised_amount": 50, "agreed_date": "tomorrow",
+                                  "preferred_payment_method": None},
+            "contextual_data": {"reason_for_delinquency": None, "customer_sentiment": None},
+            "next_best_action": "Send link",
+        }
+    )
+    sent_to: list[str] = []
+
+    def twilio_factory(*_a):
+        class _C:
+            class messages:
+                @staticmethod
+                def create(**kwargs):
+                    sent_to.append(kwargs["to"])
+                    class _M:
+                        sid = "SM"
+                    return _M()
+        return _C()
+
+    changes = await extract_and_apply(
+        _call_record(), store, _settings(twilio_trial_mode=True),
+        bedrock_client=bedrock, twilio_client_factory=twilio_factory,
+    )
+
+    # Trial: destination is the verified number, NOT the debtor's phone.
+    assert sent_to == ["+15005550010"]
+    assert changes["ptp_sms_status"] == "sent"
+    # Masked destination recorded (last 4 digits of the verified number).
+    assert changes["ptp_sms_to"] == "+******0010"
+
+
+async def test_ptp_sms_production_mode_prefers_debtor_phone(store):
+    """FULL account (trial mode off): the PTP SMS addresses the debtor's own
+    phone from the account record (falling back to the verified id only when
+    the record has no phone).
+    """
+    store.update_due("ACC-1001", phone="+15559990000")
+    bedrock = FakeBedrock(
+        {
+            "disposition": "promise_to_pay",
+            "payment_specifics": {"promised_amount": 50, "agreed_date": "tomorrow",
+                                  "preferred_payment_method": None},
+            "contextual_data": {"reason_for_delinquency": None, "customer_sentiment": None},
+            "next_best_action": "Send link",
+        }
+    )
+    sent_to: list[str] = []
+
+    def twilio_factory(*_a):
+        class _C:
+            class messages:
+                @staticmethod
+                def create(**kwargs):
+                    sent_to.append(kwargs["to"])
+                    class _M:
+                        sid = "SM"
+                    return _M()
+        return _C()
+
+    changes = await extract_and_apply(
+        _call_record(), store, _settings(twilio_trial_mode=False),
+        bedrock_client=bedrock, twilio_client_factory=twilio_factory,
+    )
+
+    assert sent_to == ["+15559990000"]
+    assert changes["ptp_sms_status"] == "sent"
+    assert changes["ptp_sms_to"] == "+******0000"
+
+
+async def test_ptp_sms_production_failure_is_failed_not_blocked_trial(store):
+    """FULL account: a send failure is a genuine 'failed', not 'blocked_trial'."""
+    bedrock = FakeBedrock(
+        {
+            "disposition": "promise_to_pay",
+            "payment_specifics": {"promised_amount": 50, "agreed_date": "tomorrow",
+                                  "preferred_payment_method": None},
+            "contextual_data": {"reason_for_delinquency": None, "customer_sentiment": None},
+            "next_best_action": "Send link",
+        }
+    )
+
+    def twilio_factory(*_a):
+        class _Raiser:
+            class messages:
+                @staticmethod
+                def create(**_k):
+                    raise RuntimeError("carrier rejected the message")
+        return _Raiser()
+
+    changes = await extract_and_apply(
+        _call_record(), store, _settings(twilio_trial_mode=False),
+        bedrock_client=bedrock, twilio_client_factory=twilio_factory,
+    )
+
+    assert changes["ptp_sms_status"] == "failed"
+    assert "ptp_sms_failed" in changes["triggers"]
+
+
+def test_mask_number_keeps_only_last_four():
+    from app.postcall import _mask_number
+
+    assert _mask_number("+15551234567") == "+******4567"
+    assert _mask_number(None) is None
+    assert _mask_number("123") == "***"

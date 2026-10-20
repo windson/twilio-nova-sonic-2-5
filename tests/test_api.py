@@ -26,6 +26,7 @@ def _settings(**overrides) -> Settings:
         app_log_group="/ecs/ar-collections-nova-sonic/app",
         extraction_model_id="amazon.nova-lite-v1:0",
         payment_link_base_url="https://pay.example.com/",
+        twilio_trial_mode=True,
         twilio_account_sid="AC_test_sid",
         twilio_auth_token="test_token_value",
         twilio_from_number="+15005550006",
@@ -185,6 +186,68 @@ def test_calls_expose_postcall_intelligence_fields(store):
 def test_get_call_unknown_id_returns_404(store):
     resp = client.get("/api/calls/does-not-exist")
     assert resp.status_code == 404
+
+
+async def test_launch_postcall_registers_offpath_task_and_discards_on_done(store):
+    """LAUNCH-POINT guard: ``_launch_postcall`` (the seam called from the /media
+    websocket teardown) must create an asyncio task, register it in the
+    module-level ``_POSTCALL_TASKS`` set so it is not garbage-collected
+    mid-flight, run OFF the current call path, and discard itself from the set
+    via the done-callback once finished. Also exercises the done-callback's
+    result logging. This fails if the launch is removed or the task is left only
+    in a local variable (the dropped-task bug).
+    """
+    import asyncio
+
+    from app import main as main_mod
+
+    ran: list[str] = []
+
+    async def fake_extract(record, store_arg, settings_arg):
+        # Prove the launch is off-path: the task has not run yet at creation.
+        ran.append(record["call_sid"])
+        return {"intelligence_status": "ready"}
+
+    record = {"call_sid": "CA_launch", "account_id": "ACC-1001"}
+    store.save_call_analytics(record)
+
+    with patch("app.main.extract_and_apply", fake_extract):
+        task = main_mod._launch_postcall(record, store, _settings())
+        # Registered + not yet executed (off the caller's path).
+        assert task is not None
+        assert task in main_mod._POSTCALL_TASKS
+        assert ran == []
+        # Let the fire-and-forget task run to completion.
+        await task
+
+    # It ran, and the done-callback discarded the strong reference.
+    assert ran == ["CA_launch"]
+    assert task not in main_mod._POSTCALL_TASKS
+
+
+async def test_launch_postcall_done_callback_logs_and_discards_on_error(store):
+    """The done-callback discards the task and logs even when the task raises
+    (defensive: ``extract_and_apply`` normally never raises, but a scheduling
+    bug must not leave a dangling reference or an unretrieved exception).
+    """
+    import asyncio
+
+    from app import main as main_mod
+
+    async def boom(record, store_arg, settings_arg):
+        raise RuntimeError("unexpected")
+
+    record = {"call_sid": "CA_boom", "account_id": "ACC-1001"}
+
+    with patch("app.main.extract_and_apply", boom):
+        task = main_mod._launch_postcall(record, store, _settings())
+        assert task is not None
+        with pytest.raises(RuntimeError):
+            await task
+        # Allow the done-callback to fire.
+        await asyncio.sleep(0)
+
+    assert task not in main_mod._POSTCALL_TASKS
 
 
 def test_index_serves_dashboard_html():
