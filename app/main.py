@@ -26,12 +26,21 @@ from app.metrics import CallMetrics, configure_json_logging
 from app.postcall import extract_and_apply
 from app.sonic_bridge import DEFAULT_KICKOFF_TEXT, SonicSession
 from app.store import get_default_store
+from app.telemetry import setup_telemetry
 from app.twilio_client import place_outbound_call
 
 logger = logging.getLogger(__name__)
 
 # Emit CloudWatch-friendly JSON-line logs for call lifecycle/metrics events.
 configure_json_logging()
+
+# Configure GA Strands OTEL telemetry ONCE at import/startup, BEFORE any
+# BidiAgent.run can execute (the agent loop only auto-emits its OTEL spans --
+# session token usage, per-response TTFT, tool-call / connection-restart spans
+# -- when a tracer provider is already configured). This is a one-time, guarded,
+# idempotent setup: it never raises and never runs per call, so it cannot add
+# latency to or crash the /media WebSocket audio path.
+setup_telemetry()
 
 app = FastAPI(
     title="AR Collections Nova Sonic 2.5 Agent",
@@ -372,8 +381,9 @@ async def media_stream(websocket: WebSocket) -> None:
                 _launch_postcall(saved_record, store, get_settings())
 
 
-# Mount the vanilla-JS dashboard assets (web/app.js, web/styles.css) as static
-# files. GET / above serves web/index.html when present (the real dashboard),
-# falling back to the placeholder only if web/ has not been built yet.
+# Mount the compiled React/shadcn dashboard bundle (built from frontend/ into
+# web/ at image-build time: web/index.html + web/assets/*) as static files.
+# GET / above serves web/index.html when present (the real dashboard), falling
+# back to the placeholder only if web/ has not been built yet.
 if _WEB_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(_WEB_DIR)), name="static")

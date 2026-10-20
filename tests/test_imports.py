@@ -1,12 +1,11 @@
-"""Import smoke test for the Strands bi-di + Bedrock runtime stack.
+"""Import smoke test for the GA Strands bi-di + Bedrock runtime stack.
 
-These imports pin the authoritative APIs used by later features. In the
-installed strands-agents 1.53.0, the bi-di API lives under
-``strands.experimental.bidi`` and the Nova Sonic model class is
-``BidiNovaSonicModel`` (lazily exported from
-``strands.experimental.bidi.models``). The test must pass once dependencies
-are installed; it is only xfailed if the stack genuinely cannot be installed
-in this environment (recorded in the feature findings).
+These imports pin the authoritative APIs used by the app. In the installed
+strands-agents 1.61.1, the bi-di API is GA under ``strands.bidi`` and the Nova
+Sonic model class is ``BedrockNovaSonicModel`` (exported from
+``strands.bidi.models``). The test must pass once dependencies are installed;
+it is only xfailed if the stack genuinely cannot be installed in this
+environment (recorded in the feature findings).
 """
 
 import pytest
@@ -14,9 +13,9 @@ import pytest
 
 def test_strands_bidi_imports():
     try:
-        from strands.experimental.bidi.agent import BidiAgent  # noqa: F401
-        from strands.experimental.bidi.models import (  # noqa: F401
-            BidiNovaSonicModel,
+        from strands.bidi.agent import BidiAgent  # noqa: F401
+        from strands.bidi.models import (  # noqa: F401
+            BedrockNovaSonicModel,
         )
         from aws_sdk_bedrock_runtime.client import (  # noqa: F401
             BedrockRuntimeClient,

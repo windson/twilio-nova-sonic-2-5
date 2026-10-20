@@ -5,21 +5,26 @@ WebSocket; we transcode to LPCM 16 kHz and feed Nova Sonic through Strands
 Custom I/O. Nova's 24 kHz LPCM output is transcoded back to u-law 8 kHz and
 streamed to Twilio.
 
-Strands I/O model (verified against strands-agents==1.53.0 installed source):
+Strands I/O model (verified against the GA strands-agents 1.61.1 ``strands.bidi``
+namespace installed source):
 
-- ``strands.experimental.bidi.agent.BidiAgent`` runs with
-  ``await agent.run(inputs=[BidiInput...], outputs=[BidiOutput...])``.
-- ``BidiInput`` / ``BidiOutput`` are ``@runtime_checkable`` Protocols with async
-  ``start(agent)``, async ``stop()`` and ``__call__``. Input ``__call__()``
-  returns the next ``BidiInputEvent``; Output ``__call__(event)`` consumes one
+- ``strands.bidi.agent.BidiAgent`` runs with
+  ``await agent.run(inputs=[InputStream...], outputs=[OutputStream...])``.
+- ``InputStream`` / ``OutputStream`` are ``@runtime_checkable`` Protocols with
+  async ``start(agent)``, async ``stop()`` and ``__call__``. Input
+  ``__call__()`` returns the next ``BidiAgentInput`` (a plain ``str`` for a text
+  turn, or an ``AudioDelta`` for audio); Output ``__call__(event)`` consumes one
   ``BidiOutputEvent``.
-- Audio in: ``BidiAudioInputEvent(audio=<base64 pcm>, format="pcm",
-  sample_rate=16000, channels=1)``.
-- Audio out: ``BidiAudioStreamEvent`` with ``.audio`` (base64 pcm),
-  ``.sample_rate``, ``.format``, ``.channels``.
-- Barge-in: ``BidiInterruptionEvent``.
-- Model: ``BidiNovaSonicModel(model_id=..., provider_config={"audio": {...}},
-  client_config={"region": ...})`` — voice lives in ``provider_config["audio"]``.
+- Audio in: ``AudioDelta(format="pcm", source={"bytes": <pcm16 bytes>})`` from
+  ``strands.bidi.types.media`` (``source`` is the ``AudioSource`` TypedDict).
+- Text in: a plain ``str`` (the kickoff user turn).
+- Audio out: ``BidiAudioDeltaEvent`` with ``.audio`` (base64 pcm),
+  ``.format``, ``.sample_rate``, ``.channels`` and ``.content_id``.
+- Barge-in: ``BidiBargeInEvent`` (no ``.reason`` attribute).
+- Model: ``BedrockNovaSonicModel(model_id=..., region=<str>, voice="tiffany",
+  audio={"input": {"sample_rate": 16000}, "output": {"sample_rate": 24000}})``.
+  ``voice`` is now a TOP-LEVEL kwarg; the audio config carries only
+  ``sample_rate`` (mono PCM); ``region`` is a plain string kwarg.
 
 FEAT-003 seams: ``build_agent`` accepts an injected ``tools`` list and
 ``system_prompt``; :class:`SonicSession` accepts an optional ``metrics`` sink
@@ -33,22 +38,19 @@ import asyncio
 import logging
 from typing import Any, Awaitable, Callable, Protocol
 
-from strands.experimental.bidi.agent import BidiAgent
-from strands.experimental.bidi.models import BidiNovaSonicModel
-from strands.experimental.bidi.types.events import (
-    BidiAudioInputEvent,
-    BidiAudioStreamEvent,
-    BidiInterruptionEvent,
+from strands.bidi.agent import BidiAgent
+from strands.bidi.models import BedrockNovaSonicModel
+from strands.bidi.types.events import (
+    BidiAudioDeltaEvent,
+    BidiBargeInEvent,
     BidiOutputEvent,
-    BidiTextInputEvent,
 )
+from strands.bidi.types.media import AudioDelta
 
 from app.audio import (
-    CHANNELS,
     NOVA_INPUT_RATE,
     NovaToTwilioBridge,
     TwilioToNovaBridge,
-    b64_encode,
 )
 from app.config import Settings, get_settings
 
@@ -85,32 +87,32 @@ class MetricsSink(Protocol):
     def on_session_start(self) -> None:  # pragma: no cover - protocol
         ...
 
-    def record_event(self, event: BidiOutputEvent) -> None:  # pragma: no cover - protocol
+    def record_event(self, event: "BidiOutputEvent") -> None:  # pragma: no cover - protocol
         ...
 
     def on_session_end(self) -> None:  # pragma: no cover - protocol
         ...
 
 
-def build_model(settings: Settings | None = None, voice: str = DEFAULT_VOICE) -> BidiNovaSonicModel:
+def build_model(
+    settings: Settings | None = None, voice: str = DEFAULT_VOICE
+) -> BedrockNovaSonicModel:
     """Construct the Nova Sonic bi-di model from configuration.
 
     model_id comes from ``NOVA_MODEL_ID`` (default ``amazon.nova-2-5-sonic``);
-    the voice (``tiffany``) and audio rates go in ``provider_config["audio"]``;
-    the AWS region goes in ``client_config``.
+    the voice (``tiffany``) is a top-level kwarg; the audio config carries only
+    the mono-PCM sample rates (input 16 kHz, output 24 kHz); the AWS region is a
+    plain ``region=`` string kwarg (mutually exclusive with ``boto_session``).
     """
     settings = settings or get_settings()
-    return BidiNovaSonicModel(
+    return BedrockNovaSonicModel(
         model_id=settings.nova_model_id,
-        provider_config={
-            "audio": {
-                "voice": voice,
-                "input_rate": NOVA_INPUT_RATE,
-                "output_rate": 24000,
-                "channels": CHANNELS,
-            }
+        region=settings.aws_region,
+        voice=voice,
+        audio={
+            "input": {"sample_rate": NOVA_INPUT_RATE},
+            "output": {"sample_rate": 24000},
         },
-        client_config={"region": settings.aws_region},
     )
 
 
@@ -141,11 +143,12 @@ def build_agent(
 
 
 class _QueueAudioInput:
-    """Strands ``BidiInput``: pulls transcoded PCM frames from an asyncio queue.
+    """Strands ``InputStream``: pulls transcoded PCM frames from an asyncio queue.
 
     The WebSocket handler decodes/transcodes each Twilio ``media`` frame and
     puts the resulting PCM16-16k bytes on ``queue``. ``__call__`` blocks until a
-    frame is available and wraps it in a ``BidiAudioInputEvent``.
+    frame is available and wraps it in an :class:`AudioDelta` (the GA input
+    shape; ``source`` is the ``AudioSource`` TypedDict carrying raw PCM bytes).
     """
 
     def __init__(self, queue: "asyncio.Queue[bytes | None]") -> None:
@@ -157,28 +160,23 @@ class _QueueAudioInput:
     async def stop(self) -> None:  # noqa: D401 - protocol hook
         return None
 
-    async def __call__(self) -> BidiAudioInputEvent:
+    async def __call__(self) -> AudioDelta:
         pcm = await self._queue.get()
         if pcm is None:
             # Sentinel: no more input. Block forever so run() is torn down via
             # agent.stop()/task cancellation rather than emitting bogus audio.
             await asyncio.Future()
-        return BidiAudioInputEvent(
-            audio=b64_encode(pcm or b""),
-            format="pcm",
-            sample_rate=NOVA_INPUT_RATE,
-            channels=CHANNELS,
-        )
+        return AudioDelta(format="pcm", source={"bytes": pcm or b""})
 
 
 class _KickoffInput:
-    """Strands ``BidiInput`` that makes the agent open the conversation.
+    """Strands ``InputStream`` that makes the agent open the conversation.
 
     Nova Sonic only speaks once it receives an input turn; a system prompt by
-    itself produces no audio. This input emits a single priming
-    :class:`BidiTextInputEvent` (role ``user``) on its first call -- right after
+    itself produces no audio. This input returns a single priming user text turn
+    (a plain ``str``, the GA text-input shape) on its first call -- right after
     ``agent.run`` has started the connection -- which triggers Nova's opening
-    turn (the greeting + amount due). After that one event it blocks forever so
+    turn (the greeting + amount due). After that one turn it blocks forever so
     it never injects any further input into the stream.
     """
 
@@ -192,21 +190,21 @@ class _KickoffInput:
     async def stop(self) -> None:  # noqa: D401 - protocol hook
         return None
 
-    async def __call__(self) -> BidiTextInputEvent:
+    async def __call__(self) -> str:
         if self._sent:
             # Priming turn already delivered; never emit again.
             await asyncio.Future()
         self._sent = True
         logger.info("priming AI-first opening turn")
-        return BidiTextInputEvent(text=self._text, role="user")
+        return self._text
 
 
 class _TwilioAudioOutput:
-    """Strands ``BidiOutput``: transcode Nova audio to u-law and send to Twilio.
+    """Strands ``OutputStream``: transcode Nova audio to u-law and send to Twilio.
 
-    On :class:`BidiAudioStreamEvent`, base64-decode Nova's 24 kHz PCM, downsample
+    On :class:`BidiAudioDeltaEvent`, base64-decode Nova's 24 kHz PCM, downsample
     to u-law 8 kHz and hand the base64 payload to ``send_media``. On
-    :class:`BidiInterruptionEvent` (barge-in), reset the resampler and call
+    :class:`BidiBargeInEvent` (barge-in), reset the resampler and call
     ``on_interrupt`` so the handler can flush Twilio playback with a ``clear``
     message. Every event is also forwarded to the optional metrics sink.
     """
@@ -236,7 +234,7 @@ class _TwilioAudioOutput:
             except Exception:  # pragma: no cover - metrics must never break audio
                 logger.exception("metrics sink raised; ignoring")
 
-        if isinstance(event, BidiAudioStreamEvent):
+        if isinstance(event, BidiAudioDeltaEvent):
             import base64
 
             pcm_24k = base64.b64decode(event.audio)
@@ -244,8 +242,9 @@ class _TwilioAudioOutput:
             if payload:
                 await self._send_media(payload)
 
-        elif isinstance(event, BidiInterruptionEvent):
-            logger.debug("reason=<%s> | barge-in: flushing Twilio playback", event.reason)
+        elif isinstance(event, BidiBargeInEvent):
+            # GA BidiBargeInEvent carries no .reason attribute.
+            logger.debug("barge-in: flushing Twilio playback")
             self._out.reset()
             if self._on_interrupt is not None:
                 await self._on_interrupt()

@@ -14,13 +14,12 @@ import pytest
 from app import sonic_bridge
 from app.config import Settings
 from app.main import app
-from strands.experimental.bidi.models import BidiNovaSonicModel
-from strands.experimental.bidi.types.events import (
-    BidiAudioInputEvent,
-    BidiAudioStreamEvent,
-    BidiInterruptionEvent,
-    BidiTextInputEvent,
+from strands.bidi.models import BedrockNovaSonicModel
+from strands.bidi.types.events import (
+    BidiAudioDeltaEvent,
+    BidiBargeInEvent,
 )
+from strands.bidi.types.media import AudioDelta
 
 
 def _settings() -> Settings:
@@ -29,6 +28,7 @@ def _settings() -> Settings:
         aws_region="us-west-2",
         app_log_group="/ecs/ar-collections-nova-sonic/app",
         extraction_model_id="amazon.nova-lite-v1:0",
+        code_interpreter_id="aws.codeinterpreter.v1",
         payment_link_base_url="https://pay.example.com/",
         twilio_trial_mode=True,
         twilio_account_sid=None,
@@ -36,45 +36,48 @@ def _settings() -> Settings:
         twilio_from_number=None,
         twilio_verified_caller_id=None,
         public_base_url=None,
+        otel_enabled=True,
+        otel_exporter="console",
+        otel_endpoint=None,
     )
 
 
 def test_build_model_sets_model_id_and_voice(monkeypatch):
-    """build_model constructs BidiNovaSonicModel with model_id + tiffany voice.
+    """build_model constructs BedrockNovaSonicModel with the GA constructor args.
 
-    We stub BidiNovaSonicModel.__init__ to capture args so no boto session or
-    network call is created.
+    We stub BedrockNovaSonicModel.__init__ to capture args so no boto session or
+    network call is created. voice is a TOP-LEVEL kwarg, audio carries only
+    sample_rate (input 16k / output 24k), and region is a plain string kwarg.
     """
     captured = {}
 
-    def fake_init(self, model_id="x", provider_config=None, client_config=None, **kwargs):
+    def fake_init(self, *, model_id="x", region=None, voice="matthew", audio=None, **kwargs):
         captured["model_id"] = model_id
-        captured["provider_config"] = provider_config
-        captured["client_config"] = client_config
-        # Minimal attribute surface used elsewhere.
-        self.model_id = model_id
-        self.config = provider_config
+        captured["region"] = region
+        captured["voice"] = voice
+        captured["audio"] = audio
+        # Back the inherited read-only model_id property via _config.
+        self._config = {"model_id": model_id}
 
-    monkeypatch.setattr(BidiNovaSonicModel, "__init__", fake_init)
+    monkeypatch.setattr(BedrockNovaSonicModel, "__init__", fake_init)
 
     model = sonic_bridge.build_model(settings=_settings())
 
     assert captured["model_id"] == "amazon.nova-2-5-sonic"
-    assert captured["provider_config"]["audio"]["voice"] == "tiffany"
-    assert captured["provider_config"]["audio"]["input_rate"] == 16000
-    assert captured["provider_config"]["audio"]["output_rate"] == 24000
-    assert captured["client_config"]["region"] == "us-west-2"
-    assert isinstance(model, BidiNovaSonicModel)
+    assert captured["voice"] == "tiffany"
+    assert captured["region"] == "us-west-2"
+    assert captured["audio"]["input"]["sample_rate"] == 16000
+    assert captured["audio"]["output"]["sample_rate"] == 24000
+    assert isinstance(model, BedrockNovaSonicModel)
 
 
 def test_build_agent_wires_model_tools_and_prompt(monkeypatch):
     """build_agent passes model/tools/system_prompt to BidiAgent."""
 
-    def fake_init(self, model_id="x", provider_config=None, client_config=None, **kwargs):
-        self.model_id = model_id
-        self.config = provider_config
+    def fake_init(self, *, model_id="x", region=None, voice="matthew", audio=None, **kwargs):
+        self._config = {"model_id": model_id}
 
-    monkeypatch.setattr(BidiNovaSonicModel, "__init__", fake_init)
+    monkeypatch.setattr(BedrockNovaSonicModel, "__init__", fake_init)
 
     agent = sonic_bridge.build_agent(
         tools=[],
@@ -83,7 +86,7 @@ def test_build_agent_wires_model_tools_and_prompt(monkeypatch):
     )
     assert agent.system_prompt == "be concise"
     assert agent.tool_names == []
-    assert isinstance(agent.model, BidiNovaSonicModel)
+    assert isinstance(agent.model, BedrockNovaSonicModel)
     assert agent.model.model_id == "amazon.nova-2-5-sonic"
 
 
@@ -94,16 +97,14 @@ def test_media_websocket_route_registered():
 
 
 @pytest.mark.asyncio
-async def test_queue_input_wraps_pcm_as_audio_event():
+async def test_queue_input_wraps_pcm_as_audio_delta():
     queue: asyncio.Queue = asyncio.Queue()
     inp = sonic_bridge._QueueAudioInput(queue)
     await queue.put(b"\x01\x02\x03\x04")
-    event = await inp()
-    assert isinstance(event, BidiAudioInputEvent)
-    assert event.format == "pcm"
-    assert event.sample_rate == 16000
-    assert event.channels == 1
-    assert base64.b64decode(event.audio) == b"\x01\x02\x03\x04"
+    delta = await inp()
+    assert isinstance(delta, AudioDelta)
+    assert delta.format == "pcm"
+    assert delta.source["bytes"] == b"\x01\x02\x03\x04"
 
 
 @pytest.mark.asyncio
@@ -133,21 +134,22 @@ async def test_twilio_output_sends_transcoded_media_and_handles_barge_in():
     # Nova 24k PCM audio chunk -> should transcode and send a base64 payload.
     pcm24k = b"\x00\x00" * 480
     await out(
-        BidiAudioStreamEvent(
+        BidiAudioDeltaEvent(
             audio=base64.b64encode(pcm24k).decode("ascii"),
             format="pcm",
             sample_rate=24000,
             channels=1,
+            content_id="c1",
         )
     )
     assert len(sent) == 1 and sent[0]
 
-    # Barge-in -> clear playback invoked.
-    await out(BidiInterruptionEvent(reason="user_speech"))
+    # Barge-in -> clear playback invoked (GA event carries no .reason).
+    await out(BidiBargeInEvent())
     assert cleared == [True]
 
-    assert "BidiAudioStreamEvent" in recorded
-    assert "BidiInterruptionEvent" in recorded
+    assert "BidiAudioDeltaEvent" in recorded
+    assert "BidiBargeInEvent" in recorded
 
 
 @pytest.mark.asyncio
@@ -173,11 +175,12 @@ async def test_session_feeds_audio_and_runs_with_stub_agent(monkeypatch):
             await inp.start(self)
             # Emit a synthetic Nova audio event to the output channel.
             pcm24k = b"\x00\x00" * 480
-            evt = BidiAudioStreamEvent(
+            evt = BidiAudioDeltaEvent(
                 audio=base64.b64encode(pcm24k).decode("ascii"),
                 format="pcm",
                 sample_rate=24000,
                 channels=1,
+                content_id="c1",
             )
             for out in outputs:
                 await out.start(self)
@@ -205,13 +208,13 @@ async def test_session_feeds_audio_and_runs_with_stub_agent(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_kickoff_input_emits_priming_turn_then_blocks():
-    """The AI-first kickoff input returns one text turn, then blocks forever."""
+    """The AI-first kickoff input returns one text turn (str), then blocks forever."""
     kickoff = sonic_bridge._KickoffInput("say hello first")
 
-    event = await kickoff()
-    assert isinstance(event, BidiTextInputEvent)
-    assert event.text == "say hello first"
-    assert event.role == "user"
+    turn = await kickoff()
+    # GA text input is a plain str user turn.
+    assert isinstance(turn, str)
+    assert turn == "say hello first"
 
     # Second call must not emit again (it blocks until cancelled).
     second = asyncio.ensure_future(kickoff())
@@ -267,12 +270,12 @@ async def test_session_sends_ai_first_opening_turn_without_caller_audio(monkeypa
     await asyncio.sleep(0.05)
 
     # The opening text turn was sent even though no caller audio was ever fed.
-    text_turns = [e for e in sent_inputs if isinstance(e, BidiTextInputEvent)]
+    # GA text input is a plain str user turn.
+    text_turns = [e for e in sent_inputs if isinstance(e, str)]
     assert len(text_turns) == 1
-    assert text_turns[0].text == "greet the debtor and state the amount due"
-    assert text_turns[0].role == "user"
+    assert text_turns[0] == "greet the debtor and state the amount due"
     # And no audio input was produced (debtor never spoke).
-    assert not any(isinstance(e, BidiAudioInputEvent) for e in sent_inputs)
+    assert not any(isinstance(e, AudioDelta) for e in sent_inputs)
 
     await session.close()
     assert task.done()

@@ -1,13 +1,60 @@
-# AR Collections Nova Sonic 2.5 Agent
+# AR Collections Nova Sonic 2.5 Agent — an AWS sample
 
-AI-first-initiated **outbound** Accounts Receivable collections voice agent.
-Twilio places the outbound call and carries the audio; **Amazon Bedrock Nova
-Sonic 2.5** (model `amazon.nova-2-5-sonic`, female voice **`tiffany`**) does the
-speech understanding, reasoning, and speech generation; **Strands bi-di agents**
-orchestrate the real-time session. The agent greets the debtor by name, states
-the exact amount due and due date, converses, and writes the outcome back to the
-due record via a tool. Every call is tagged with detailed metrics shown on a
-built-in analytics dashboard.
+An AWS reference sample showing how to build a **real-time, speech-to-speech
+voice agent** on AWS by combining **Twilio** telephony with **Amazon Bedrock
+Nova Sonic 2.5** and the **Strands Bidi Agents** GA API, then layering on
+**post-call intelligence** and **observability**. The use case is an
+AI-initiated **outbound** Accounts Receivable (AR) collections call, but the
+architecture is a general blueprint for any phone-based conversational agent.
+
+## What this sample demonstrates
+
+- **Twilio telephony + Amazon Bedrock Nova Sonic 2.5 speech-to-speech.** Twilio
+  places the outbound call and carries the audio over a Media Streams
+  WebSocket; **Amazon Bedrock Nova Sonic 2.5** (model `amazon.nova-2-5-sonic`,
+  voice **`tiffany`**) performs speech understanding, reasoning, and speech
+  generation in a single bidirectional stream.
+- **Strands GA Bidi Agents.** The real-time session is orchestrated with the
+  **generally-available** `strands.bidi` API (`BidiAgent` +
+  `BedrockNovaSonicModel`), replacing the earlier experimental
+  `strands.experimental.bidi` interface. In-call Strands `@tool`s let the model
+  update the due record and capture spoken payment dates mid-conversation.
+- **Post-call intelligence.** After the call, an asynchronous pipeline (off the
+  real-time path) extracts the **call disposition**, **structured conversation
+  data**, and the **next-best-action** via the Bedrock Converse API, resolves
+  spoken relative dates with **Amazon Bedrock AgentCore Code Interpreter**, and
+  fires downstream automation (payment-link SMS, human escalation).
+- **Observability.** Per-call metrics (end-to-end time, TTFT, turn count,
+  Twilio-vs-Nova split) feed a built-in analytics dashboard, and the GA Strands
+  **OpenTelemetry (OTEL) spans** (per session, per model response, and per tool
+  call, including reported token usage) are emitted to CloudWatch Logs.
+- **AWS reference architecture.** CloudFront → Application Load Balancer → ECS
+  Fargate → Amazon Bedrock, with Amazon DynamoDB persistence, AWS Secrets
+  Manager for credentials, CloudWatch for logs/metrics, and CloudTrail for
+  audit — all provisioned by a single CloudFormation template.
+
+The analytics dashboard is a **shadcn/ui** React + Tailwind + Vite SPA, compiled
+at image-build time and served by the same FastAPI app.
+
+> **Deploying this sample?** Follow [DEPLOYMENT.md](DEPLOYMENT.md) — a
+> reproducible, fully-automated (IaC + scripted) runbook that takes an AWS
+> account from zero to a live, callable demo with no hidden manual steps.
+
+## AWS services used
+
+| Service | Role in the sample |
+| --- | --- |
+| **Amazon Bedrock** (Nova Sonic 2.5) | Real-time speech-to-speech model over a bidirectional stream |
+| **Amazon Bedrock** (Converse, Nova Lite/Micro) | Post-call disposition + structured-data extraction |
+| **Amazon Bedrock AgentCore Code Interpreter** | Off-path resolution of spoken relative dates |
+| **Amazon ECS on AWS Fargate** | Runs the FastAPI real-time bridge |
+| **Elastic Load Balancing (ALB)** | WebSocket/WSS-capable ingress (idle timeout ≥ 120s) |
+| **Amazon CloudFront** | TLS front door for Twilio `wss://` (managed cert) |
+| **Amazon DynamoDB** | Dues/account records + per-call analytics |
+| **AWS Secrets Manager** | Twilio credentials (referenced by ARN, never inline) |
+| **Amazon CloudWatch** | JSON logs, dashboard, and GA OTEL spans |
+| **AWS CloudTrail** | Management-event audit trail |
+| **AWS CloudFormation** | Single-template IaC for the whole stack |
 
 ## Architecture
 
@@ -60,8 +107,9 @@ audio path:
     single `response_id` across the call.
 
 > **Verified AWS fact:** `amazon.nova-2-5-sonic` is available in Amazon Bedrock
-> in **us-east-1** with **streaming = true**. The bi-di operation to grant in
-> IAM is `bedrock:InvokeModelWithBidirectionalStream` (plus `bedrock:InvokeModel`).
+> in **us-east-1** with **streaming = true**. The bidirectional operation to
+> grant in IAM is `bedrock:InvokeModelWithBidirectionalStream` (plus
+> `bedrock:InvokeModel`).
 
 ## Components
 
@@ -69,12 +117,16 @@ audio path:
 | --- | --- |
 | `app/main.py` | FastAPI app: `/healthz`, `/` dashboard, `/api/*` REST, `/media` WebSocket |
 | `app/audio.py` | mu-law <-> PCM resample helpers (`audioop`) |
-| `app/sonic_bridge.py` | Strands `BidiAgent` + Nova Sonic model wiring and Twilio I/O bridge |
+| `app/sonic_bridge.py` | Strands GA `strands.bidi` `BidiAgent` + `BedrockNovaSonicModel` wiring and Twilio I/O bridge |
+| `app/telemetry.py` | One-time GA Strands OTEL (`StrandsTelemetry`) setup (console/OTLP exporter) |
 | `app/collections_agent.py` | System prompt + `update_due_record` tool |
 | `app/metrics.py` | Per-call / per-turn metrics + JSON-line logging |
 | `app/store.py` | Pluggable store: in-memory by default, **DynamoDB on AWS** |
 | `app/twilio_client.py` | Places the outbound call with `<Connect><Stream>` TwiML |
-| `web/` | Dependency-light vanilla-JS analytics dashboard |
+| `app/code_interpreter.py` | Off-path AgentCore Code Interpreter wrapper (resolves relative date phrases) |
+| `app/postcall.py` | Async post-call intelligence (disposition, structured data, NBA, date resolution) |
+| `frontend/` | shadcn/ui React + Tailwind + Vite dashboard source (built at image-build time) |
+| `web/` | Compiled dashboard bundle served by FastAPI at `/` + `/static/assets/` (git-ignored; produced by the Docker node build stage) |
 | `scripts/place_call.py` | CLI to initiate an outbound collections call |
 | `scripts/deploy.sh` | Operator wrapper for build/lint/push/deploy |
 | `infra/template.yaml` | AWS CloudFormation IaC (ECS Fargate + ALB + DynamoDB + CloudWatch + CloudTrail) |
@@ -155,7 +207,41 @@ audio path:
    duration of each; "Nova Sonic total time" is the summed duration of Nova's
    outbound audio frames.
 
+## Dashboard (shadcn/ui redesign)
+
+The analytics dashboard is a **shadcn/ui** single-page app (React + TypeScript +
+Tailwind, bundled with Vite) living in `frontend/`. It replaces the earlier
+dependency-light vanilla-JS page while preserving every capability (due records,
+past calls, per-call metrics, the chat transcript, the per-turn latency table,
+and the in-depth event log) and adds a more interactive information architecture:
+a call-attempt header with status/disposition **badges**, the transcript and
+telemetry panels, a per-turn latency table, a latency chart, and
+**tooltips / collapsibles / popovers** to surface detail on demand. It polls the
+same REST API (`/api/config`, `/api/dues`, `/api/calls`, `/api/calls/{id}`) every
+few seconds, so a call updates live.
+
+- **Source vs. served bundle.** `frontend/` holds the TypeScript source and
+  `shadcn` config; `vite.config.ts` sets `base: "/static/"` and emits the
+  compiled bundle into `web/` (`index.html` + `assets/`), which FastAPI serves
+  unchanged (`GET /` -> `web/index.html`, `/static` -> `web/`). The compiled
+  `web/` bundle is **git-ignored** and produced at image-build time, so no large
+  generated assets are committed.
+- **Built in the container (multi-stage Docker).** The `Dockerfile` has a
+  `node:22-slim` **web-build** stage that runs `npm ci && npm run build` in
+  `frontend/` (npm runs at image-build time, where the network is available),
+  then the `python:3.12-slim` runtime stage `COPY --from=web-build`s the emitted
+  `web/` bundle. Because the node build runs inside `docker build`, the CodeBuild
+  environment only needs Docker - no host node toolchain and no local
+  `docker build` (the image is built remotely via `scripts/codebuild_image.sh`).
+
 ## AWS deploy
+
+> **For a from-scratch, step-by-step deployment, follow
+> [DEPLOYMENT.md](DEPLOYMENT.md).** It is a reproducible, fully
+> IaC/scripted runbook (prerequisites → Bedrock model access → Twilio secrets
+> → CodeBuild image → CloudFormation deploy → seed demo data → force ECS
+> rollout → place a call) with no hidden manual steps. The section below is the
+> reference explanation of what the IaC provisions and the TLS options.
 
 The IaC (`infra/template.yaml`) provisions an **ECS Fargate** service behind an
 **Application Load Balancer** (WebSocket/WSS capable, idle timeout 120s), two
@@ -164,10 +250,24 @@ The IaC (`infra/template.yaml`) provisions an **ECS Fargate** service behind an
 **least-privilege IAM task role** granting
 `bedrock:InvokeModelWithBidirectionalStream` + `bedrock:InvokeModel` on the Nova
 Sonic model ARN, a separate scoped `bedrock:InvokeModel` grant on the text
-extraction model ARN for the post-call Converse extraction, DynamoDB RW on just
-the two tables, and CloudWatch Logs write. The post-call PTP payment-link SMS
-needs no new IAM (it reuses existing egress + the Secrets-Manager Twilio
-credentials).
+extraction model ARN for the post-call Converse extraction, a separate
+least-privilege `agentcore-code-interpreter` grant
+(`bedrock-agentcore:StartCodeInterpreterSession` / `InvokeCodeInterpreter` /
+`StopCodeInterpreterSession`, scoped to `code-interpreter/*`) for the off-path
+date resolution, DynamoDB RW on just the two tables, and CloudWatch Logs write.
+The post-call PTP payment-link SMS needs no new IAM (it reuses existing egress +
+the Secrets-Manager Twilio credentials).
+
+> **Code Interpreter / IAM.** The off-path natural-language date tool
+> (`app/code_interpreter.py`) targets the **managed** AgentCore interpreter
+> `aws.codeinterpreter.v1`, so the task role grants only the three session
+> actions its SDK path actually calls
+> (`start()` -> `StartCodeInterpreterSession`,
+> `invoke("executeCode", ...)` -> `InvokeCodeInterpreter`,
+> `stop()` -> `StopCodeInterpreterSession`) and **no** Create/Delete/List/Get.
+> Both `bedrock:InvokeModelWithBidirectionalStream` and the `bedrock-agentcore`
+> session actions are valid IAM actions missing from cfn-lint's bundled catalog,
+> so a scoped `W3037` ignore sits in the TaskRole `Metadata` with a comment.
 
 > **Extraction model / IAM coupling.** The text-extraction model is set once via
 > the `ExtractionModelId` CloudFormation parameter (default
@@ -200,11 +300,14 @@ credentials).
    ```bash
    aws secretsmanager create-secret --name ar/twilio/account_sid --secret-string "$TWILIO_ACCOUNT_SID"
    # ...repeat for auth_token, from_number, verified_caller_id...
-   export TWILIO_ACCOUNT_SID_ARN=arn:aws:secretsmanager:us-east-1:920487201358:secret:ar/twilio/account_sid-XXXXX
+   # Capture the ARN that create-secret returns (shape shown with placeholders):
+   export TWILIO_ACCOUNT_SID_ARN=arn:aws:secretsmanager:<region>:<AWS_ACCOUNT_ID>:secret:ar/twilio/account_sid-XXXXXX
    export TWILIO_AUTH_TOKEN_ARN=...
    export TWILIO_FROM_NUMBER_ARN=...
    export TWILIO_VERIFIED_CALLER_ID_ARN=...
    ```
+
+   See [DEPLOYMENT.md](DEPLOYMENT.md) for the exact, copy-pasteable commands.
 
    The template references these ARNs in the task definition `Secrets` block; the
    ECS execution role is granted `secretsmanager:GetSecretValue` / `ssm:GetParameter`
@@ -256,9 +359,12 @@ credentials).
    **ALB ingress is locked to CloudFront when `EnableCloudFront=true`.** To make
    the CloudFront TLS front door the *only* ingress path (so a plaintext
    `ws://<alb-dns>/media` can no longer bypass CloudFront), the ALB security
-   group's `:80` ingress is restricted to the AWS-managed CloudFront prefix list
-   `com.amazonaws.global.cloudfront.origin-facing` (us-east-1 id `pl-3b927c52`,
-   passed via the `CloudFrontOriginFacingPrefixListId` parameter) instead of
+   group's `:80` ingress is restricted to the AWS-managed CloudFront
+   origin-facing managed prefix list
+   `com.amazonaws.global.cloudfront.origin-facing` (region-specific; resolve the
+   id for your region with the `aws ec2 describe-managed-prefix-lists` command
+   below and pass it via the `CloudFrontOriginFacingPrefixListId` parameter,
+   which defaults to the current us-east-1 id) instead of
    `0.0.0.0/0`. CloudFront talks to the origin over `http-only:80`, so only the
    `:80` rule is needed; adding a second `:443` prefix-list rule is unnecessary
    and would exceed the 60-rule-per-SG limit (the managed prefix list has ~49
@@ -286,6 +392,49 @@ credentials).
    curl -sS -o /dev/null -w '%{http_code}\n' https://$CF/healthz   # -> 200 (trusted cert, no -k)
    ```
 
+   #### Origin network isolation: CloudFront VPC origin (active posture)
+
+   The prefix-list allow-list above is an **IP-based** control: it filters by
+   CloudFront's published source ranges, which the ALB still exposes to the
+   public internet (just filtered at the security group). For stronger,
+   **network-level** isolation the reference stack runs the **CloudFront VPC
+   origin** posture (`UseVpcOrigin=true`). When both `EnableCloudFront=true` and
+   `UseVpcOrigin=true`, the ALB is provisioned as an **internal** load balancer
+   (`IpAddressType=ipv4`) in **private subnets with no public IP**, the Fargate
+   tasks run private (`AssignPublicIp=DISABLED`, egress via a NAT gateway), and
+   CloudFront reaches the origin through a service-managed
+   `AWS::CloudFront::VpcOrigin` ENI — so the origin has **no public endpoint at
+   all** and is reachable *only* by that distribution. This improves security
+   over the prefix-list option because it removes the public IP entirely rather
+   than relying on a source-IP allow-list that changes over time. See
+   [docs/architecture.md](docs/architecture.md) for the trade-offs.
+
+   The private subnets (internal ALB + tasks) are provisioned by the template
+   itself (IaC) when `PRIVATE_SUBNET_IDS` is left blank, so you do **not** need
+   to pre-create them; only a public subnet for NAT egress is required. The
+   subnets in use are surfaced by the `ProvisionedPrivateSubnetIds` stack output.
+
+   ```bash
+   export VPC_ID=<vpc-id>
+   export PUBLIC_SUBNET_IDS=<subnet-id-a>,<subnet-id-b>      # still required (2 AZs)
+   export ENABLE_CLOUDFRONT=true
+   export USE_VPC_ORIGIN=true
+   # PRIVATE_SUBNET_IDS left blank — the template provisions the private subnets.
+   export NAT_GATEWAY_SUBNET_ID=<public-subnet-for-nat>             # NAT egress for private tasks
+   scripts/deploy.sh deploy
+   ```
+
+   > **Operational note (this sample's live demo).** VPC origin is the
+   > **activated** posture on the reference stack (`UseVpcOrigin=true`, the
+   > internal IPv4 ALB). Switching an existing stack from a public ALB to an
+   > internal one **replaces** the load balancer (new DNS/ARN — not a
+   > zero-downtime change), but the CloudFront **domain is unchanged** across the
+   > replacement, so flip `UseVpcOrigin` on a fresh stack or during a planned
+   > maintenance window, not as an in-place update of a live stack. One-time
+   > account prerequisite: CloudFront auto-provisions the
+   > `AWSServiceRoleForCloudFrontVPCOrigins` service-linked role the first time a
+   > VPC origin is created.
+
    ### Option 2 (custom domain): ACM certificate + HTTPS listener on the ALB
 
    If you own a hostname, terminate TLS directly on the ALB with an ACM
@@ -299,7 +448,7 @@ credentials).
      points `PUBLIC_BASE_URL` at the TLS hostname:
 
      ```bash
-     export CERTIFICATE_ARN=arn:aws:acm:us-east-1:920487201358:certificate/XXXX
+     export CERTIFICATE_ARN=arn:aws:acm:<region>:<AWS_ACCOUNT_ID>:certificate/XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
      export PUBLIC_HOSTNAME=collections.example.com
      scripts/deploy.sh deploy   # pass CertificateArn / PublicHostname params
      ```
@@ -400,48 +549,81 @@ for a strict JSON object and parses it defensively). Until extraction completes
 they stay blank (`intelligence_status = pending`); the dashboard renders blank
 placeholders and fills them in when `intelligence_status` becomes `ready`.
 
-### 3. The `compute_future_date` code-interpreter tool
+### 3. Natural-language dates: capture in-call, resolve with a code interpreter
 
 To turn relative phrases the debtor speaks (e.g. "I'll pay next month, the first
-Monday") into a concrete date, the agent calls a **custom Strands `@tool`**,
-`compute_future_date(phrase, reference_date=None)` in `app/collections_agent.py`
-(same `@tool` decorator pattern as `update_due_record`, which Nova Sonic already
-invokes in-call). It does deterministic, purely-local **stdlib `datetime`** math
-(no network, no sandbox), so it returns within the turn.
+Monday") into a concrete date, the work is split so the **real-time turn stays
+fast** while the actual computation is delegated to a **real code interpreter**:
 
-**Why a custom `@tool` and not the vended `python_repl` or AgentCore:** Strands'
-vended `strands.vended_tools.python_repl` requires a configured Sandbox (local
-Docker / microVM / SSH host) to execute code. Local Docker is broken in this
-environment (podman shim) and a sandbox is heavy overkill for a tiny date
-computation; AWS Bedrock AgentCore's code interpreter is likewise unnecessary
-infrastructure here. A custom `@tool` is the correct, lowest-risk API.
+- **In-call (fast).** The agent calls a lightweight custom Strands `@tool`,
+  `capture_payment_date_phrase(phrase, account_id=None)` in
+  `app/collections_agent.py` (same `@tool` pattern as `update_due_record`). It
+  only **records the raw phrase** on the due record and returns immediately; it
+  does **no** date math and makes **no** network call, so it never adds latency
+  to the audio/turn path.
+- **Off-path (post-call).** `app/code_interpreter.py` wraps the **AWS Bedrock
+  AgentCore Code Interpreter** (`bedrock_agentcore.tools.code_interpreter_client`,
+  managed identifier `aws.codeinterpreter.v1`). `resolve_date_phrase(phrase,
+  reference_date, region, model_id=None, bedrock_client=None,
+  client_factory=None)` first asks a Bedrock **TEXT model** (the same
+  `EXTRACTION_MODEL_ID`, via the Converse API) to **author a Python program on
+  the fly** - the prompt supplies only the arguments (the phrase + today's
+  date), and the **model** reasons from today's date and writes the date math.
+  That model-generated program is then shipped to the sandbox via
+  `invoke("executeCode", {"language": "python", "code": ...})`, and the wrapper
+  parses the `YYYY-MM-DD` the program prints. The orchestration never
+  hand-writes the date logic; a tiny labelled harness only guarantees a single
+  printed line. Both the model client (`bedrock_client`) and the sandbox client
+  (`client_factory`) are injectable so tests never hit AWS, and the wrapper is
+  fully defensive (any error / `isError` / unparseable output returns `None`,
+  and the session is always `stop()`-ped in a `finally`).
+
+**Why off-path:** a Code Interpreter session costs roughly **~1.9s** (~1.75s to
+start + ~0.13s to execute), which is why the heavy resolution runs only inside
+the post-call task (`extract_and_apply` in `app/postcall.py`) and never on the
+real-time turn. The already-ISO fast path (`strptime`) skips the interpreter
+entirely when the model already returned a concrete date.
 
 Example: with a reference date in May 2024, `"next month 1st Monday"` resolves to
 `2024-06-03`. Other handled phrases include `"in two weeks"`, `"next Friday"`,
 `"end of next month"`, and `"tomorrow"`.
 
-The **same date math** is reused post-call in `app/postcall.py` to resolve a
-relative `agreed_date` phrase returned by the extraction model into a concrete
-ISO date.
-
 ### Async / no-latency guarantee
 
-The in-call tools (`update_due_record`, `compute_future_date`) are cheap and
-local, but the **expensive work** (LLM disposition classification + structured
-extraction + the downstream triggers) runs **after the call ends**, off the
+The in-call tools (`update_due_record`, `capture_payment_date_phrase`) are cheap
+and local, but the **expensive work** (LLM disposition classification +
+structured extraction + the AgentCore code-interpreter date resolution + the
+downstream triggers) runs **after the call ends**, off the
 audio/turn path, as a fire-and-forget `asyncio` task launched from the `/media`
 WebSocket finally-block in `app/main.py` (`extract_and_apply` in
 `app/postcall.py`). The call-latency metrics (`total_e2e_ms`, `nova_total_ms`,
 `ttft_ms`) are computed on the audio path (`session_start`..`session_end`) and
 are frozen before the post-call task runs, so it provably cannot inflate them.
 
-This is enforced by a test:
-`tests/test_postcall.py::test_no_added_latency_postcall_does_not_touch_call_metrics`
-drives a synthetic `CallMetrics` session to fixed values, then runs
-`extract_and_apply` and asserts the three metrics are **byte-for-byte
-unchanged**.
+This is enforced by two tests in `tests/test_postcall.py`:
+`test_no_added_latency_postcall_does_not_touch_call_metrics` drives a synthetic
+`CallMetrics` session to fixed values, then runs `extract_and_apply` and asserts
+the three metrics are **byte-for-byte unchanged**; and
+`test_no_latency_audio_path_never_invokes_extraction` drives the full audio path
+with a blocking Bedrock stub **and a blocking code-interpreter stub**, asserting
+neither is touched until the off-path task runs post-call.
 
 ## Observability
+
+- **GA Strands OTEL spans.** Because the session is orchestrated with the GA
+  `strands.bidi` API, the agent loop automatically emits OpenTelemetry spans
+  once `StrandsTelemetry` is configured **before** the agent runs — one span per
+  **session** (with `gen_ai.usage.*` token totals), per **model response** (with
+  native time-to-first-audio), and per **tool call**, including reported token
+  usage. The app wires this once at startup (`app/telemetry.py`, guarded so a
+  setup failure never crashes the app or touches the real-time audio path) and
+  defaults to the **console exporter**, so spans are written to stdout and the
+  ECS `awslogs` driver ships them to CloudWatch Logs with **no new IAM and no
+  new infrastructure**. Set `OTEL_EXPORTER=otlp` (+ `OTEL_EXPORTER_OTLP_ENDPOINT`)
+  to send to a collector, or `OTEL_ENABLED=false` to disable. These non-secret
+  knobs are surfaced via `GET /api/config`. See
+  [docs/architecture.md](docs/architecture.md) for how OTEL reconciles with the
+  dashboard's `CallMetrics`.
 
 - **CloudWatch Logs.** App logs are one JSON object per line (call placed, stream
   start, per-turn start/stop, TTFT, tool calls, barge-in, errors, call-end
@@ -472,9 +654,10 @@ unchanged**.
 
 - **Conversational turns (what `turn_count` means).** A turn is one side of the
   user<->Nova Sonic alternation: a caller utterance answered by a Sonic utterance
-  is the back-and-forth. `turn_count` is derived from the
-  `BidiTranscriptStreamEvent` `role` (`user`/`assistant`) + `is_final` alternation,
-  not from Nova response IDs. This **replaced the earlier `response_id`-based
+  is the back-and-forth. `turn_count` is derived from the GA
+  `BidiTranscriptBlockEvent` `role` (`user`/`assistant`) alternation — each block
+  event is a completed utterance — not from Nova response IDs. This **replaced
+  the earlier `response_id`-based
   grouping** because in live calls Nova Sonic reused a single `response_id` for
   the entire exchange, so counting matched response-start/response-complete pairs
   reported `turn_count = 1` even when there were several user<->Sonic
@@ -513,9 +696,12 @@ unchanged**.
   `InvokeModelWithBidirectionalStream`, which that feature does not cover, so it
   would not record any turn/TTFT ground truth here (and there is no
   CloudFormation resource for it — it is an account-level API). Turn semantics
-  are therefore derived from the Strands `BidiTranscriptStreamEvent`
+  are therefore derived from the GA Strands `BidiTranscriptBlockEvent`
   user/assistant alternation plus response-start/first-audio timing. See the
-  comment near the turn-counting logic in `app/metrics.py`.
+  comment near the turn-counting logic in `app/metrics.py`. The GA
+  `strands.bidi` agent loop also emits authoritative OTEL spans (session token
+  usage, per-response native TTFT, tool calls) — see the Observability notes
+  below and `docs/architecture.md`.
 
 - **CloudTrail.** A multi-region management-event trail writes to the encrypted,
   private S3 bucket created by the stack. Use it (and CloudWatch) to diagnose

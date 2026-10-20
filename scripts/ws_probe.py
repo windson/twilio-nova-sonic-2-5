@@ -1,8 +1,14 @@
-"""Ad-hoc WebSocket upgrade probe for wss://<CF>/media through CloudFront.
+"""Ad-hoc WebSocket upgrade probe for wss://<cloudfront-domain>/media.
 
-Not a committed test; used by FEAT-007 to prove the WS 101 handshake and open
+Not a committed test; an operator helper to prove the WS 101 handshake and open
 socket complete end-to-end (CloudFront -> ALB -> ECS app). Sends a synthetic
 Twilio-style 'connected' frame to confirm the app does not immediately close.
+
+Usage:
+    python scripts/ws_probe.py <cloudfront-domain>
+
+where <cloudfront-domain> is the stack's CloudFrontDomainName output, e.g.
+``dXXXXXXXXXXXXX.cloudfront.net`` (no scheme).
 """
 
 from __future__ import annotations
@@ -35,5 +41,13 @@ async def main(cf: str) -> int:
 
 
 if __name__ == "__main__":
-    cf = sys.argv[1] if len(sys.argv) > 1 else "d3k3puelhq4ike.cloudfront.net"
+    if len(sys.argv) < 2 or not sys.argv[1].strip():
+        print(
+            "usage: python scripts/ws_probe.py <cloudfront-domain>\n"
+            "  e.g. python scripts/ws_probe.py dXXXXXXXXXXXXX.cloudfront.net\n"
+            "  (use the stack's CloudFrontDomainName output, no scheme)",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    cf = sys.argv[1]
     raise SystemExit(asyncio.run(main(cf)))

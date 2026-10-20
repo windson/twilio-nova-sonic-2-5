@@ -37,6 +37,35 @@ Parameters:
       intelligence_status=failed). Constrained to the TEXT models verified
       available in us-east-1; to use another model, add it here so the grant
       and the env var stay in lockstep.
+  OtelEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: >-
+      Master switch for GA Strands OTEL telemetry. When true the GA bidi agent
+      loop auto-emits OTEL spans (session token usage, per-response
+      time-to-first-audio/TTFT, tool-call and connection-restart spans).
+  OtelExporter:
+    Type: String
+    Default: console
+    AllowedValues:
+      - console
+      - otlp
+      - none
+    Description: >-
+      OTEL span exporter. "console" (default) writes spans to stdout, which the
+      ECS awslogs driver already ships to CloudWatch Logs - so NO new IAM and NO
+      new infrastructure are required for telemetry. "otlp" ships to the
+      collector named by OtelExporterOtlpEndpoint; "none" disables export.
+  OtelExporterOtlpEndpoint:
+    Type: String
+    Default: ""
+    Description: >-
+      OTLP collector endpoint URL. Only used when OtelExporter=otlp; read by the
+      OpenTelemetry SDK via OTEL_EXPORTER_OTLP_ENDPOINT. Leave blank for the
+      console exporter.
   TwilioAccountSidArn:
     Type: String
     Description: >-
@@ -106,6 +135,53 @@ Parameters:
       aws ec2 describe-managed-prefix-lists --filters
       Name=prefix-list-name,Values=com.amazonaws.global.cloudfront.origin-facing
       --region us-east-1.
+  # --- Option 2 (CloudFront VPC origin) parameters -------------------------
+  # Option 2 is a strictly stronger security posture than Option 1: instead of
+  # an internet-facing ALB whose SG allow-lists the CloudFront origin-facing
+  # prefix list (an IP filter over AWS-managed ranges that change over time),
+  # the ALB becomes INTERNAL in private subnets with NO public IP, reachable
+  # ONLY through the CloudFront distribution's service-managed VPC origin ENI -
+  # i.e. true network-level isolation rather than an allow-list. These params
+  # take effect only when BOTH EnableCloudFront AND UseVpcOrigin are "true";
+  # with the default UseVpcOrigin="false" the template is byte-compatible with
+  # the existing internet-facing ALB + prefix-list behavior and nothing changes.
+  UseVpcOrigin:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: >-
+      Option 2 (CloudFront VPC origin). When "true" AND EnableCloudFront is also
+      "true", the ALB is provisioned INTERNAL in PrivateSubnetIds with no public
+      IP, the Fargate tasks run in those private subnets (AssignPublicIp
+      DISABLED, egress via the NAT gateway), and the CloudFront distribution
+      reaches the origin through an AWS::CloudFront::VpcOrigin (service-managed
+      ENI) rather than over the public internet. This gives the origin
+      network-level isolation (only the distribution can reach it) instead of
+      the Option 1 prefix-list allow-list. Requires PrivateSubnetIds and
+      NatGatewaySubnetId. Leave "false" (default) to keep the existing
+      internet-facing ALB + prefix-list posture unchanged.
+  PrivateSubnetIds:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: >-
+      Two or more EXISTING private subnets (different AZs) that host the
+      internal ALB, the CloudFront VPC origin ENI, and the Fargate tasks when
+      UseVpcOrigin="true". Each must have at least one free IPv4 address so
+      CloudFront can place its service-managed ENI. Parameterized (rather than hard-coding CIDRs) so
+      the template provisions no overlapping address space and stays account
+      agnostic. Leave blank when UseVpcOrigin="false".
+  NatGatewaySubnetId:
+    Type: String
+    Default: ""
+    Description: >-
+      A PUBLIC subnet (with an internet gateway route) in which to place the NAT
+      gateway when UseVpcOrigin="true". Private-subnet tasks lose the public
+      egress they had via AssignPublicIp=ENABLED, so the NAT gateway restores
+      their required OUTBOUND internet access to the Twilio REST API plus AWS
+      egress (Bedrock Nova Sonic, DynamoDB, ECR image pulls, AgentCore). Leave
+      blank when UseVpcOrigin="false".
 
 Conditions:
   # HTTPS/WSS is enabled only when an ACM certificate ARN is supplied, so the
@@ -119,6 +195,33 @@ Conditions:
   # Inverse of EnableCf: open ALB ingress (0.0.0.0/0) only when CloudFront is
   # off. When CloudFront is on, ingress is locked to the managed prefix list.
   CloudFrontDisabled: !Not [!Equals [!Ref EnableCloudFront, "true"]]
+  # Option 2: the CloudFront VPC origin posture is active only when BOTH
+  # EnableCloudFront and UseVpcOrigin are "true" (UseVpcOrigin is meaningless
+  # without the CloudFront front door it sits behind). When active, the ALB is
+  # internal in private subnets, the tasks run private with NAT egress, and the
+  # distribution reaches the origin via the service-managed VPC origin ENI.
+  UseVpcOriginCond: !And
+    - !Equals [!Ref EnableCloudFront, "true"]
+    - !Equals [!Ref UseVpcOrigin, "true"]
+  # Option 1 (prefix-list) ALB path: CloudFront on but WITHOUT the VPC origin.
+  # This is the existing internet-facing ALB + origin-facing prefix list; it is
+  # intentionally mutually exclusive with UseVpcOriginCond so exactly one origin
+  # style is wired at a time.
+  CloudFrontPrefixListOrigin: !And
+    - !Equals [!Ref EnableCloudFront, "true"]
+    - !Not [!Equals [!Ref UseVpcOrigin, "true"]]
+  # When the VPC-origin posture is active AND no PrivateSubnetIds were supplied,
+  # the stack provisions its own IPv4 private subnets (PrivateSubnet1/2
+  # below) and wires the internal ALB, the Fargate service, and the private
+  # route-table associations to them. Supplying PrivateSubnetIds overrides this
+  # (an operator can bring existing private subnets), keeping the parameter path
+  # intact. !Join over the CommaDelimitedList yields "" only when it is empty.
+  ProvisionPrivateSubnets: !And
+    - !Condition UseVpcOriginCond
+    - !Equals [!Join ["", !Ref PrivateSubnetIds], ""]
+  # Wire the OTLP endpoint env var only when an endpoint is actually supplied,
+  # so the console/stdout path (the default) carries no empty OTLP config.
+  HasOtelEndpoint: !Not [!Equals [!Ref OtelExporterOtlpEndpoint, ""]]
 
 Resources:
   # --- DynamoDB persistence --------------------------------------------------
@@ -193,9 +296,12 @@ Resources:
   TaskRole:
     Type: AWS::IAM::Role
     Metadata:
-      # bedrock:InvokeModelWithBidirectionalStream is a valid Bedrock action
-      # (Nova Sonic bi-di streaming) that cfn-lint's bundled IAM action catalog
-      # does not yet list, so W3037 is a false positive here.
+      # bedrock:InvokeModelWithBidirectionalStream (Nova Sonic bi-di streaming)
+      # and the bedrock-agentcore:*CodeInterpreterSession /
+      # bedrock-agentcore:InvokeCodeInterpreter actions (AgentCore Code
+      # Interpreter, used off-path for date resolution) are all valid IAM
+      # actions that cfn-lint's bundled action catalog does not yet list, so
+      # W3037 is a false positive for this role.
       cfn-lint:
         config:
           ignore_checks:
@@ -221,9 +327,13 @@ Resources:
                   - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${NovaModelId}"
         # Separate, narrowly-scoped grant for the OFF-PATH post-call intelligence
         # (app/postcall.py), which calls the Bedrock Converse API on a TEXT model
-        # (default amazon.nova-lite-v1:0, EXTRACTION_MODEL_ID). Kept distinct from
-        # the Nova Sonic bidi statement above so the extraction grant stays scoped
-        # to just the text model ARN(s) and the two policies evolve independently.
+        # (default amazon.nova-lite-v1:0, EXTRACTION_MODEL_ID). The SAME model +
+        # grant is reused by app/code_interpreter.py to GENERATE the on-the-fly
+        # date-resolution Python program (also via Converse -> bedrock:InvokeModel
+        # on the same ExtractionModelId ARN), so NO additional IAM is required for
+        # the model that authors the code. Kept distinct from the Nova Sonic bidi
+        # statement above so the extraction grant stays scoped to just the text
+        # model ARN(s) and the two policies evolve independently.
         - PolicyName: bedrock-text-extraction
           PolicyDocument:
             Version: "2012-10-17"
@@ -238,6 +348,36 @@ Resources:
                 # at invoke time.
                 Resource:
                   - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${ExtractionModelId}"
+        # Separate, least-privilege grant for the OFF-PATH natural-language date
+        # resolution (app/code_interpreter.py), which ships a generated Python
+        # program to the AWS Bedrock AgentCore Code Interpreter sandbox and reads
+        # back the computed ISO date. The SDK path used
+        # (bedrock_agentcore.tools.code_interpreter_client.CodeInterpreter:
+        # start() -> invoke("executeCode", ...) -> stop()) maps to EXACTLY these
+        # three session actions; no Create/Delete/List/Get is used because the
+        # app targets the MANAGED default interpreter (aws.codeinterpreter.v1),
+        # which requires no CreateCodeInterpreter. This ~1.9s call runs only in
+        # the post-call async task (app/postcall.py), never on the real-time
+        # audio/turn path, so it adds zero call latency. Kept distinct from the
+        # Nova Sonic bidi and text-extraction grants so each evolves on its own.
+        - PolicyName: agentcore-code-interpreter
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:StartCodeInterpreterSession
+                  - bedrock-agentcore:InvokeCodeInterpreter
+                  - bedrock-agentcore:StopCodeInterpreterSession
+                # Scoped to the code-interpreter resource namespace in this
+                # account/region, which covers the managed aws.codeinterpreter.v1
+                # default the app uses (arn:...:code-interpreter/*). VERIFIED at
+                # runtime: a live end-to-end resolution ran from the deployed
+                # task role (/api/config reports code_interpreter=agentcore and a
+                # real phrase resolved in ~1.9s), confirming this account-scoped
+                # code-interpreter/* ARN authorizes the managed default.
+                Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:code-interpreter/*"
         # Note: the PTP payment-link SMS (app/twilio_client.send_sms) needs NO new
         # IAM. It reuses the task's existing egress (ServiceSecurityGroup allows
         # all outbound to the Twilio API) and the Twilio credentials already
@@ -289,17 +429,19 @@ Resources:
           Description: Allow all egress.
 
   # --- ALB ingress (CloudFront-only when Option 1 is enabled) ---------------
-  # EnableCloudFront=true: lock ingress to CloudFront edge IPs via the managed
-  # prefix list so only the CloudFront distribution can reach the ALB origin.
-  # Only the :80 rule is created: CloudFront talks to this origin over
-  # http-only on port 80 (see Distribution.OriginProtocolPolicy), and no
-  # HTTPS:443 listener exists on the ALB in the CloudFront path (HttpsListener
-  # requires a certificate). Referencing a managed prefix list counts its
-  # entry count (49) against the per-SG rule quota (60), so a second :443
-  # prefix-list rule would exceed the limit and is unnecessary here.
+  # EnableCloudFront=true WITHOUT the VPC origin (Option 1): lock ingress to
+  # CloudFront edge IPs via the managed prefix list so only the CloudFront
+  # distribution can reach the internet-facing ALB origin. Only the :80 rule is
+  # created: CloudFront talks to this origin over http-only on port 80 (see
+  # Distribution.OriginProtocolPolicy), and no HTTPS:443 listener exists on the
+  # ALB in the CloudFront path (HttpsListener requires a certificate).
+  # Referencing a managed prefix list counts its entry count (49) against the
+  # per-SG rule quota (60), so a second :443 prefix-list rule would exceed the
+  # limit and is unnecessary here. Mutually exclusive with the VPC-origin path
+  # below (CloudFrontPrefixListOrigin excludes UseVpcOrigin).
   AlbIngressHttpCloudFront:
     Type: AWS::EC2::SecurityGroupIngress
-    Condition: EnableCf
+    Condition: CloudFrontPrefixListOrigin
     Properties:
       GroupId: !Ref AlbSecurityGroup
       IpProtocol: tcp
@@ -307,6 +449,31 @@ Resources:
       ToPort: 80
       SourcePrefixListId: !Ref CloudFrontOriginFacingPrefixListId
       Description: HTTP from CloudFront origin-facing edge IPs only (Option 1).
+
+  # --- ALB ingress (Option 2: CloudFront VPC origin) ------------------------
+  # UseVpcOrigin=true: the ALB is INTERNAL in private subnets and is reached
+  # only through the CloudFront service-managed VPC origin ENI. Per the AWS VPC
+  # origins guidance, the origin SG is opened to the CloudFront origin-facing
+  # managed prefix list(s) (Option 1 in that guide) BEFORE the VPC origin
+  # exists, which avoids a circular dependency on CloudFront's service-managed
+  # security group (that SG can only be referenced after the VPC origin is
+  # created). The IPv4 VPC origin is admitted via the IPv4 origin-facing managed
+  # prefix list. Even though the prefix list is reused, the security improvement
+  # comes from the ALB itself being internal with no public IP in a private
+  # subnet: the allow-list now sits in front of an origin that is already
+  # network-isolated to the distribution's ENI. (Referencing the managed prefix
+  # list consumes its ~49 entries against the per-SG rule quota of 60, so only
+  # this single IPv4 rule is added here - well within the limit.)
+  AlbIngressHttpVpcOriginV4:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: UseVpcOriginCond
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourcePrefixListId: !Ref CloudFrontOriginFacingPrefixListId
+      Description: HTTP from the CloudFront VPC origin (IPv4 origin-facing).
 
   # EnableCloudFront=false: original open ingress (plain ALB / ACM custom domain).
   AlbIngressHttpOpen:
@@ -351,13 +518,186 @@ Resources:
       SourceSecurityGroupId: !Ref AlbSecurityGroup
       Description: App port reachable only from the ALB.
 
+  # --- Private networking the VPC origin requires (Option 2) -----------------
+  # The target VPC ships with only PUBLIC subnets, yet the CloudFront VPC origin
+  # needs the ALB to be INTERNAL in PRIVATE subnets with no public IP. So, only
+  # under UseVpcOriginCond, the stack carves two IPv4 private subnets from the
+  # VPC's 10.0.0.0/16. These are created only when UseVpcOrigin="true"; the
+  # default "false" path provisions none of them and stays byte-compatible. An
+  # operator who supplies PrivateSubnetIds bypasses the stack-created subnets
+  # (see the ProvisionPrivateSubnets condition), but the subnets below are still
+  # created (harmless, unreferenced) when UseVpcOrigin="true" with an explicit
+  # list.
+  #
+  # IPv4-only: the internal ALB and VPC origin are IpAddressType=ipv4. A
+  # dualstack ALB would require each ALB subnet to carry an IPv6 /64 sliced from
+  # an Amazon-provided VPC /56, but the VPC here is externally owned (referenced
+  # by VpcId, not created by this stack) so its IPv6 CIDR is not a GetAtt-able
+  # stack attribute and cannot be sliced in a single CloudFormation pass. IPv4
+  # is fully sufficient for the private CloudFront-VPC-origin -> ALB path.
+  #
+  # Two private subnets in two AZs (!GetAZs picks the region's AZs wherever the
+  # stack deploys). VPC CIDR is 10.0.0.0/16 with 10.0.1.0/24 and 10.0.2.0/24
+  # already used by the two public subnets, so 10.0.11.0/24 and 10.0.12.0/24 do
+  # not overlap. MapPublicIpOnLaunch is false (private).
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Condition: UseVpcOriginCond
+    Properties:
+      VpcId: !Ref VpcId
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Condition: UseVpcOriginCond
+    Properties:
+      VpcId: !Ref VpcId
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+
+  # --- Private-subnet egress (Option 2: CloudFront VPC origin) ---------------
+  # EGRESS DESIGN. When UseVpcOrigin=true the Fargate tasks move from public
+  # subnets (AssignPublicIp=ENABLED, which gave them direct outbound internet)
+  # into the supplied private subnets with AssignPublicIp=DISABLED. They still
+  # require OUTBOUND access to:
+  #   * the Twilio REST API (public internet - placing/updating calls, SMS);
+  #   * AWS service endpoints - Bedrock Nova Sonic (bidi stream), DynamoDB,
+  #     ECR (image pulls on task start), CloudWatch Logs, AgentCore.
+  # A NAT gateway in a PUBLIC subnet (NatGatewaySubnetId) plus a private route
+  # table whose default route (0.0.0.0/0) targets the NAT restores that egress.
+  # Twilio is a public third-party API, so NAT is REQUIRED regardless of VPC
+  # endpoints. (A hardening follow-up could ALSO add gateway endpoints for
+  # DynamoDB + S3-for-ECR-layers and interface endpoints for
+  # ecr.api/ecr.dkr/bedrock-runtime/logs to cut AWS traffic off the NAT path;
+  # that is an additive optimization and is intentionally left out here to keep
+  # this change focused and the per-endpoint cost/complexity out of the default
+  # sample.) These resources exist only under UseVpcOriginCond, so the default
+  # UseVpcOrigin="false" deploy provisions none of them.
+  NatEip:
+    Type: AWS::EC2::EIP
+    Condition: UseVpcOriginCond
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: UseVpcOriginCond
+    Metadata:
+      # W1030: cfn-lint resolves the intentional empty-string DEFAULT of
+      # NatGatewaySubnetId against the AWS::EC2::Subnet::Id regex and flags it.
+      # This is a false positive: the empty default only exists so the stack
+      # deploys with UseVpcOrigin="false" (this resource is not created then);
+      # when UseVpcOrigin="true" a real subnet id is supplied. Same rationale as
+      # the existing W3037 ignore on TaskRole.
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W1030
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref NatGatewaySubnetId
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: UseVpcOriginCond
+    Properties:
+      VpcId: !Ref VpcId
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: UseVpcOriginCond
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  # Associate the private route table (NAT default route) with each private
+  # subnet. Two associations cover the required >=2 AZ layout; supplying a third
+  # private subnet is supported by the ALB/Service but would need a third
+  # association here. cfn-lint has no issue with associating a route table to a
+  # subnet it does not also create.
+  PrivateSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: UseVpcOriginCond
+    Metadata:
+      # W1035: on the supplied-list branch cfn-lint resolves !Select against the
+      # empty-string DEFAULT of PrivateSubnetIds (an empty list) and flags the
+      # element against the AWS::EC2::Subnet::Id regex. False positive: that
+      # branch is only taken when an operator actually supplies PrivateSubnetIds
+      # (ProvisionPrivateSubnets false); otherwise the stack-created
+      # PrivateSubnet1 is used. The empty default only keeps the "false" path
+      # deployable.
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W1035
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !If
+        - ProvisionPrivateSubnets
+        - !Ref PrivateSubnet1
+        - !Select [0, !Ref PrivateSubnetIds]
+
+  PrivateSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: UseVpcOriginCond
+    Metadata:
+      # W1035: same empty-default false positive as PrivateSubnet1RouteAssoc.
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W1035
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !If
+        - ProvisionPrivateSubnets
+        - !Ref PrivateSubnet2
+        - !Select [1, !Ref PrivateSubnetIds]
+
   # --- Application Load Balancer (WebSocket/WSS capable) ---------------------
+  # When UseVpcOrigin=true the ALB is INTERNAL (no public IP) in the private
+  # subnets and is reachable only via the CloudFront VPC origin ENI; otherwise
+  # it keeps today's internet-facing posture in the public subnets. Scheme and
+  # Subnets are both "update requires replacement" on an ALB, so flipping an
+  # already-deployed internet-facing stack to UseVpcOrigin=true REPLACES the
+  # load balancer (new ALB DNS/ARN); the VPC origin + distribution rebind to the
+  # new ALB in the same change set. See findings for the FEAT-005 rollout note.
+  # The internal ALB is IpAddressType=ipv4 (see the IpAddressType comment below).
   LoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Metadata:
+      # W1030: cfn-lint resolves the !If false branch's !Ref PrivateSubnetIds
+      # empty-string DEFAULT against the subnet-id regex. False positive: the
+      # PrivateSubnetIds branch is only selected when UseVpcOrigin="true", where
+      # real subnet ids are supplied; the empty default keeps the "false" path
+      # (which uses PublicSubnetIds) deployable. Same rationale as W3037/W1035.
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W1030
     Properties:
       Type: application
-      Scheme: internet-facing
-      Subnets: !Ref PublicSubnetIds
+      Scheme: !If [UseVpcOriginCond, internal, internet-facing]
+      # IPv4 in both postures. The VPC-origin ALB is INTERNAL (no public IP) and
+      # reached only via the CloudFront VPC origin ENI; IPv4 is sufficient for
+      # that private path. (A dualstack internal ALB would require every ALB
+      # subnet to carry an IPv6 /64 sliced from an Amazon-provided VPC block,
+      # which cannot be derived in one pass for an externally-owned VPC whose
+      # IPv6 CIDR is not a GetAtt-able stack resource, so IPv4-only is used.)
+      IpAddressType: ipv4
+      # When the stack provisions its own private subnets, use them; when an
+      # operator supplied PrivateSubnetIds, use those; otherwise (VPC origin
+      # off) the public subnets.
+      Subnets: !If
+        - UseVpcOriginCond
+        - !If
+          - ProvisionPrivateSubnets
+          - [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+          - !Ref PrivateSubnetIds
+        - !Ref PublicSubnetIds
       SecurityGroups:
         - !Ref AlbSecurityGroup
       LoadBalancerAttributes:
@@ -369,6 +709,14 @@ Resources:
   TargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
+      # A posture-specific Name forces the target group to be REPLACED in lock
+      # step with the ALB when UseVpcOrigin flips. The ALB is replaced (Scheme +
+      # Subnets require replacement); if the target group were reused, the new
+      # listener would attach the existing TG while the old listener still holds
+      # it, and ELB forbids one target group on two load balancers at once. The
+      # two names differ, so the new TG and the old TG coexist during the swap
+      # without a name collision, then the old one is cleaned up.
+      Name: !If [UseVpcOriginCond, arcol-tg-vpcorigin, arcol-tg-internet]
       VpcId: !Ref VpcId
       Port: 8080
       Protocol: HTTP
@@ -430,6 +778,27 @@ Resources:
   # managed CachingDisabled cache policy keeps the dynamic /media traffic
   # uncached. Origin read/keepalive timeouts are set to their 60s max so the
   # initial WS 101 Switching Protocols handshake is not cut off.
+  # --- CloudFront VPC origin (Option 2) -------------------------------------
+  # Creates the service-managed VPC origin that fronts the INTERNAL ALB. The
+  # distribution references it per-origin via VpcOriginConfig (below) instead of
+  # a public CustomOriginConfig/DomainName, so CloudFront reaches the origin
+  # over the private VPC-origin ENI rather than the public internet. IpAddressType
+  # ipv4 matches the IPv4 internal ALB. HTTPPort 80 + OriginProtocolPolicy
+  # http-only mirror the plaintext HTTP:80 contract the ALB listener already
+  # serves (CloudFront terminates TLS at the edge). Created only under
+  # UseVpcOriginCond.
+  VpcOrigin:
+    Type: AWS::CloudFront::VpcOrigin
+    Condition: UseVpcOriginCond
+    Properties:
+      VpcOriginEndpointConfig:
+        Name: !Sub "${AWS::StackName}-alb-vpc-origin"
+        Arn: !Ref LoadBalancer
+        HTTPPort: 80
+        HTTPSPort: 443
+        OriginProtocolPolicy: http-only
+        IpAddressType: ipv4
+
   Distribution:
     Type: AWS::CloudFront::Distribution
     Condition: EnableCf
@@ -441,15 +810,32 @@ Resources:
         HttpVersion: http2and3
         IPV6Enabled: true
         Origins:
+          # A single origin entry whose connection style is selected by the
+          # UseVpcOrigin condition. Option 2 (VPC origin): drop CustomOriginConfig
+          # and reference the service-managed VpcOrigin via VpcOriginConfig, so
+          # the origin is the INTERNAL ALB reached privately. Option 1 / plain:
+          # keep the public CustomOriginConfig to the internet-facing ALB DNS.
+          # OriginReadTimeout/OriginKeepaliveTimeout are set to their 60s max in
+          # both styles so the WebSocket 101 handshake is not cut off. DomainName
+          # is still required by CloudFront in both styles and resolves to the
+          # ALB DNS name.
           - Id: alb-origin
             DomainName: !GetAtt LoadBalancer.DNSName
-            CustomOriginConfig:
+            VpcOriginConfig: !If
+              - UseVpcOriginCond
+              - VpcOriginId: !GetAtt VpcOrigin.Id
+                OriginReadTimeout: 60
+                OriginKeepaliveTimeout: 60
+              - !Ref AWS::NoValue
+            CustomOriginConfig: !If
+              - UseVpcOriginCond
+              - !Ref AWS::NoValue
               # ALB is HTTP:80 only (no cert on the ALB); CloudFront terminates
               # TLS at the edge and talks plaintext HTTP to the origin.
-              OriginProtocolPolicy: http-only
-              HTTPPort: 80
-              OriginReadTimeout: 60
-              OriginKeepaliveTimeout: 60
+              - OriginProtocolPolicy: http-only
+                HTTPPort: 80
+                OriginReadTimeout: 60
+                OriginKeepaliveTimeout: 60
         DefaultCacheBehavior:
           TargetOriginId: alb-origin
           ViewerProtocolPolicy: redirect-to-https
@@ -536,6 +922,26 @@ Resources:
                   - HasPublicHostname
                   - !Ref PublicHostname
                   - !GetAtt LoadBalancer.DNSName
+            # GA Strands OTEL telemetry. The app configures StrandsTelemetry
+            # once at startup (before any BidiAgent.run) so the GA bidi agent
+            # loop auto-emits OTEL spans: a bidi_session span with reported token
+            # usage (gen_ai.usage.*), a bidi_response span with native TTFT
+            # (gen_ai.server.time_to_first_audio), plus tool-call and
+            # connection-restart spans. With the default OTEL_EXPORTER=console,
+            # spans are written to stdout and the awslogs LogDriver below already
+            # ships them to CloudWatch Logs -- so NO new IAM and NO new
+            # infrastructure are required for telemetry. OTEL_EXPORTER=otlp is
+            # the only setting that needs an external collector; if you adopt it,
+            # that collector's auth (not this task role) governs access.
+            - Name: OTEL_ENABLED
+              Value: !Ref OtelEnabled
+            - Name: OTEL_EXPORTER
+              Value: !Ref OtelExporter
+            - !If
+              - HasOtelEndpoint
+              - Name: OTEL_EXPORTER_OTLP_ENDPOINT
+                Value: !Ref OtelExporterOtlpEndpoint
+              - !Ref AWS::NoValue
           # Twilio credentials are injected from Secrets Manager/SSM by ARN;
           # no secret value appears in this template.
           Secrets:
@@ -557,6 +963,16 @@ Resources:
   Service:
     Type: AWS::ECS::Service
     DependsOn: Listener
+    Metadata:
+      # W1030: cfn-lint resolves the !If false branch's !Ref PrivateSubnetIds
+      # empty-string DEFAULT against the subnet-id regex. False positive: the
+      # PrivateSubnetIds branch is only selected when UseVpcOrigin="true" (real
+      # subnet ids supplied); the empty default keeps the default "false" path
+      # (public subnets) deployable. Same rationale as the W3037/W1035 ignores.
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W1030
     Properties:
       Cluster: !Ref Cluster
       LaunchType: FARGATE
@@ -564,10 +980,20 @@ Resources:
       TaskDefinition: !Ref TaskDefinition
       # >= 120s matches the ALB idle timeout so the WebSocket stays open.
       HealthCheckGracePeriodSeconds: 120
+      # When UseVpcOrigin=true the tasks run in the private subnets with NO
+      # public IP (AssignPublicIp=DISABLED) and reach Twilio/Bedrock/DynamoDB/
+      # ECR/AgentCore outbound via the NAT gateway. Otherwise they keep today's
+      # public-subnet + AssignPublicIp=ENABLED posture.
       NetworkConfiguration:
         AwsvpcConfiguration:
-          AssignPublicIp: ENABLED
-          Subnets: !Ref PublicSubnetIds
+          AssignPublicIp: !If [UseVpcOriginCond, DISABLED, ENABLED]
+          Subnets: !If
+            - UseVpcOriginCond
+            - !If
+              - ProvisionPrivateSubnets
+              - [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+              - !Ref PrivateSubnetIds
+            - !Ref PublicSubnetIds
           SecurityGroups:
             - !Ref ServiceSecurityGroup
       LoadBalancers:
@@ -726,3 +1152,13 @@ Outputs:
   CloudTrailName:
     Description: CloudTrail trail recording management events.
     Value: !Ref Trail
+  ProvisionedPrivateSubnetIds:
+    Condition: UseVpcOriginCond
+    Description: >-
+      The private subnet ids backing the internal ALB, the VPC origin ENI, and
+      the Fargate tasks when UseVpcOrigin="true": the stack-created subnets when
+      PrivateSubnetIds was left blank, else the operator-supplied list.
+    Value: !If
+      - ProvisionPrivateSubnets
+      - !Join [",", [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+      - !Join [",", !Ref PrivateSubnetIds]

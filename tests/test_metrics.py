@@ -10,15 +10,46 @@ from __future__ import annotations
 import base64
 import logging
 
+import itertools
+
 from app.metrics import CallMetrics
-from strands.experimental.bidi.types.events import (
-    BidiAudioStreamEvent,
-    BidiInterruptionEvent,
-    BidiResponseCompleteEvent,
+from strands.bidi.types.events import (
+    BidiAudioDeltaEvent,
+    BidiBargeInEvent,
     BidiResponseStartEvent,
-    BidiTranscriptStreamEvent,
+    BidiResponseStopEvent,
+    BidiToolUseBlocksEvent,
+    BidiTranscriptBlockEvent,
+    BidiTranscriptDeltaEvent,
     BidiUsageEvent,
 )
+
+# Monotonic content-id generator so each GA event carries a unique id without
+# the tests having to thread one through by hand.
+_content_ids = itertools.count()
+
+
+def _cid() -> str:
+    return f"c{next(_content_ids)}"
+
+
+def _final_transcript(text: str, role: str) -> BidiTranscriptBlockEvent:
+    """GA completed-utterance transcript (the old is_final=True transcript)."""
+    return BidiTranscriptBlockEvent(transcript=text, role=role, content_id=_cid())
+
+
+def _partial_transcript(
+    delta: str, role: str, content_id: str | None = None
+) -> BidiTranscriptDeltaEvent:
+    """GA partial transcript delta (the old is_final=False transcript).
+
+    Deltas of one utterance share a ``content_id``; pass an explicit one to
+    group consecutive deltas into the same utterance (a new/omitted id means a
+    new utterance).
+    """
+    return BidiTranscriptDeltaEvent(
+        delta=delta, role=role, content_id=content_id or _cid()
+    )
 
 
 class FakeClock:
@@ -34,8 +65,10 @@ class FakeClock:
         self.t = seconds
 
 
-def _audio_event() -> BidiAudioStreamEvent:
-    return BidiAudioStreamEvent(audio="AAAA", format="pcm", sample_rate=24000, channels=1)
+def _audio_event() -> BidiAudioDeltaEvent:
+    return BidiAudioDeltaEvent(
+        audio="AAAA", format="pcm", sample_rate=24000, channels=1, content_id=_cid()
+    )
 
 
 # Decoded byte length of the small "AAAA" payload used by _audio_event().
@@ -45,14 +78,16 @@ _SMALL_FRAME_BYTES = len(base64.b64decode("AAAA"))
 _SMALL_FRAME_MS = _SMALL_FRAME_BYTES / 48.0
 
 
-def _audio_event_bytes(num_bytes: int) -> BidiAudioStreamEvent:
-    """Build a BidiAudioStreamEvent whose decoded PCM payload is exactly
+def _audio_event_bytes(num_bytes: int) -> BidiAudioDeltaEvent:
+    """Build a BidiAudioDeltaEvent whose decoded PCM payload is exactly
     ``num_bytes`` bytes, so the Nova speaking-time contribution is deterministic.
 
     PCM16 mono 24 kHz: ms = num_bytes / (2 * 24000) * 1000 = num_bytes / 48.
     """
     payload = base64.b64encode(b"\x00" * num_bytes).decode()
-    return BidiAudioStreamEvent(audio=payload, format="pcm", sample_rate=24000, channels=1)
+    return BidiAudioDeltaEvent(
+        audio=payload, format="pcm", sample_rate=24000, channels=1, content_id=_cid()
+    )
 
 
 def test_metrics_full_synthetic_stream():
@@ -88,28 +123,18 @@ def test_metrics_full_synthetic_stream():
     m.record_event(_audio_event())
     # assistant transcript
     clock.set(1.8)
-    m.record_event(
-        BidiTranscriptStreamEvent(
-            delta=None, text="Hello, this is Ava.", role="assistant", is_final=True,
-            current_transcript="Hello, this is Ava.",
-        )
-    )
+    m.record_event(_final_transcript("Hello, this is Ava.", role="assistant"))
     # response completes at t=2.2 -> duration = 1000ms
     clock.set(2.2)
-    m.record_event(BidiResponseCompleteEvent(response_id="r1", stop_reason="complete"))
+    m.record_event(BidiResponseStopEvent(response_id="r1"))
 
-    # Barge-in while user interrupts
+    # Barge-in while user interrupts (GA event carries no reason).
     clock.set(2.5)
-    m.record_event(BidiInterruptionEvent(reason="user_speech"))
+    m.record_event(BidiBargeInEvent())
 
     # User finishes speaking (final user transcript) at t=3.0
     clock.set(3.0)
-    m.record_event(
-        BidiTranscriptStreamEvent(
-            delta=None, text="I can pay next week.", role="user", is_final=True,
-            current_transcript="I can pay next week.",
-        )
-    )
+    m.record_event(_final_transcript("I can pay next week.", role="user"))
 
     # Turn 2: response starts at t=3.2 -> latency = 3.2 - 3.0 = 200ms
     clock.set(3.2)
@@ -119,18 +144,17 @@ def test_metrics_full_synthetic_stream():
     m.record_event(_audio_event())
     # completes at t=3.9 -> duration = 700ms
     clock.set(3.9)
-    m.record_event(BidiResponseCompleteEvent(response_id="r2", stop_reason="complete"))
+    m.record_event(BidiResponseStopEvent(response_id="r2"))
 
-    # Usage
+    # Usage: GA shape - cache/modality live in input/output token details.
     clock.set(3.95)
     m.record_event(
         BidiUsageEvent(
             input_tokens=120,
             output_tokens=80,
             total_tokens=200,
-            modality_details=None,
-            cache_read_input_tokens=0,
-            cache_write_input_tokens=0,
+            input_token_details={"cache_read": 0, "text": 100, "audio": 20},
+            output_token_details={"text": 80},
         )
     )
 
@@ -245,39 +269,19 @@ def test_conversation_turns_from_alternation_with_shared_response_id():
 
     # Assistant opening turn (AI speaks first).
     clock.set(1.0)
-    m.record_event(
-        BidiTranscriptStreamEvent(
-            delta=None, text="Hello, this is Ava from billing.", role="assistant",
-            is_final=True, current_transcript="Hello, this is Ava from billing.",
-        )
-    )
+    m.record_event(_final_transcript("Hello, this is Ava from billing.", role="assistant"))
     # User replies.
     clock.set(1.5)
-    m.record_event(
-        BidiTranscriptStreamEvent(
-            delta=None, text="Hi, what is this about?", role="user",
-            is_final=True, current_transcript="Hi, what is this about?",
-        )
-    )
+    m.record_event(_final_transcript("Hi, what is this about?", role="user"))
     # Assistant replies again (still same response_id).
     clock.set(2.0)
-    m.record_event(
-        BidiTranscriptStreamEvent(
-            delta=None, text="You have a balance of fifty dollars.", role="assistant",
-            is_final=True, current_transcript="You have a balance of fifty dollars.",
-        )
-    )
+    m.record_event(_final_transcript("You have a balance of fifty dollars.", role="assistant"))
     # User replies again.
     clock.set(2.6)
-    m.record_event(
-        BidiTranscriptStreamEvent(
-            delta=None, text="Okay, I will pay tomorrow.", role="user",
-            is_final=True, current_transcript="Okay, I will pay tomorrow.",
-        )
-    )
+    m.record_event(_final_transcript("Okay, I will pay tomorrow.", role="user"))
 
     clock.set(3.0)
-    m.record_event(BidiResponseCompleteEvent(response_id="shared", stop_reason="complete"))
+    m.record_event(BidiResponseStopEvent(response_id="shared"))
     clock.set(3.5)
     m.on_session_end()
 
@@ -332,26 +336,11 @@ def test_conversation_turns_join_consecutive_same_role_finals():
     m.on_session_start()
 
     clock.set(1.0)
-    m.record_event(
-        BidiTranscriptStreamEvent(
-            delta=None, text="Hello there.", role="assistant", is_final=True,
-            current_transcript="Hello there.",
-        )
-    )
+    m.record_event(_final_transcript("Hello there.", role="assistant"))
     clock.set(1.3)
-    m.record_event(
-        BidiTranscriptStreamEvent(
-            delta=None, text="How can I help?", role="assistant", is_final=True,
-            current_transcript="How can I help?",
-        )
-    )
+    m.record_event(_final_transcript("How can I help?", role="assistant"))
     clock.set(2.0)
-    m.record_event(
-        BidiTranscriptStreamEvent(
-            delta=None, text="I need help.", role="user", is_final=True,
-            current_transcript="I need help.",
-        )
-    )
+    m.record_event(_final_transcript("I need help.", role="user"))
     clock.set(2.5)
     m.on_session_end()
 
@@ -381,26 +370,11 @@ def test_single_final_turn_total_ms_is_nonzero_elapsed():
 
     # Each turn is a SINGLE final transcript -> intra-segment span is 0 for all.
     clock.set(1.0)
-    m.record_event(
-        BidiTranscriptStreamEvent(
-            delta=None, text="Hello, this is Ava.", role="assistant", is_final=True,
-            current_transcript="Hello, this is Ava.",
-        )
-    )
+    m.record_event(_final_transcript("Hello, this is Ava.", role="assistant"))
     clock.set(2.5)
-    m.record_event(
-        BidiTranscriptStreamEvent(
-            delta=None, text="I can pay next week.", role="user", is_final=True,
-            current_transcript="I can pay next week.",
-        )
-    )
+    m.record_event(_final_transcript("I can pay next week.", role="user"))
     clock.set(4.0)
-    m.record_event(
-        BidiTranscriptStreamEvent(
-            delta=None, text="Great, thank you.", role="assistant", is_final=True,
-            current_transcript="Great, thank you.",
-        )
-    )
+    m.record_event(_final_transcript("Great, thank you.", role="assistant"))
     clock.set(6.0)
     m.on_session_end()  # total_e2e = 6000ms
 
@@ -429,26 +403,13 @@ def test_user_partial_transcript_fallback_populates_chat():
     m.on_session_start()
 
     clock.set(1.0)
-    m.record_event(
-        BidiTranscriptStreamEvent(
-            delta=None, text="Hello.", role="assistant", is_final=True,
-            current_transcript="Hello.",
-        )
-    )
-    # User only emits partial (non-final) transcripts.
+    m.record_event(_final_transcript("Hello.", role="assistant"))
+    # User only emits partial (delta) transcripts for ONE utterance (same
+    # content_id) -> accumulate to "I will pay".
     clock.set(1.5)
-    m.record_event(
-        BidiTranscriptStreamEvent(
-            delta="I", text="I", role="user", is_final=False, current_transcript="I",
-        )
-    )
+    m.record_event(_partial_transcript("I", role="user", content_id="u1"))
     clock.set(1.8)
-    m.record_event(
-        BidiTranscriptStreamEvent(
-            delta=" will pay", text="I will pay", role="user", is_final=False,
-            current_transcript="I will pay",
-        )
-    )
+    m.record_event(_partial_transcript(" will pay", role="user", content_id="u1"))
     clock.set(2.0)
     m.on_session_end()
 
@@ -457,6 +418,65 @@ def test_user_partial_transcript_fallback_populates_chat():
     assert "user" in speakers
     user_turn = next(t for t in turns if t["speaker"] == "user")
     assert user_turn["text"] == "I will pay"
+
+
+def test_partial_only_utterances_do_not_concatenate_across_content_ids():
+    """On a partial-only call with several user utterances (deltas with
+    DIFFERENT content_ids and no block), the fallback is the LATEST utterance's
+    text, not a run-on concatenation of every utterance.
+    """
+    clock = FakeClock()
+    m = CallMetrics(clock=clock)
+    clock.set(0.0)
+    m.on_session_start()
+
+    clock.set(1.0)
+    m.record_event(_final_transcript("Hello.", role="assistant"))
+
+    # Utterance 1: two deltas sharing content_id "u1".
+    clock.set(1.5)
+    m.record_event(_partial_transcript("I will", role="user", content_id="u1"))
+    clock.set(1.7)
+    m.record_event(_partial_transcript(" pay today", role="user", content_id="u1"))
+
+    # Utterance 2: a NEW content_id "u2" -> must NOT append to utterance 1.
+    clock.set(2.5)
+    m.record_event(_partial_transcript("Actually", role="user", content_id="u2"))
+    clock.set(2.7)
+    m.record_event(_partial_transcript(" next week", role="user", content_id="u2"))
+
+    clock.set(3.0)
+    m.on_session_end()
+
+    # The accumulator reflects only the latest utterance, not the concatenation.
+    assert m._last_user_partial_text == "Actually next week"
+    assert "I will pay today" not in (m._last_user_partial_text or "")
+
+    user_turns = [t for t in m.conversation_turns if t["speaker"] == "user"]
+    assert len(user_turns) == 1
+    assert user_turns[0]["text"] == "Actually next week"
+
+
+def test_user_block_final_clears_partial_fallback_accumulator():
+    """A real final (BlockEvent) takes precedence over the partial fallback and
+    resets the accumulator so a later utterance's deltas start fresh.
+    """
+    clock = FakeClock()
+    m = CallMetrics(clock=clock)
+    clock.set(0.0)
+    m.on_session_start()
+
+    clock.set(1.0)
+    m.record_event(_partial_transcript("I will", role="user", content_id="u1"))
+    clock.set(1.2)
+    # Block closes utterance u1 -> clears the partial accumulator.
+    m.record_event(_final_transcript("I will pay today.", role="user"))
+    assert m._last_user_partial_text is None
+
+    # A fresh partial-only utterance accumulates on its own, uncontaminated.
+    clock.set(2.0)
+    m.record_event(_partial_transcript("Thanks", role="user", content_id="u2"))
+    assert m._last_user_partial_text == "Thanks"
 
 
 def test_metrics_emits_json_log_lines_for_lifecycle(caplog):
@@ -504,9 +524,9 @@ def test_ttft_attributed_to_newest_open_turn_under_overlap():
     m.record_event(_audio_event())
 
     clock.set(2.0)
-    m.record_event(BidiResponseCompleteEvent(response_id="r2", stop_reason="complete"))
+    m.record_event(BidiResponseStopEvent(response_id="r2"))
     clock.set(2.1)
-    m.record_event(BidiResponseCompleteEvent(response_id="r1", stop_reason="interrupted"))
+    m.record_event(BidiResponseStopEvent(response_id="r1"))
     clock.set(3.0)
     m.on_session_end()
 
@@ -520,8 +540,8 @@ def test_nova_total_ms_sums_audio_not_response_window_regression():
 
     Nova Sonic reuses ONE response_id for the whole call: it fires many
     BidiResponseStartEvent (one per speech burst) but only a single late
-    BidiResponseCompleteEvent at call end. The OLD metric summed the
-    response_start..complete windows, so it measured only the last window and
+    BidiResponseStopEvent at call end. The OLD metric summed the
+    response_start..stop windows, so it measured only the last window and
     badly under-counted. The corrected nova_total_ms sums the actual outbound
     audio-frame durations.
 
@@ -558,10 +578,10 @@ def test_nova_total_ms_sums_audio_not_response_window_regression():
     clock.set(3.0)
     m.record_event(_audio_event_bytes(frame_bytes[2]))
 
-    # ONE late response_complete at call end (stop_reason incomplete-ish). The
-    # response-window sum therefore captures only a small slice of the call.
+    # ONE late response_stop at call end. The response-window sum therefore
+    # captures only a small slice of the call.
     clock.set(10.0)
-    m.record_event(BidiResponseCompleteEvent(response_id="shared", stop_reason="complete"))
+    m.record_event(BidiResponseStopEvent(response_id="shared"))
     clock.set(12.0)
     m.on_session_end()
 
@@ -572,7 +592,7 @@ def test_nova_total_ms_sums_audio_not_response_window_regression():
 
     # The old erroneous response-window sum does NOT equal the corrected
     # audio-derived value: repeated response_start events reusing one id each
-    # overwrote the open-turn start, so the single late response_complete
+    # overwrote the open-turn start, so the single late response_stop
     # measures a bogus window (here 7000ms) unrelated to the 1750ms Nova
     # actually spoke. This inequality is exactly what would fail under the old
     # calc (where nova_total_ms WAS the window sum).
@@ -597,33 +617,13 @@ def test_per_utterance_turn_model_counts_each_utterance():
     # Alternation that also includes TWO consecutive same-role (assistant)
     # finals, to prove they are counted as two separate utterance turns.
     clock.set(1.0)
-    m.record_event(
-        BidiTranscriptStreamEvent(
-            delta=None, text="Hello, this is Ava.", role="assistant", is_final=True,
-            current_transcript="Hello, this is Ava.",
-        )
-    )
+    m.record_event(_final_transcript("Hello, this is Ava.", role="assistant"))
     clock.set(1.4)
-    m.record_event(
-        BidiTranscriptStreamEvent(
-            delta=None, text="How can I help you today?", role="assistant", is_final=True,
-            current_transcript="How can I help you today?",
-        )
-    )
+    m.record_event(_final_transcript("How can I help you today?", role="assistant"))
     clock.set(2.0)
-    m.record_event(
-        BidiTranscriptStreamEvent(
-            delta=None, text="I can pay next week.", role="user", is_final=True,
-            current_transcript="I can pay next week.",
-        )
-    )
+    m.record_event(_final_transcript("I can pay next week.", role="user"))
     clock.set(2.8)
-    m.record_event(
-        BidiTranscriptStreamEvent(
-            delta=None, text="Great, I will note that.", role="assistant", is_final=True,
-            current_transcript="Great, I will note that.",
-        )
-    )
+    m.record_event(_final_transcript("Great, I will note that.", role="assistant"))
     clock.set(4.0)
     m.on_session_end()
 
@@ -660,12 +660,57 @@ def test_per_utterance_turn_model_counts_each_utterance():
     assert m.conversation_turns[0]["text"] == "Hello, this is Ava. How can I help you today?"
 
 
-def test_unmatched_response_complete_without_start_is_safe():
+def test_unmatched_response_stop_without_start_is_safe():
     clock = FakeClock()
     m = CallMetrics(clock=clock)
     clock.set(0.0)
     m.on_session_start()
     clock.set(0.5)
-    # Complete with no prior start -> must not raise, no turn recorded.
-    m.record_event(BidiResponseCompleteEvent(response_id="ghost", stop_reason="complete"))
+    # Stop with no prior start -> must not raise, no turn recorded.
+    m.record_event(BidiResponseStopEvent(response_id="ghost"))
     assert len(m.turns) == 0
+
+
+def test_tool_use_blocks_emit_one_invocation_per_tool():
+    """GA groups tool calls in BidiToolUseBlocksEvent; one invocation each."""
+    clock = FakeClock()
+    m = CallMetrics(clock=clock)
+    clock.set(0.0)
+    m.on_session_start()
+    clock.set(0.5)
+    m.record_event(
+        BidiToolUseBlocksEvent(
+            tool_uses=[
+                {"name": "update_due_record", "input": {}, "toolUseId": "t1"},
+                {"name": "capture_payment_date_phrase", "input": {}, "toolUseId": "t2"},
+            ]
+        )
+    )
+    tool_events = [e for e in m.events_log if e["event_type"] == "tool_invocation"]
+    assert [e["tool"] for e in tool_events] == [
+        "update_due_record",
+        "capture_payment_date_phrase",
+    ]
+
+
+def test_usage_adapts_ga_token_details():
+    """GA BidiUsageEvent: cache_read comes from input_token_details."""
+    clock = FakeClock()
+    m = CallMetrics(clock=clock)
+    clock.set(0.0)
+    m.on_session_start()
+    m.record_event(
+        BidiUsageEvent(
+            input_tokens=120,
+            output_tokens=80,
+            total_tokens=200,
+            input_token_details={"cache_read": 15, "text": 90, "audio": 15},
+            output_token_details={"text": 80},
+        )
+    )
+    assert m.usage["input_tokens"] == 120
+    assert m.usage["output_tokens"] == 80
+    assert m.usage["total_tokens"] == 200
+    assert m.usage["cache_read_input_tokens"] == 15
+    assert m.usage["modality_details"]["input"]["audio"] == 15
+    assert m.usage["modality_details"]["output"]["text"] == 80
