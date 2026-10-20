@@ -70,6 +70,11 @@ export interface ConversationTurn {
   // same values and are kept until the backend drops them).
   turn_elapsed_ms?: number | null;
   total_ms?: number | null;
+  // FEAT-004: caller->reply gap (time from the caller finishing speaking to
+  // the agent beginning its reply), present only when a genuine caller turn
+  // precedes this assistant turn. response_wait_ms / latency_ms are kept as
+  // backward-compatible aliases carrying the same value.
+  caller_reply_gap_ms?: number | null;
   response_wait_ms?: number | null;
   latency_ms?: number | null;
   transcript_span_ms?: number | null;

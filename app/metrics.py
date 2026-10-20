@@ -58,12 +58,16 @@ Approximations (documented here and in FEAT-003 findings):
   NOT a transport-latency measurement; the transport estimate above is a
   separate, independently-derived figure.
 
-Terminology (ASK 1, from FEAT-001): per conversational turn the app exposes
-``response_wait_ms`` (time for Sonic to begin answering; the value previously
-MISLABELED ``latency_ms``, kept as a deprecated alias), ``ttft_ms`` (official
-time-to-first-audio, ``gen_ai.server.time_to_first_audio``) with an honest
-``ttft_source``, ``turn_elapsed_ms`` (turn-elapsed; alias of ``total_ms``) and
-``transcript_span_ms`` (spoken duration).
+Terminology (ASK 1, from FEAT-001; corrected in FEAT-004): per conversational
+turn the app exposes ``caller_reply_gap_ms`` (the caller->assistant gap: time
+from the caller finishing speaking to the agent beginning its reply, present
+ONLY when a genuine caller turn directly precedes this assistant turn -- None
+otherwise, never a turn-to-turn gap; ``response_wait_ms`` and the older
+``latency_ms`` are kept as backward-compatible aliases carrying the SAME value),
+``ttft_ms`` (official time-to-first-audio, ``gen_ai.server.time_to_first_audio``)
+with an honest ``ttft_source``, ``turn_elapsed_ms`` (turn-elapsed; alias of
+``total_ms``) and ``transcript_span_ms`` (spoken duration). The caller->reply
+gap is NOT the same thing as TTFT; they are reported independently.
 """
 
 from __future__ import annotations
@@ -668,6 +672,13 @@ class CallMetrics:
 
         session_end_ms = self.total_e2e_ms
         prev_user_end_ms: float | None = None
+        # Tracks whether the turn IMMEDIATELY preceding the current one is a
+        # genuine caller (user) turn. The caller->reply gap is only meaningful
+        # when a real caller turn directly precedes an assistant turn; on an
+        # AI-first call Nova speaks consecutive assistant turns with no caller
+        # utterance between them, and the gap there is a turn-to-turn gap, NOT a
+        # caller wait.
+        prev_turn_was_user = False
         for i, seg in enumerate(turns):
             seg["text"] = " ".join(seg.pop("_texts")).strip()
             start_ms = seg.get("start_ms")
@@ -701,40 +712,56 @@ class CallMetrics:
             seg["total_ms"] = total_ms
 
             if seg["speaker"] == "assistant":
-                # Per-utterance "response wait": from when the caller last
-                # finished speaking (preceding user turn's last final transcript)
-                # to this assistant turn's first final transcript, i.e. how long
-                # the caller waited for Sonic to BEGIN answering. This is a
-                # response-WAIT window, NOT model/network latency, and is
-                # derivable for EVERY assistant turn unlike the shared response
-                # window. ASK 1: it is exposed under the accurate name
-                # ``response_wait_ms`` (``latency_ms`` is kept as a deprecated
-                # backward-compatible alias with the SAME value).
-                response_wait_ms: float | None = None
-                if prev_user_end_ms is not None and start_ms is not None:
-                    response_wait_ms = round(max(start_ms - prev_user_end_ms, 0.0), 3)
+                # Caller->reply gap (FEAT-004 / DEFECT D1): time from when the
+                # caller last FINISHED speaking (the immediately-preceding user
+                # turn's last final transcript) to this assistant turn's first
+                # final transcript, i.e. how long the caller waited for Sonic to
+                # BEGIN answering. This is ONLY meaningful when a genuine caller
+                # turn directly precedes this assistant turn. On an AI-first call
+                # Nova speaks consecutive assistant turns with no intervening
+                # caller utterance; the gap between two assistant turns is a
+                # turn-to-turn gap, NOT a caller wait, so it must be None here
+                # (no turn-to-turn fallback). This is NOT the same thing as TTFT
+                # (time to first audio); the two are reported independently.
+                caller_reply_gap_ms: float | None = None
+                if (
+                    prev_turn_was_user
+                    and prev_user_end_ms is not None
+                    and start_ms is not None
+                ):
+                    caller_reply_gap_ms = round(max(start_ms - prev_user_end_ms, 0.0), 3)
 
                 timing = self._closest_timing(start_ms, assistant_timings, used_timing)
                 if timing is not None:
                     seg["ttft_ms"] = timing.get("ttft_ms")
                     seg["ttft_source"] = "response_window"
-                    # Prefer the response-window wait when we have it (it is the
-                    # user-stop -> response_start measure); else keep the
-                    # per-utterance transcript-derived wait.
-                    if timing.get("turn_latency_ms") is not None:
-                        response_wait_ms = timing.get("turn_latency_ms")
+                    # Prefer the response-window measure (user-stop ->
+                    # response_start) ONLY when a real caller turn precedes this
+                    # assistant turn; otherwise there is no caller wait to show.
+                    if (
+                        prev_turn_was_user
+                        and timing.get("turn_latency_ms") is not None
+                    ):
+                        caller_reply_gap_ms = timing.get("turn_latency_ms")
                 else:
                     # No response window left for this turn (Nova reused one
                     # response_id). We cannot derive a true per-utterance first-
-                    # token time, so TTFT is honestly unavailable; the response
-                    # wait still comes from the transcript gap above.
+                    # token time, so TTFT is honestly unavailable.
                     seg["ttft_ms"] = None
                     seg["ttft_source"] = "unavailable"
-                # Accurate name (ASK 1) + deprecated backward-compatible alias.
-                seg["response_wait_ms"] = response_wait_ms
-                seg["latency_ms"] = response_wait_ms
-            elif seg["speaker"] == "user" and end_ms is not None:
-                prev_user_end_ms = end_ms
+                # Accurate name (FEAT-004) + backward-compatible aliases carrying
+                # the SAME (now-correct, possibly-null) value so older frontends
+                # do not break.
+                seg["caller_reply_gap_ms"] = caller_reply_gap_ms
+                seg["response_wait_ms"] = caller_reply_gap_ms
+                seg["latency_ms"] = caller_reply_gap_ms
+                prev_turn_was_user = False
+            elif seg["speaker"] == "user":
+                if end_ms is not None:
+                    prev_user_end_ms = end_ms
+                prev_turn_was_user = True
+            else:
+                prev_turn_was_user = False
 
         # ASK 1: expose the turn-elapsed time under an accurate name alongside
         # the legacy ``total_ms`` key the frontend currently reads.

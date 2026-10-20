@@ -181,9 +181,15 @@ def test_metrics_full_synthetic_stream():
     assert [t["speaker"] for t in m.conversation_turns] == ["assistant", "user"]
     assert m.conversation_turns[0]["text"] == "Hello, this is Ava."
     assert m.conversation_turns[1]["text"] == "I can pay next week."
-    # Assistant conversational turn carries ttft/latency from nearest response.
+    # Assistant conversational turn carries ttft from the nearest response.
     assert m.conversation_turns[0]["ttft_ms"] == 300.0
-    assert m.conversation_turns[0]["latency_ms"] == 160.0
+    # FEAT-004: this is the OPENING assistant turn (AI-first) with no caller
+    # turn preceding it, so the caller->reply gap is None (never a turn-to-turn
+    # gap), and the backward-compat aliases mirror that None. The raw response
+    # window's turn_latency_ms (asserted below on m.turns) is unaffected.
+    assert m.conversation_turns[0]["caller_reply_gap_ms"] is None
+    assert m.conversation_turns[0]["response_wait_ms"] is None
+    assert m.conversation_turns[0]["latency_ms"] is None
     # Every conversational turn exposes total_ms.
     for t in m.conversation_turns:
         assert "total_ms" in t
@@ -721,8 +727,13 @@ def test_conversation_turns_expose_accurate_ask1_field_names():
     turns = m.conversation_turns
     later_assistant = turns[2]
     assert later_assistant["speaker"] == "assistant"
-    # Accurate name present AND equal to the legacy alias.
+    # FEAT-004: this assistant turn is directly preceded by a REAL caller turn
+    # ("What is this about?") so the caller->reply gap IS computed, and the
+    # backward-compat aliases carry the same value.
+    assert "caller_reply_gap_ms" in later_assistant
     assert "response_wait_ms" in later_assistant
+    assert later_assistant["caller_reply_gap_ms"] == 500.0
+    assert later_assistant["response_wait_ms"] == later_assistant["caller_reply_gap_ms"]
     assert later_assistant["response_wait_ms"] == later_assistant["latency_ms"]
     assert later_assistant["response_wait_ms"] == 500.0
     # turn_elapsed_ms is present on every turn and aliases total_ms.
@@ -732,6 +743,91 @@ def test_conversation_turns_expose_accurate_ask1_field_names():
     # ttft_source stays honest for the later (unmatched) assistant turn.
     assert later_assistant["ttft_source"] == "unavailable"
     assert turns[0]["ttft_source"] == "response_window"
+
+
+def test_caller_reply_gap_none_for_ai_first_assistant_turns():
+    """FEAT-004 (DEFECT D1): on an AI-first call the agent opens the
+    conversation with assistant speech and no caller has spoken yet, so there
+    is NO caller->reply gap to measure. The leading assistant turn (and any
+    assistant turn not directly preceded by a genuine caller turn) must report
+    ``caller_reply_gap_ms`` is None -- never a turn-to-turn gap -- and the
+    backward-compat aliases must mirror that None. Fails if the old
+    transcript-gap fallback is reintroduced.
+    """
+    clock = FakeClock()
+    m = CallMetrics(call_sid="CA-AIFIRST", account_id="ACC-1001", clock=clock)
+    clock.set(0.0)
+    m.on_session_start()
+    # AI-first: the agent speaks first (two separate response windows) with no
+    # caller utterance in between -> these group into the leading assistant
+    # turn, which has no preceding caller turn.
+    clock.set(0.5)
+    m.record_event(BidiResponseStartEvent(response_id="r1"))
+    clock.set(0.8)
+    m.record_event(_audio_event())
+    clock.set(1.0)
+    m.record_event(_final_transcript("Hi, this is Ava from billing.", role="assistant"))
+    clock.set(2.0)
+    m.record_event(_final_transcript("I'm calling about your account.", role="assistant"))
+    clock.set(3.0)
+    m.record_event(BidiResponseStopEvent(response_id="r1"))
+    clock.set(3.5)
+    m.on_session_end()
+
+    turns = m.conversation_turns
+    # Consecutive assistant finals with no caller between group into one leading
+    # assistant turn with no preceding caller turn.
+    first_assistant = turns[0]
+    assert first_assistant["speaker"] == "assistant"
+    assert first_assistant["caller_reply_gap_ms"] is None
+    # Backward-compat aliases carry the same (None) value.
+    assert first_assistant["response_wait_ms"] is None
+    assert first_assistant["latency_ms"] is None
+    # turn_elapsed_ms is unaffected by the gap semantics (still present).
+    assert first_assistant["turn_elapsed_ms"] == first_assistant["total_ms"]
+
+
+def test_caller_reply_gap_computed_only_after_a_real_caller_turn():
+    """FEAT-004: the caller->reply gap is computed as
+    ``start_ms - prev_user_end_ms`` ONLY for an assistant turn that is directly
+    preceded by a genuine caller (user) turn. An assistant turn that opens the
+    call (no caller yet) must be None, and the one immediately after the caller
+    stops must carry the real gap. The alias equals the new field.
+    """
+    clock = FakeClock()
+    m = CallMetrics(call_sid="CA-GAP", account_id="ACC-1001", clock=clock)
+    clock.set(0.0)
+    m.on_session_start()
+    # Leading assistant turn (AI-first) -> gap must be None.
+    clock.set(1.0)
+    m.record_event(_final_transcript("Hello, this is Ava.", role="assistant"))
+    # Caller replies, finishing at t=2.0s (t_ms=2000).
+    clock.set(2.0)
+    m.record_event(_final_transcript("Okay, go ahead.", role="user"))
+    # Agent answers, first final at t=2.4s (t_ms=2400) -> gap 400ms.
+    clock.set(2.4)
+    m.record_event(_final_transcript("You owe fifty dollars.", role="assistant"))
+    clock.set(3.0)
+    m.on_session_end()
+
+    turns = m.conversation_turns
+    leading, caller, reply = turns[0], turns[1], turns[2]
+    assert leading["speaker"] == "assistant"
+    assert caller["speaker"] == "user"
+    assert reply["speaker"] == "assistant"
+
+    # AI-first leading assistant turn: no caller preceded -> None.
+    assert leading["caller_reply_gap_ms"] is None
+    assert leading["response_wait_ms"] is None
+
+    # Assistant turn directly after a real caller turn: gap = 2400 - 2000.
+    assert reply["caller_reply_gap_ms"] == 400.0
+    assert reply["response_wait_ms"] == reply["caller_reply_gap_ms"]
+    assert reply["latency_ms"] == reply["caller_reply_gap_ms"]
+
+    # turn_elapsed_ms is unchanged by the gap fix (aliases total_ms everywhere).
+    for t in turns:
+        assert t["turn_elapsed_ms"] == t["total_ms"]
 
 
 def test_sync_tool_calls_attached_to_nearest_assistant_turn():
