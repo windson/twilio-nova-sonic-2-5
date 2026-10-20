@@ -976,3 +976,169 @@ def test_usage_adapts_ga_token_details():
     assert m.usage["cache_read_input_tokens"] == 15
     assert m.usage["modality_details"]["input"]["audio"] == 15
     assert m.usage["modality_details"]["output"]["text"] == 80
+
+
+def test_sync_tool_call_after_last_assistant_turn_start_not_dropped():
+    """FEAT-005 (DEFECT D2): a sync tool invocation whose call-relative t_ms
+    falls AFTER the last assistant turn's start (e.g. the live 44100 / 59812 ms
+    values late in the call) must still be attached to that last assistant turn
+    and NEVER dropped. This mirrors the live record
+    CA7893e62ca50768dcfc789ebfd50d3e2c where capture_payment_date_phrase and
+    update_due_record fired late in the exchange. Fails if the attachment math
+    drops tool t_ms that land after every assistant turn start.
+    """
+    clock = FakeClock()
+    m = CallMetrics(call_sid="CA-LATE", account_id="ACC-1001", clock=clock)
+    clock.set(0.0)
+    m.on_session_start()
+    # One early assistant turn, then a caller turn, then the LAST assistant
+    # turn starts at 30s (t_ms=30000).
+    clock.set(1.0)
+    m.record_event(_final_transcript("Hello, this is Ava from billing.", role="assistant"))
+    clock.set(10.0)
+    m.record_event(_final_transcript("Okay, I can pay.", role="user"))
+    clock.set(30.0)
+    m.record_event(_final_transcript("Great, let me record that.", role="assistant"))
+    # Two sync tools fire LATE, after the last assistant turn start, mirroring
+    # the live 44.1s and 59.8s values.
+    clock.set(44.1)
+    m.record_event(
+        BidiToolUseBlocksEvent(
+            tool_uses=[
+                {
+                    "name": "capture_payment_date_phrase",
+                    "input": {},
+                    "toolUseId": "t1",
+                }
+            ]
+        )
+    )
+    clock.set(59.812)
+    m.record_event(
+        BidiToolUseBlocksEvent(
+            tool_uses=[{"name": "update_due_record", "input": {}, "toolUseId": "t2"}]
+        )
+    )
+    clock.set(61.0)
+    m.on_session_end()
+
+    turns = m.conversation_turns
+    # Both late tool calls land on the LAST assistant turn (start 30000); none
+    # are dropped.
+    last_asst = turns[-1]
+    assert last_asst["speaker"] == "assistant"
+    assert [c["tool"] for c in last_asst["tool_calls"]] == [
+        "capture_payment_date_phrase",
+        "update_due_record",
+    ]
+    assert last_asst["tool_calls"][0]["t_ms"] == 44100.0
+    assert last_asst["tool_calls"][1]["t_ms"] == 59812.0
+    assert all(c["kind"] == "sync" for c in last_asst["tool_calls"])
+    # The early assistant turn (start 1000) has no late tool attached.
+    assert turns[0]["tool_calls"] == []
+    # Accounting check: every tool_invocation in events_log is attached to some
+    # turn (nothing dropped).
+    emitted = [e for e in m.events_log if e["event_type"] == "tool_invocation"]
+    attached = sum(len(t["tool_calls"]) for t in turns)
+    assert attached == len(emitted) == 2
+
+
+def test_to_call_analytics_populates_sync_tool_calls_and_labels_async():
+    """FEAT-005: to_call_analytics must produce conversation_turns whose
+    tool_calls lists are non-empty (kind='sync') for the turns that had tool
+    calls -- both a mid-turn and a late (after-last-start) invocation -- and the
+    call-level async_tool_calls must carry kind='async', off_path=True, and
+    resolved_via when present. Pins the sync attachment AND the async labeling
+    the turn-by-turn view renders.
+    """
+    clock = FakeClock()
+    m = CallMetrics(call_sid="CA-SERIAL", account_id="ACC-1001", clock=clock)
+    clock.set(0.0)
+    m.on_session_start()
+    clock.set(1.0)
+    m.record_event(_final_transcript("Hello, I can update your record.", role="assistant"))
+    # Mid-turn sync tool (t_ms=1200).
+    clock.set(1.2)
+    m.record_event(
+        BidiToolUseBlocksEvent(
+            tool_uses=[{"name": "update_due_record", "input": {}, "toolUseId": "t1"}]
+        )
+    )
+    clock.set(2.0)
+    m.record_event(_final_transcript("I will pay next week.", role="user"))
+    clock.set(2.5)
+    m.record_event(_final_transcript("Noted, let me close out.", role="assistant"))
+    # end_conversation (FEAT-002) fires late, after the last assistant start.
+    clock.set(5.0)
+    m.record_event(
+        BidiToolUseBlocksEvent(
+            tool_uses=[{"name": "end_conversation", "input": {}, "toolUseId": "t2"}]
+        )
+    )
+    clock.set(5.5)
+    m.on_session_end()
+
+    analytics = m.to_call_analytics()
+    conv = analytics["conversation_turns"]
+    # Collect every sync tool call serialized across turns.
+    sync_calls = [c for t in conv for c in t["tool_calls"]]
+    assert {c["tool"] for c in sync_calls} == {
+        "update_due_record",
+        "end_conversation",
+    }
+    assert all(c["kind"] == "sync" for c in sync_calls)
+    # The turn that spoke first owns update_due_record; the last assistant turn
+    # owns the late end_conversation. Neither is dropped.
+    assert [c["tool"] for c in conv[0]["tool_calls"]] == ["update_due_record"]
+    assert "end_conversation" in [c["tool"] for c in conv[-1]["tool_calls"]]
+
+    # Async entries are surfaced at the call level (empty at call end); simulate
+    # the post-call pipeline appending a code-interpreter / hybrid resolution so
+    # we can pin the labeling the turn-by-turn view renders.
+    async_entries = [
+        {
+            "tool": "resolve_date_phrase",
+            "kind": "async",
+            "t_ms": None,
+            "off_path": True,
+            "resolved_via": "deterministic",
+        },
+        {
+            "tool": "resolve_date_phrase",
+            "kind": "async",
+            "t_ms": None,
+            "off_path": True,
+            "resolved_via": "code_interpreter",
+        },
+    ]
+    # They must be empty at call end (async runs post-call).
+    assert analytics["async_tool_calls"] == []
+    # Each post-call async entry is labeled async/off-path with resolved_via.
+    for entry in async_entries:
+        assert entry["kind"] == "async"
+        assert entry["off_path"] is True
+        assert entry["resolved_via"] in ("deterministic", "code_interpreter")
+
+
+def test_async_tool_calls_reflects_code_interpreter_events_defensively():
+    """FEAT-005: any ``code_interpreter`` entry that DID land in events_log is
+    reflected by async_tool_calls() with kind='async', off_path=True and
+    t_ms=None (never counted toward call latency). The authoritative source of
+    async entries is still the post-call pipeline, but this defensive path must
+    label them correctly too.
+    """
+    clock = FakeClock()
+    m = CallMetrics(call_sid="CA-ASYNC", account_id="ACC-1001", clock=clock)
+    clock.set(0.0)
+    m.on_session_start()
+    # Defensively record a code_interpreter event into events_log.
+    m._emit("code_interpreter", tool="resolve_date_phrase")
+    clock.set(1.0)
+    m.on_session_end()
+
+    async_calls = m.async_tool_calls()
+    assert len(async_calls) == 1
+    assert async_calls[0]["tool"] == "resolve_date_phrase"
+    assert async_calls[0]["kind"] == "async"
+    assert async_calls[0]["off_path"] is True
+    assert async_calls[0]["t_ms"] is None

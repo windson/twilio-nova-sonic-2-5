@@ -52,6 +52,11 @@ export interface ToolCall {
   // Present and true on async (post-call) entries: they do NOT add call
   // latency.
   off_path?: boolean;
+  // FEAT-003/FEAT-005: on async date-resolution entries, which tier of the
+  // hybrid resolver produced the answer ('deterministic' | 'code_interpreter'
+  // | 'unresolved'), surfaced on the async tool chip so the resolution path is
+  // visible in the turn-by-turn view.
+  resolved_via?: string | null;
 }
 
 // ASK 7: an inline barge-in marker interleaved into the conversation timeline.

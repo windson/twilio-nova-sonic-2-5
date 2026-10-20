@@ -927,6 +927,8 @@ function ToolCalls({ calls }: { calls: ToolCall[] }) {
     <div className="flex flex-wrap gap-1">
       {calls.map((c, i) => {
         const async = c.kind === "async" || c.off_path === true;
+        const resolvedVia =
+          async && c.resolved_via ? String(c.resolved_via) : null;
         return (
           <Badge
             key={i}
@@ -939,15 +941,16 @@ function ToolCalls({ calls }: { calls: ToolCall[] }) {
             }
             title={
               async
-                ? "async / post-call tool (off-path, adds no call latency)"
+                ? "async / off-path tool (post-call, adds no call latency)" +
+                  (resolvedVia ? ` \u2014 resolved via ${resolvedVia}` : "")
                 : c.t_ms != null
                   ? `sync in-call tool at ${fmtMs(c.t_ms)}`
                   : "sync in-call tool"
             }
           >
-            {c.tool || "tool"} &middot; {async ? "async" : "sync"}
+            {c.tool || "tool"} &middot; {async ? "async / off-path" : "sync"}
             {!async && c.t_ms != null ? ` \u00b7 ${fmtMs(c.t_ms)}` : ""}
-            {async ? " \u00b7 off-path" : ""}
+            {resolvedVia ? ` \u00b7 via ${resolvedVia}` : ""}
           </Badge>
         );
       })}
