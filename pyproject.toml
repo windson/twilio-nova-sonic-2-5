@@ -5,11 +5,20 @@ description = "AI-first-initiated outbound Accounts Receivable Collections voice
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "strands-agents[bidi]",
-    # strands-agents 1.53.0 bidi (strands.experimental.bidi.models.nova_sonic)
-    # imports BedrockRuntimeClient and config.Config from aws-sdk-bedrock-runtime.
-    # Those symbols were renamed/removed in 0.10.0+, so pin below 0.10.0.
-    "aws-sdk-bedrock-runtime>=0.4.0,<0.10.0",
+    # GA Strands Bidi Agents: strands.bidi namespace (BidiAgent,
+    # BedrockNovaSonicModel, AudioIO) plus GA OTEL telemetry
+    # (strands.telemetry.StrandsTelemetry). First shipped around 1.54.0;
+    # 1.61.1 is confirmed to contain strands/bidi/. The experimental
+    # strands.experimental.bidi namespace is retained as a shim in GA.
+    "strands-agents[bidi]>=1.61,<2",
+    # The GA strands.bidi.models.bedrock provider imports the newer
+    # AsyncBedrockRuntimeClient / AsyncBedrockRuntimeConfig / HTTPAuthSchemeResolver
+    # / SigV4AuthScheme symbols from aws-sdk-bedrock-runtime. The old
+    # experimental model needed BedrockRuntimeClient + config.Config, which the
+    # <0.10.0 pin preserved; the GA model needs the >=0.11 API instead. The
+    # strands-agents[bidi] extra itself requires >=0.11,<0.12 (py>=3.12), so
+    # align the direct pin with that range.
+    "aws-sdk-bedrock-runtime>=0.11,<0.12",
     "boto3",
     # AWS Bedrock AgentCore Code Interpreter client used off the real-time
     # audio path (post-call async) to resolve natural-language dates by
