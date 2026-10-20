@@ -294,6 +294,68 @@ def test_get_call_unknown_id_returns_404(store):
     assert resp.status_code == 404
 
 
+def test_call_dashboard_url_scoped_to_call_sid_and_config(store):
+    """ASK 4: both the /api/calls list summary and the full /api/calls/{id}
+    record carry a per-call CloudWatch dashboard deep-link that is scoped to the
+    call_sid and built from the configured region + app log group (no live AWS
+    call). The link opens a consolidated Logs Insights view filtered to the
+    call. Fails if the dashboard_url is dropped, is not scoped to the call, or
+    ignores the configured log group/region.
+    """
+    analytics = {
+        "call_sid": "CA_dash",
+        "account_id": "ACC-1001",
+        "total_e2e_ms": 5000.0,
+        "turn_count": 2,
+    }
+    store.save_call_analytics(analytics)
+
+    custom = _settings(
+        aws_region="eu-west-1",
+        app_log_group="/ecs/my-stack/app",
+    )
+    with patch("app.main.get_settings", return_value=custom):
+        summary = next(
+            c
+            for c in client.get("/api/calls").json()["calls"]
+            if c["call_sid"] == "CA_dash"
+        )
+        full = client.get("/api/calls/CA_dash").json()
+
+    for url in (summary["dashboard_url"], full["dashboard_url"]):
+        assert url
+        # Built from the configured region (host + region query param).
+        assert "eu-west-1.console.aws.amazon.com" in url
+        assert "region=eu-west-1" in url
+        # Consolidated CloudWatch Logs Insights (dashboard) deep-link.
+        assert "#logsV2:logs-insights" in url
+        assert "queryDetail" in url
+        # Scoped to THIS call_sid (console-token encoded: filter call_sid = ...).
+        assert "CA_dash" in url
+        # References the configured app log group (console-token encoded "/" ->
+        # "*2F"), not the default group.
+        assert "*2Fecs*2Fmy-stack*2Fapp" in url
+        assert "ar-collections-nova-sonic" not in url
+
+
+def test_call_dashboard_url_builder_unit():
+    """Unit-level assertions on the pure string builder: the query filters by
+    call_sid against the given log group and surfaces the metric fields.
+    """
+    from app.dashboard import call_dashboard_query, call_dashboard_url
+
+    q = call_dashboard_query("CA_unit", "/ecs/s/app")
+    assert "SOURCE '/ecs/s/app'" in q
+    assert "filter call_sid = 'CA_unit'" in q
+    for field in ("ttft_ms", "turn_latency_ms", "duration_ms", "total_tokens"):
+        assert field in q
+
+    url = call_dashboard_url("CA_unit", aws_region="us-west-2", app_log_group="/ecs/s/app")
+    assert url.startswith("https://us-west-2.console.aws.amazon.com/cloudwatch/home")
+    assert "#logsV2:logs-insights$3FqueryDetail$3D" in url
+    assert "CA_unit" in url
+
+
 async def test_launch_postcall_registers_offpath_task_and_discards_on_done(store):
     """LAUNCH-POINT guard: ``_launch_postcall`` (the seam called from the /media
     websocket teardown) must create an asyncio task, register it in the

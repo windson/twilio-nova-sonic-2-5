@@ -29,6 +29,9 @@ export interface CallSummary {
   barge_in_count?: number | null;
   disposition?: string | null;
   intelligence_status?: string | null;
+  // ASK 4: backend-built per-call CloudWatch dashboard deep-link (config-built,
+  // scoped to this call_sid). The UI prefers this over client-side building.
+  dashboard_url?: string | null;
 }
 
 export interface Turn {
@@ -154,6 +157,8 @@ export interface CallRecord {
   ptp_sms_status?: string | null;
   ptp_sms_to?: string | null;
   triggers?: string[];
+  // ASK 4: backend-built per-call CloudWatch dashboard deep-link.
+  dashboard_url?: string | null;
 }
 
 export interface AppConfig {
@@ -309,23 +314,55 @@ export function dispositionLabel(disposition?: string | null): string {
     .join(" ");
 }
 
-// Build the CloudWatch Logs console deep link scoped to a single call. This is
-// a verbatim port of web/app.js cloudwatchLogsUrl: the log-group path is
-// double-URL-encoded (each "/" -> "%2F" -> console "$252F"), and "?"/"="
-// inside the fragment are written as the console's "$3F"/"$3D" escapes; the
-// call_sid is passed as a PLAIN filterPattern term (not quoted).
-export function cloudwatchLogsUrl(
+// ASK 4: build the consolidated per-call CloudWatch DASHBOARD deep-link scoped
+// to a single call_sid. This opens a CloudWatch Logs Insights view filtered to
+// the call that surfaces TTFT, turns, token usage, barge-ins, tool invocations,
+// transport and the call timeline by parsing the app's JSON-line logs. The
+// backend returns this same URL on each call record (dashboard_url); this
+// client-side builder mirrors that construction exactly and is used as a
+// fallback when the backend field is absent.
+//
+// Encoding mirrors app/dashboard.py: each literal is percent-encoded then "%"
+// is rewritten to the console's "*" escape; "?"/"=" in the fragment use the
+// console's "$3F"/"$3D" escapes; the queryDetail value is the console's
+// RISON-like "~(...)" token tree.
+function consoleToken(value: string): string {
+  let out = "";
+  for (const ch of value) {
+    if (/[A-Za-z0-9\-_.]/.test(ch)) {
+      out += ch;
+    } else {
+      for (const byte of new TextEncoder().encode(ch)) {
+        out += "*" + byte.toString(16).toUpperCase().padStart(2, "0");
+      }
+    }
+  }
+  return out;
+}
+
+export function callDashboardQuery(callSid: string, appLogGroup: string): string {
+  return (
+    `SOURCE '${appLogGroup}'` +
+    ` | fields t_ms, event_type, ttft_ms, turn_latency_ms, duration_ms,` +
+    ` tool, role, input_tokens, output_tokens, total_tokens, message` +
+    ` | filter call_sid = '${callSid}'` +
+    ` | sort t_ms asc` +
+    ` | limit 1000`
+  );
+}
+
+export function callDashboardUrl(
   callSid: string,
   awsRegion?: string | null,
   appLogGroup?: string | null
 ): string {
   const region = awsRegion || "us-east-1";
   const logGroup = appLogGroup || "/ecs/ar-collections-nova-sonic/app";
-  const encGroup = encodeURIComponent(logGroup).replace(/%/g, "$25");
-  const filter = encodeURIComponent(callSid).replace(/%/g, "$25");
+  const query = callDashboardQuery(callSid, logGroup);
+  const detail =
+    "~(end~0~start~-3600~timeType~'RELATIVE~unit~'seconds" +
+    `~editorString~'${consoleToken(query)}` +
+    `~source~(~'${consoleToken(logGroup)}))`;
   const base = `https://${region}.console.aws.amazon.com/cloudwatch/home?region=${region}`;
-  return (
-    `${base}#logsV2:log-groups/log-group/${encGroup}/log-events` +
-    `$3FfilterPattern$3D${filter}`
-  );
+  return `${base}#logsV2:logs-insights$3FqueryDetail$3D${detail}`;
 }

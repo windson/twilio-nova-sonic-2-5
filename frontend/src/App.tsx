@@ -10,7 +10,7 @@ import {
 
 import {
   apiPost,
-  cloudwatchLogsUrl,
+  callDashboardUrl,
   DASH,
   dispositionLabel,
   fmtDateTime,
@@ -497,7 +497,7 @@ function CallsPanel({
               <TableHead>Disposition</TableHead>
               <TableHead>Turns</TableHead>
               <TableHead>Total e2e</TableHead>
-              <TableHead>CloudWatch</TableHead>
+              <TableHead>Dashboard</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -551,6 +551,7 @@ function CallsPanel({
                     {call.call_sid && (
                       <CloudWatchLink
                         callSid={call.call_sid}
+                        dashboardUrl={call.dashboard_url}
                         config={config}
                       />
                     )}
@@ -565,21 +566,26 @@ function CallsPanel({
   );
 }
 
-// CloudWatch deep link in a popover so the user can read exactly what it opens
-// (and the region/log group it targets) before following it.
+// ASK 4: per-call CloudWatch DASHBOARD deep link in a popover so the user can
+// read exactly what it opens (region/log group) before following it. Prefers
+// the backend-built dashboard_url and falls back to the client-side builder.
 function CloudWatchLink({
   callSid,
+  dashboardUrl,
   config,
 }: {
   callSid: string;
+  dashboardUrl?: string | null;
   config: ReturnType<typeof useConfig>;
 }) {
-  const url = cloudwatchLogsUrl(callSid, config?.aws_region, config?.app_log_group);
+  const url =
+    dashboardUrl ||
+    callDashboardUrl(callSid, config?.aws_region, config?.app_log_group);
   return (
     <Popover>
       <PopoverTrigger asChild onClick={(e) => e.stopPropagation()}>
         <button className="inline-flex items-center gap-1 text-xs text-primary hover:underline">
-          Logs <ExternalLink className="h-3 w-3" />
+          Call dashboard <ExternalLink className="h-3 w-3" />
         </button>
       </PopoverTrigger>
       <PopoverContent
@@ -587,7 +593,8 @@ function CloudWatchLink({
         onClick={(e) => e.stopPropagation()}
       >
         <p className="mb-2 text-muted-foreground">
-          Opens CloudWatch Logs filtered to this call.
+          Opens a CloudWatch dashboard scoped to this call (TTFT, turns, token
+          usage, barge-ins, transport, timeline).
         </p>
         <dl className="mb-3 space-y-1">
           <div className="flex justify-between gap-2">
@@ -601,7 +608,7 @@ function CloudWatchLink({
             </dd>
           </div>
           <div className="flex justify-between gap-2">
-            <dt className="text-muted-foreground">Filter</dt>
+            <dt className="text-muted-foreground">Scoped to call</dt>
             <dd className="truncate font-mono">{callSid}</dd>
           </div>
         </dl>
@@ -611,7 +618,7 @@ function CloudWatchLink({
           rel="noopener"
           className="inline-flex items-center gap-1 font-medium text-primary hover:underline"
         >
-          Open in CloudWatch <ExternalLink className="h-3 w-3" />
+          Open CloudWatch dashboard <ExternalLink className="h-3 w-3" />
         </a>
       </PopoverContent>
     </Popover>

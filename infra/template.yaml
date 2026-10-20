@@ -1075,9 +1075,13 @@ Resources:
           TargetGroupArn: !Ref TargetGroup
 
   # --- CloudWatch dashboard --------------------------------------------------
-  # The per-call drill-down link in the UI is a client-side CloudWatch Logs
-  # Insights deep link (no new IAM, no PutMetricData). The ARCollections/TTFTms
-  # widget is an aspirational custom-metric placeholder (nothing emits it yet).
+  # Static, aggregate (not per-call) observability dashboard. The per-call
+  # drill-down link in the UI is a client/backend-built CloudWatch Logs Insights
+  # deep link scoped to one call_sid (no new IAM, no PutMetricData). The log
+  # widgets below parse the app's one-JSON-object-per-line logs (fields such as
+  # event_type, ttft_ms, turn_latency_ms, duration_ms, tool, input_tokens,
+  # output_tokens, total_tokens -- see app/metrics.py) for TTFT, turns, token
+  # usage, barge-ins, transport and a recent call timeline across ALL calls.
   Dashboard:
     Type: AWS::CloudWatch::Dashboard
     Properties:
@@ -1086,44 +1090,59 @@ Resources:
         {
           "widgets": [
             {
-              "type": "metric", "x": 0, "y": 0, "width": 8, "height": 6,
+              "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
               "properties": {
                 "title": "Call volume (ALB requests)",
-                "region": "${AWS::Region}",
-                "stat": "Sum",
-                "metrics": [
-                  [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ]
-                ]
+                "region": "${AWS::Region}", "stat": "Sum",
+                "metrics": [ [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ] ]
               }
             },
             {
-              "type": "metric", "x": 8, "y": 0, "width": 8, "height": 6,
-              "properties": {
-                "title": "Avg TTFT (custom metric: ARCollections/TTFTms)",
-                "region": "${AWS::Region}",
-                "stat": "Average",
-                "metrics": [
-                  [ "ARCollections", "TTFTms" ]
-                ]
-              }
-            },
-            {
-              "type": "metric", "x": 16, "y": 0, "width": 8, "height": 6,
+              "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
               "properties": {
                 "title": "Request latency (ALB target response time)",
-                "region": "${AWS::Region}",
-                "stat": "Average",
-                "metrics": [
-                  [ "AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ]
-                ]
+                "region": "${AWS::Region}", "stat": "Average",
+                "metrics": [ [ "AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ] ]
               }
             },
             {
-              "type": "log", "x": 0, "y": 6, "width": 24, "height": 6,
+              "type": "log", "x": 0, "y": 6, "width": 12, "height": 6,
               "properties": {
-                "title": "Recent app logs (call lifecycle / metrics JSON lines)",
-                "region": "${AWS::Region}",
-                "query": "SOURCE '${AppLogGroup}' | fields @timestamp, @message | sort @timestamp desc | limit 50"
+                "title": "TTFT (time to first audio, ms) over time",
+                "region": "${AWS::Region}", "view": "timeSeries", "stacked": false,
+                "query": "SOURCE '${AppLogGroup}' | filter event_type = 'ttft_measured' | stats avg(ttft_ms) as avg_ttft_ms, max(ttft_ms) as max_ttft_ms by bin(5m)"
+              }
+            },
+            {
+              "type": "log", "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Turns: response wait and turn elapsed (ms)",
+                "region": "${AWS::Region}", "view": "timeSeries", "stacked": false,
+                "query": "SOURCE '${AppLogGroup}' | filter event_type = 'turn_complete' | stats avg(turn_latency_ms) as avg_response_wait_ms, avg(duration_ms) as avg_turn_elapsed_ms, count(*) as turns by bin(5m)"
+              }
+            },
+            {
+              "type": "log", "x": 0, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "Token usage (input / output / total)",
+                "region": "${AWS::Region}", "view": "timeSeries", "stacked": false,
+                "query": "SOURCE '${AppLogGroup}' | filter event_type = 'usage' | stats sum(input_tokens) as input_tokens, sum(output_tokens) as output_tokens, sum(total_tokens) as total_tokens by bin(5m)"
+              }
+            },
+            {
+              "type": "log", "x": 12, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "Barge-ins and tool invocations per call",
+                "region": "${AWS::Region}", "view": "table",
+                "query": "SOURCE '${AppLogGroup}' | filter event_type = 'barge_in' or event_type = 'tool_invocation' | stats count(*) as events by call_sid, event_type | sort call_sid desc | limit 100"
+              }
+            },
+            {
+              "type": "log", "x": 0, "y": 18, "width": 24, "height": 6,
+              "properties": {
+                "title": "Recent call timeline (lifecycle / metrics JSON lines)",
+                "region": "${AWS::Region}", "view": "table",
+                "query": "SOURCE '${AppLogGroup}' | fields @timestamp, call_sid, event_type, t_ms, ttft_ms, turn_latency_ms, duration_ms, tool, total_tokens | sort @timestamp desc | limit 100"
               }
             }
           ]
