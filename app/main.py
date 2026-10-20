@@ -158,10 +158,11 @@ def _launch_postcall(
 def _dashboard_url(call_sid: str | None) -> str | None:
     """Build the per-call CloudWatch dashboard deep-link from config (ASK 4).
 
-    Pure string construction (no AWS call): a consolidated CloudWatch Logs
-    Insights view scoped to ``call_sid`` against the configured app log group +
-    region, surfacing TTFT, turns, token usage, barge-ins, tool invocations,
-    transport and the call timeline. ``None`` when the record has no call_sid.
+    Pure string construction (no AWS call): opens the CONSOLIDATED per-call
+    CloudWatch dashboard (``<stack>-per-call``, provisioned in infra) with its
+    multi-widget view scoped to ``call_sid`` -- per-turn timeline, TTFT + turns,
+    token usage, barge-ins, tool calls, Twilio/transport. ``None`` when the
+    record has no call_sid. The stack name is derived from the app log group.
     """
     if not call_sid:
         return None

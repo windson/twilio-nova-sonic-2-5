@@ -566,9 +566,11 @@ function CallsPanel({
   );
 }
 
-// ASK 4: per-call CloudWatch DASHBOARD deep link in a popover so the user can
-// read exactly what it opens (region/log group) before following it. Prefers
-// the backend-built dashboard_url and falls back to the client-side builder.
+// ASK 4 / D3: opens the CONSOLIDATED per-call CloudWatch dashboard in a popover
+// so the user can read exactly what it opens (region/log group/call) before
+// following it. Prefers the backend-built dashboard_url and falls back to the
+// client-side builder (both target the <stack>-per-call dashboard scoped to the
+// call_sid).
 function CloudWatchLink({
   callSid,
   dashboardUrl,
@@ -593,8 +595,9 @@ function CloudWatchLink({
         onClick={(e) => e.stopPropagation()}
       >
         <p className="mb-2 text-muted-foreground">
-          Opens a CloudWatch dashboard scoped to this call (TTFT, turns, token
-          usage, barge-ins, transport, timeline).
+          Opens the consolidated CloudWatch dashboard scoped to this call: a
+          multi-widget view (per-turn timeline, TTFT &amp; turns, token usage,
+          barge-ins, tool calls, Twilio transport), not a single logs stream.
         </p>
         <dl className="mb-3 space-y-1">
           <div className="flex justify-between gap-2">

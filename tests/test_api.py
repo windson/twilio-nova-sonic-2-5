@@ -295,12 +295,12 @@ def test_get_call_unknown_id_returns_404(store):
 
 
 def test_call_dashboard_url_scoped_to_call_sid_and_config(store):
-    """ASK 4: both the /api/calls list summary and the full /api/calls/{id}
-    record carry a per-call CloudWatch dashboard deep-link that is scoped to the
-    call_sid and built from the configured region + app log group (no live AWS
-    call). The link opens a consolidated Logs Insights view filtered to the
-    call. Fails if the dashboard_url is dropped, is not scoped to the call, or
-    ignores the configured log group/region.
+    """ASK 4 / D3: both the /api/calls list summary and the full /api/calls/{id}
+    record carry a per-call CloudWatch dashboard deep-link that OPENS the
+    CONSOLIDATED per-call dashboard (``#dashboards:name=<stack>-per-call``)
+    scoped to the call_sid, built from the configured region + app log group (no
+    live AWS call). Fails if the dashboard_url is dropped, reverts to the old
+    logs-insights-only shape, is not scoped to the call, or ignores the config.
     """
     analytics = {
         "call_sid": "CA_dash",
@@ -327,15 +327,16 @@ def test_call_dashboard_url_scoped_to_call_sid_and_config(store):
         # Built from the configured region (host + region query param).
         assert "eu-west-1.console.aws.amazon.com" in url
         assert "region=eu-west-1" in url
-        # Consolidated CloudWatch Logs Insights (dashboard) deep-link.
-        assert "#logsV2:logs-insights" in url
-        assert "queryDetail" in url
-        # Scoped to THIS call_sid (console-token encoded: filter call_sid = ...).
-        assert "CA_dash" in url
-        # References the configured app log group (console-token encoded "/" ->
-        # "*2F"), not the default group.
-        assert "*2Fecs*2Fmy-stack*2Fapp" in url
+        # Opens the CONSOLIDATED per-call dashboard, not a bare logs stream.
+        assert "#dashboards:name=" in url
+        assert "logsV2:logs-insights" not in url
+        # Dashboard name derived from the configured log group's stack segment.
+        assert "my-stack-per-call" in url
         assert "ar-collections-nova-sonic" not in url
+        # Scoped to THIS call_sid via the dashboard variable override token.
+        assert "params" in url
+        assert "CALL_SID_TOKEN" in url
+        assert "CA_dash" in url
 
 
 def test_call_dashboard_url_builder_unit():
@@ -352,8 +353,11 @@ def test_call_dashboard_url_builder_unit():
 
     url = call_dashboard_url("CA_unit", aws_region="us-west-2", app_log_group="/ecs/s/app")
     assert url.startswith("https://us-west-2.console.aws.amazon.com/cloudwatch/home")
-    assert "#logsV2:logs-insights$3FqueryDetail$3D" in url
+    # Consolidated per-call dashboard fragment, scoped via the variable token.
+    assert "#dashboards:name=s-per-call$3Fparams$3D" in url
+    assert "CALL_SID_TOKEN" in url
     assert "CA_unit" in url
+    assert "logsV2:logs-insights" not in url
 
 
 async def test_launch_postcall_registers_offpath_task_and_discards_on_done(store):
