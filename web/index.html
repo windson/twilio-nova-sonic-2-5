@@ -46,13 +46,14 @@
             <tr>
               <th>Call SID</th>
               <th>Account</th>
+              <th>Disposition</th>
               <th>Turns</th>
               <th>Total e2e</th>
               <th>CloudWatch</th>
             </tr>
           </thead>
           <tbody id="calls-body">
-            <tr><td colspan="5" class="empty">No calls yet.</td></tr>
+            <tr><td colspan="6" class="empty">No calls yet.</td></tr>
           </tbody>
         </table>
       </section>
@@ -82,6 +83,69 @@
         is a separate per-frame measurement (mean, not a share of total), so it
         is shown on its own rather than as a half of the end-to-end split.
       </p>
+
+      <div class="intel-grid">
+        <div class="intel-block" id="disposition-block">
+          <h3>Call Disposition</h3>
+          <p class="intel-hint">
+            Standardized outcome tag that drives CRM updates and downstream
+            automation (payment-link SMS, pause/escalate).
+          </p>
+          <div class="disp-row">
+            <span id="disp-tag" class="disp-tag disp-none">not yet identified</span>
+          </div>
+          <p class="intel-triggers muted" id="disp-triggers">
+            Downstream triggers: &ndash;
+          </p>
+        </div>
+
+        <div class="intel-block" id="structured-block">
+          <h3>
+            Structured Conversation Data &amp; Next-Best-Action
+            <span id="intel-status" class="intel-status" hidden></span>
+          </h3>
+          <p class="intel-hint">
+            Extracted entities, payment details, behavioral insights, and the
+            exact next step to move the debt toward resolution.
+          </p>
+
+          <div class="intel-subhead">Payment specifics</div>
+          <dl class="intel-fields">
+            <div class="intel-field">
+              <dt>Promised amount</dt>
+              <dd id="sd-promised-amount">&ndash;</dd>
+            </div>
+            <div class="intel-field">
+              <dt>Agreed date</dt>
+              <dd id="sd-agreed-date">&ndash;</dd>
+            </div>
+            <div class="intel-field">
+              <dt>Preferred payment method</dt>
+              <dd id="sd-payment-method">&ndash;</dd>
+            </div>
+          </dl>
+
+          <div class="intel-subhead">Contextual data</div>
+          <dl class="intel-fields">
+            <div class="intel-field">
+              <dt>Reason for delinquency</dt>
+              <dd id="sd-reason">&ndash;</dd>
+            </div>
+            <div class="intel-field">
+              <dt>Customer sentiment</dt>
+              <dd id="sd-sentiment">&ndash;</dd>
+            </div>
+          </dl>
+
+          <div class="intel-subhead">Next-best-action</div>
+          <dl class="intel-fields">
+            <div class="intel-field intel-field-wide">
+              <dt>Automated directive</dt>
+              <dd id="sd-nba">&ndash;</dd>
+            </div>
+          </dl>
+        </div>
+      </div>
 
       <h3>Conversation</h3>
       <p class="muted metrics-note">

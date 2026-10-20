@@ -84,6 +84,31 @@ function cloudwatchLogsUrl(callSid) {
   );
 }
 
+// Map a snake_case disposition tag (the backend's CALL_DISPOSITIONS taxonomy)
+// to a human-readable label for the UI. A couple of tags get an explicit label
+// (e.g. the PTP abbreviation); everything else is Title Cased generically so
+// new tags added to the backend still render sensibly.
+const DISPOSITION_LABELS = {
+  promise_to_pay: "Promise to Pay (PTP)",
+  refusal_to_pay: "Refusal to Pay",
+  dispute_raised: "Dispute Raised",
+  inbound_callback_requested: "Inbound Callback Requested",
+  wrong_number: "Wrong Number",
+  no_answer: "No Answer",
+  left_voicemail: "Left Voicemail",
+  already_paid: "Already Paid",
+  undetermined: "Undetermined",
+};
+
+function dispositionLabel(disposition) {
+  if (!disposition) return "";
+  if (DISPOSITION_LABELS[disposition]) return DISPOSITION_LABELS[disposition];
+  return String(disposition)
+    .split("_")
+    .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w))
+    .join(" ");
+}
+
 function showToast(message, isError) {
   const el = $("toast");
   el.textContent = message;
@@ -192,7 +217,7 @@ async function loadCalls() {
     const data = await apiGet("/api/calls");
     const calls = data.calls || [];
     if (calls.length === 0) {
-      body.innerHTML = '<tr><td colspan="5" class="empty">No calls yet.</td></tr>';
+      body.innerHTML = '<tr><td colspan="6" class="empty">No calls yet.</td></tr>';
       return;
     }
     body.innerHTML = "";
@@ -200,9 +225,15 @@ async function loadCalls() {
       const tr = document.createElement("tr");
       tr.className = "clickable";
       if (call.call_sid === state.selectedCallId) tr.classList.add("selected");
+      // Compact disposition badge in the list so outcomes are visible at a
+      // glance. Falls back to an em dash when extraction hasn't produced one.
+      const dispCell = call.disposition
+        ? `<span class="disp-tag disp-${call.disposition}">${dispositionLabel(call.disposition)}</span>`
+        : '<span class="muted">\u2013</span>';
       tr.innerHTML = `
         <td class="mono">${call.call_sid || ""}</td>
         <td>${call.account_id || ""}</td>
+        <td>${dispCell}</td>
         <td>${call.turn_count != null ? call.turn_count : "\u2013"}</td>
         <td>${fmtMs(call.total_e2e_ms)}</td>
         <td></td>`;
@@ -223,7 +254,7 @@ async function loadCalls() {
       body.appendChild(tr);
     }
   } catch (e) {
-    body.innerHTML = `<tr><td colspan="5" class="empty">Failed to load calls: ${e.message}</td></tr>`;
+    body.innerHTML = `<tr><td colspan="6" class="empty">Failed to load calls: ${e.message}</td></tr>`;
   }
 }
 
@@ -271,6 +302,7 @@ async function renderDetail() {
   $("m-turns").textContent = record.turn_count != null ? record.turn_count : "\u2013";
   $("m-barge").textContent = record.barge_in_count != null ? record.barge_in_count : "\u2013";
 
+  renderIntelligence(record);
   renderChat(record);
   renderTurns(record.turns || [], record.transcripts || []);
   $("log-pre").textContent = JSON.stringify(record.events_log || [], null, 2);
@@ -356,6 +388,91 @@ function chatSegments(record) {
       latencyMs: null,
     }))
     .filter((s) => s.text);
+}
+
+// Render the two inline intelligence blocks (Call Disposition; Structured
+// Conversation Data & Next-Best-Action) from the live call record. Both start
+// blank and fill in DURING or AFTER the call via the existing 3s poll: the
+// backend extracts them off the real-time path (FEAT-002), so renderDetail
+// simply reflects whatever the record carries on each tick.
+//
+// Fields read from the record (null/absent -> blank placeholder):
+//   disposition            snake_case string | null
+//   intelligence_status    'pending' | 'ready' | 'failed'
+//   structured_data.payment_specifics {promised_amount, agreed_date,
+//                          preferred_payment_method}
+//   structured_data.contextual_data {reason_for_delinquency,
+//                          customer_sentiment}
+//   next_best_action       string | null
+//   ptp_sms_status         'sent' | 'blocked_trial' | 'failed' | null
+//   collection_paused      bool
+//   escalated              bool
+//   triggers               [string, ...]
+const DASH = "\u2013";
+
+function fmtText(value) {
+  if (value === null || value === undefined || value === "") return DASH;
+  return String(value);
+}
+
+function renderIntelligence(record) {
+  // --- Block 1: Call Disposition tag + downstream-trigger status ----------
+  const tag = $("disp-tag");
+  const disposition = record.disposition;
+  if (disposition) {
+    tag.textContent = dispositionLabel(disposition);
+    tag.className = `disp-tag disp-${disposition}`;
+  } else {
+    tag.textContent = "not yet identified";
+    tag.className = "disp-tag disp-none";
+  }
+
+  // Downstream triggers line: SMS status + paused/escalated flags. Only shows
+  // concrete signals; otherwise an em dash so the block reads as "uncalled".
+  const triggerParts = [];
+  if (record.ptp_sms_status) {
+    const smsLabel = {
+      sent: "payment-link SMS sent",
+      blocked_trial: "payment-link SMS blocked (trial account)",
+      failed: "payment-link SMS failed",
+    }[record.ptp_sms_status] || `payment-link SMS ${record.ptp_sms_status}`;
+    triggerParts.push(smsLabel);
+  }
+  if (record.collection_paused) triggerParts.push("collection paused");
+  if (record.escalated) triggerParts.push("escalated to specialist");
+  $("disp-triggers").textContent =
+    "Downstream triggers: " + (triggerParts.length ? triggerParts.join(" \u00b7 ") : DASH);
+
+  // --- Block 2: Structured data + Next-Best-Action ------------------------
+  const sd = record.structured_data || {};
+  const pay = sd.payment_specifics || {};
+  const ctx = sd.contextual_data || {};
+
+  $("sd-promised-amount").textContent =
+    pay.promised_amount != null ? fmtMoney(pay.promised_amount, record.currency) : DASH;
+  $("sd-agreed-date").textContent = fmtText(pay.agreed_date);
+  $("sd-payment-method").textContent = fmtText(pay.preferred_payment_method);
+  $("sd-reason").textContent = fmtText(ctx.reason_for_delinquency);
+  $("sd-sentiment").textContent = fmtText(ctx.customer_sentiment);
+  $("sd-nba").textContent = fmtText(record.next_best_action);
+
+  // Extraction-status hint on the structured block: 'pending' -> extracting,
+  // 'failed' -> muted note, 'ready'/absent -> no hint.
+  const statusEl = $("intel-status");
+  const status = record.intelligence_status;
+  if (status === "pending") {
+    statusEl.hidden = false;
+    statusEl.textContent = "extracting\u2026";
+    statusEl.className = "intel-status intel-status-pending";
+  } else if (status === "failed") {
+    statusEl.hidden = false;
+    statusEl.textContent = "extraction unavailable";
+    statusEl.className = "intel-status intel-status-failed";
+  } else {
+    statusEl.hidden = true;
+    statusEl.textContent = "";
+    statusEl.className = "intel-status";
+  }
 }
 
 function renderChat(record) {

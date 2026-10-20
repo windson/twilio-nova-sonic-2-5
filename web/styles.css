@@ -217,6 +217,164 @@ body {
   text-decoration: underline;
 }
 
+/* --- post-call intelligence blocks --- */
+.intel-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin: 18px 0 4px;
+}
+
+@media (max-width: 760px) {
+  .intel-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.intel-block {
+  background: var(--bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 12px 14px;
+}
+
+.intel-block h3 {
+  margin: 0 0 6px;
+  color: var(--text);
+  font-size: 0.95rem;
+}
+
+.intel-hint {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.4;
+}
+
+.disp-row {
+  margin-bottom: 8px;
+}
+
+.intel-triggers {
+  margin: 0;
+  font-size: 0.78rem;
+}
+
+.intel-subhead {
+  color: var(--muted);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin: 10px 0 4px;
+}
+
+.intel-fields {
+  margin: 0;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 2px;
+}
+
+.intel-field {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 0;
+  border-bottom: 1px dashed var(--panel-border);
+}
+
+.intel-field:last-child {
+  border-bottom: none;
+}
+
+.intel-field dt {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.intel-field dd {
+  margin: 0;
+  font-size: 0.86rem;
+  text-align: right;
+  color: var(--text);
+}
+
+.intel-field-wide {
+  flex-direction: column;
+  gap: 2px;
+}
+
+.intel-field-wide dd {
+  text-align: left;
+}
+
+.intel-status {
+  font-size: 0.7rem;
+  font-weight: 400;
+  padding: 2px 8px;
+  border-radius: 999px;
+  vertical-align: middle;
+  margin-left: 6px;
+}
+
+.intel-status-pending {
+  background: rgba(91, 141, 239, 0.15);
+  color: var(--accent);
+}
+
+.intel-status-failed {
+  background: var(--panel-border);
+  color: var(--muted);
+}
+
+/* Disposition tag with per-outcome color variants. */
+.disp-tag {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  background: var(--panel-border);
+  color: var(--text);
+}
+
+.disp-none {
+  background: transparent;
+  border: 1px dashed var(--panel-border);
+  color: var(--muted);
+  font-weight: 400;
+  font-style: italic;
+}
+
+/* PTP / already-paid -> green (positive resolution). */
+.disp-promise_to_pay,
+.disp-already_paid {
+  background: #26432f;
+  color: #8ee0a8;
+}
+
+/* Dispute / callback -> amber (needs attention / follow-up). */
+.disp-dispute_raised,
+.disp-inbound_callback_requested {
+  background: #46402a;
+  color: #f0d78e;
+}
+
+/* Refusal -> red (negative outcome). */
+.disp-refusal_to_pay {
+  background: #4a2d2d;
+  color: #f0a0a0;
+}
+
+/* Wrong number / no answer / voicemail / undetermined -> grey (no contact). */
+.disp-wrong_number,
+.disp-no_answer,
+.disp-left_voicemail,
+.disp-undetermined {
+  background: #2a2f3d;
+  color: #b4bccb;
+}
+
 /* --- chat conversation view --- */
 .chat {
   display: flex;
