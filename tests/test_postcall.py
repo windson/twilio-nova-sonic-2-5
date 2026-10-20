@@ -121,6 +121,66 @@ def _ci_factory(canned_iso="2024-06-03"):
     return factory
 
 
+class ExecutingCodeInterpreter:
+    """Code-interpreter stub that ACTUALLY RUNS the model-authored program.
+
+    Executes the program handed to ``executeCode`` in an isolated local
+    namespace and captures its stdout, so a test can prove the full ASK 8 path
+    (captured phrase -> model program -> real stdout -> parsed ISO ->
+    persisted agreed_date) end-to-end, offline. Fails if the resolution math or
+    the backfill wiring is reverted.
+    """
+
+    def __init__(self, region):
+        self.region = region
+        self.started = False
+        self.stopped = False
+
+    def start(self):
+        self.started = True
+
+    def invoke(self, method, params=None):
+        import contextlib
+        import io
+
+        code = (params or {}).get("code", "")
+        buf = io.StringIO()
+        is_error = False
+        try:
+            with contextlib.redirect_stdout(buf):
+                exec(compile(code, "<model-program>", "exec"), {"__name__": "__main__"})
+        except Exception:  # noqa: BLE001 - surface as an interpreter error
+            is_error = True
+        return {
+            "stream": [
+                {
+                    "result": {
+                        "isError": is_error,
+                        "content": [{"type": "text", "text": buf.getvalue()}],
+                    }
+                }
+            ]
+        }
+
+    def stop(self):
+        self.stopped = True
+
+
+# A realistic program the code-gen model authors for the ASK 8 phrase
+# 'second tuesday of next month': the 2nd Tuesday of the month AFTER the
+# reference month (reference date passed in by the resolver as 2024-05-15).
+_SECOND_TUESDAY_PROGRAM = (
+    "import calendar\n"
+    "from datetime import date\n"
+    "ref = date(2024, 5, 15)\n"
+    "year = ref.year + (1 if ref.month == 12 else 0)\n"
+    "month = 1 if ref.month == 12 else ref.month + 1\n"
+    "tuesdays = [d for d in range(1, calendar.monthrange(year, month)[1] + 1)\n"
+    "            if date(year, month, d).weekday() == calendar.TUESDAY]\n"
+    "print(date(year, month, tuesdays[1]).isoformat())\n"
+)
+
+
 def _call_record(**overrides):
     rec = {
         "call_sid": "CA_pc",
@@ -837,3 +897,69 @@ async def test_agreed_date_backfilled_from_captured_phrase_when_llm_null(store):
     assert changes["structured_data"]["payment_specifics"]["agreed_date"] == "2024-07-09"
     # due.promised_date also resolved to the ISO date.
     assert store.get_due("ACC-1001")["promised_date"] == "2024-07-09"
+
+
+class SequencingBedrock:
+    """Bedrock stub: first converse returns the extraction JSON, subsequent
+    converse calls return the model-authored date-resolution program.
+
+    Lets a single injected client serve BOTH roles: the post-call classifier
+    (``_classify``) and the code-interpreter code generator
+    (``_generate_program``), so a test can drive the ASK 8 backfill through the
+    REAL resolution path with an executing sandbox.
+    """
+
+    def __init__(self, extraction_payload: dict, program: str) -> None:
+        self._extraction = extraction_payload
+        self._program = program
+        self.calls: list[dict] = []
+
+    def converse(self, **kwargs):
+        self.calls.append(kwargs)
+        text = self._extraction if len(self.calls) == 1 else self._program
+        payload = json.dumps(text) if isinstance(text, dict) else text
+        return {"output": {"message": {"content": [{"text": payload}]}}}
+
+
+async def test_ask8_backfill_resolves_real_program_end_to_end(store):
+    """ASK 8 end-to-end (OFFLINE): LLM agreed_date=null + captured phrase
+    'second tuesday of next month' -> the resolver asks the model to author a
+    program, the sandbox RUNS it for real, and the concrete ISO date backfills
+    structured_data.payment_specifics.agreed_date AND due.promised_date. The
+    anchor is pinned inside the program (2024-05-15) so the expected date is the
+    2nd Tuesday of June 2024 = 2024-06-11. Fails if either the resolution math
+    or the backfill wiring is reverted.
+    """
+    store.update_due("ACC-1001", promised_date_phrase="second tuesday of next month")
+    bedrock = SequencingBedrock(
+        {
+            "disposition": "promise_to_pay",
+            "payment_specifics": {"promised_amount": 625, "agreed_date": None,
+                                  "preferred_payment_method": None},
+            "contextual_data": {"reason_for_delinquency": None, "customer_sentiment": None},
+            "next_best_action": "Follow up",
+        },
+        _SECOND_TUESDAY_PROGRAM,
+    )
+    captured: list[ExecutingCodeInterpreter] = []
+
+    def ci_factory(region):
+        c = ExecutingCodeInterpreter(region)
+        captured.append(c)
+        return c
+
+    changes = await extract_and_apply(
+        _call_record(account_id="ACC-1001"),
+        store,
+        _settings(),
+        bedrock_client=bedrock,
+        twilio_client_factory=lambda *a: _InsightsTwilioClient(),
+        code_interpreter_factory=ci_factory,
+    )
+
+    # The UI field was backfilled from the REAL model-authored + executed program.
+    assert changes["structured_data"]["payment_specifics"]["agreed_date"] == "2024-06-11"
+    assert store.get_due("ACC-1001")["promised_date"] == "2024-06-11"
+    # The sandbox actually ran (and was cleaned up) at least once.
+    assert captured and captured[0].started and captured[0].stopped
+    assert changes["intelligence_status"] == "ready"

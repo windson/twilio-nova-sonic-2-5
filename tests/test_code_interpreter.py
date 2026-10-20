@@ -282,6 +282,97 @@ def test_strips_code_fences_from_model_output():
     assert "print('2024-06-03')" in code
 
 
+class ExecutingCodeInterpreter:
+    """Stub AgentCore CodeInterpreter that ACTUALLY RUNS the model's program.
+
+    Unlike :class:`FakeCodeInterpreter` (which returns a canned stdout), this
+    stub executes the model-authored program handed to ``executeCode`` in an
+    isolated local namespace and captures its stdout. This lets a test assert
+    the date MATH is correct end-to-end (phrase -> program -> real stdout ->
+    parsed ISO) without touching AWS, so it would fail if the resolution is
+    reverted to a wrong program. Execution stays offline and uses only the
+    standard library.
+    """
+
+    def __init__(self, region: str) -> None:
+        self.region = region
+        self.started = False
+        self.stopped = False
+
+    def start(self):
+        self.started = True
+
+    def invoke(self, method, params=None):
+        import contextlib
+        import io
+
+        code = (params or {}).get("code", "")
+        buf = io.StringIO()
+        is_error = False
+        try:
+            with contextlib.redirect_stdout(buf):
+                exec(compile(code, "<model-program>", "exec"), {"__name__": "__main__"})
+        except Exception:  # noqa: BLE001 - surface as an interpreter error
+            is_error = True
+        return {
+            "stream": [
+                {
+                    "result": {
+                        "isError": is_error,
+                        "content": [{"type": "text", "text": buf.getvalue()}],
+                    }
+                }
+            ]
+        }
+
+    def stop(self):
+        self.stopped = True
+
+
+def test_second_tuesday_of_next_month_resolves_correctly_anchored():
+    """Deterministic, OFFLINE proof of ASK 8: the model-authored program for
+    'second tuesday of next month' anchored on 2024-05-15 resolves to the
+    SECOND Tuesday of June 2024 = 2024-06-11. The FakeBedrock returns a real
+    (model-style) program and the ExecutingCodeInterpreter runs it for real, so
+    this fails if the resolution produces the wrong date.
+    """
+    # A realistic program the code-gen model would author for this phrase:
+    # pick the month after the reference month, then the 2nd Tuesday.
+    program = (
+        "import calendar\n"
+        "from datetime import date\n"
+        "ref = date(2024, 5, 15)\n"
+        "year = ref.year + (1 if ref.month == 12 else 0)\n"
+        "month = 1 if ref.month == 12 else ref.month + 1\n"
+        "tuesdays = [d for d in range(1, calendar.monthrange(year, month)[1] + 1)\n"
+        "            if date(year, month, d).weekday() == calendar.TUESDAY]\n"
+        "print(date(year, month, tuesdays[1]).isoformat())\n"
+    )
+    bedrock = FakeBedrock(program=program)
+    captured: list[ExecutingCodeInterpreter] = []
+
+    def factory(region):
+        c = ExecutingCodeInterpreter(region)
+        captured.append(c)
+        return c
+
+    result = code_interpreter.resolve_date_phrase(
+        "second tuesday of next month",
+        reference_date="2024-05-15",
+        region="us-east-1",
+        bedrock_client=bedrock,
+        client_factory=factory,
+    )
+
+    assert result == "2024-06-11"
+    # The phrase + reference date were supplied to the model as arguments.
+    user_text = bedrock.calls[0]["messages"][0]["content"][0]["text"]
+    assert "second tuesday of next month" in user_text
+    assert "2024-05-15" in user_text
+    # The sandbox actually ran the model's program and was cleaned up.
+    assert captured and captured[0].started and captured[0].stopped
+
+
 def test_empty_phrase_short_circuits_without_model_or_session():
     bedrock = FakeBedrock()
     called = {"n": 0}

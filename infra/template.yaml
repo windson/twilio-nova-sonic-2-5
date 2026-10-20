@@ -465,6 +465,12 @@ Resources:
         # Off-path natural-language date resolution (app/code_interpreter.py):
         # start/invoke/stop against the managed aws.codeinterpreter.v1 default.
         # Runs only in the post-call task, never on the audio path.
+        # The BUILT-IN interpreter lives in the special account segment "aws"
+        # (arn:...:bedrock-agentcore:<region>:aws:code-interpreter/aws.codeinterpreter.v1),
+        # NOT the caller's account id - verified against the official CFN pattern
+        # (aws|[0-9]{12}) for CodeInterpreterArn and the live AccessDenied log for
+        # CA7893e62ca50768dcfc789ebfd50d3e2c. Also allow any custom interpreter in
+        # this account and the per-session resource created by StartCodeInterpreterSession.
         - PolicyName: agentcore-code-interpreter
           PolicyDocument:
             Version: "2012-10-17"
@@ -475,7 +481,9 @@ Resources:
                   - bedrock-agentcore:InvokeCodeInterpreter
                   - bedrock-agentcore:StopCodeInterpreterSession
                 Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:aws:code-interpreter/aws.codeinterpreter.v1"
                   - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:code-interpreter/*"
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:code-interpreter-session/*"
         # Note: the PTP payment-link SMS (app/twilio_client.send_sms) needs NO new
         # IAM (reuses task egress + the Twilio secrets injected into the task).
         - PolicyName: dynamodb-rw
