@@ -289,6 +289,75 @@ def fetch_call_insights(
     return base
 
 
+def hangup_call(
+    call_sid: str | None,
+    *,
+    settings: Settings | None = None,
+    client_factory: Any | None = None,
+) -> dict[str, Any]:
+    """Hang up a live Twilio call by completing it (FEAT-002, terminal action).
+
+    The end-of-conversation ``end_conversation`` tool (built in
+    :mod:`app.collections_agent`) drives this: updating an in-progress Call with
+    ``Status=completed`` terminates it via
+    ``client.calls(call_sid).update(status='completed')`` (confirmed against the
+    Twilio Call-resource API). This is the single intended terminal REST action;
+    it is allowed off the real-time audio path.
+
+    It is deliberately FAILURE-SAFE and never raises into the caller (the model
+    thread must never crash on a hangup): a missing ``call_sid`` returns a benign
+    marker, and a Twilio error because the call already completed / is gone is
+    caught and returned as a marker. It mirrors the defensive logging in
+    :func:`fetch_call_insights` - only the exception type name and call sid are
+    logged, never the auth token.
+
+    Args:
+        call_sid: The live Twilio Call sid to hang up.
+        settings: Settings override (defaults to :func:`get_settings`).
+        client_factory: Injectable ``twilio.rest.Client`` factory (mocked in
+            tests). Defaults to the real client.
+
+    Returns:
+        A marker dict: ``{"hung_up": bool, "status": str, "call_sid": ...}`` and,
+        on failure, an ``error`` (exception type name). ``hung_up`` is ``True``
+        only when the Call update was actually issued.
+    """
+    marker: dict[str, Any] = {
+        "hung_up": False,
+        "status": "noop",
+        "call_sid": call_sid,
+    }
+
+    if not call_sid:
+        marker["status"] = "no_call_sid"
+        return marker
+
+    settings = settings or get_settings()
+    if not settings.twilio_configured:
+        marker["status"] = "twilio_not_configured"
+        return marker
+
+    try:
+        client = _make_client(settings, client_factory=client_factory)
+        client.calls(call_sid).update(status="completed")
+        marker["hung_up"] = True
+        marker["status"] = "completed"
+        logger.info("call_sid=<%s> | twilio call hung up (status=completed)", call_sid)
+    except Exception as exc:  # noqa: BLE001 - never raise; call may already be gone
+        marker["hung_up"] = False
+        marker["status"] = "error"
+        marker["error"] = type(exc).__name__
+        # Log WITHOUT the exception payload (which could echo creds); only the
+        # type name + call sid. A call that already completed / is gone lands
+        # here and is treated as a benign no-op by the caller.
+        logger.warning(
+            "call_sid=<%s> | twilio hangup failed (%s); treating as already-ended",
+            call_sid,
+            type(exc).__name__,
+        )
+    return marker
+
+
 def place_outbound_call(
     to: str,
     account_record: Mapping[str, Any] | None = None,

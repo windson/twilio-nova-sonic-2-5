@@ -20,7 +20,7 @@ seams :mod:`app.sonic_bridge` injects per call.
 from __future__ import annotations
 
 import logging
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from strands import tool
 
@@ -96,21 +96,46 @@ def get_system_prompt(due_record: Mapping[str, Any]) -> str:
         "'disputed' if they dispute, 'callback' if they want a later call, and "
         "keep 'open' if unresolved.\n"
         "- After the tool confirms, briefly restate the outcome to the caller "
-        "and end the call."
+        "and deliver your closing/parting greeting (for example 'Thank you, "
+        "goodbye.').\n\n"
+        "Ending the call (final action):\n"
+        "- Once `update_due_record` has confirmed the outcome and you have "
+        "delivered your closing greeting, call the `end_conversation` tool "
+        "EXACTLY ONCE to end the call. This is always your final action.\n"
+        "- Also call `end_conversation` immediately if the caller says a parting "
+        "phrase such as 'goodbye', 'bye', or 'that's all'.\n"
+        "- Do not call `end_conversation` more than once, and do not call it "
+        "before you have finished the conversation and said goodbye."
     )
 
 
-def build_tools(store: Store | None = None) -> list[Any]:
+def build_tools(
+    store: Store | None = None,
+    *,
+    call_sid: str | None = None,
+    on_end: Callable[[], Any] | None = None,
+) -> list[Any]:
     """Build the tool list for a call, bound to ``store``.
 
     Returns the ``update_due_record`` tool (which writes through
-    :meth:`Store.update_due`) and the lightweight
-    ``capture_payment_date_phrase`` tool. The latter only records the raw
-    natural-language date phrase on the due record and returns immediately so
-    the real-time turn path stays fast; the concrete ``YYYY-MM-DD`` is resolved
-    OFF-path post-call by :func:`app.code_interpreter.resolve_date_phrase`. The
-    returned tools are plain ``@tool``-decorated functions, so they can also be
-    invoked directly in tests.
+    :meth:`Store.update_due`), the lightweight ``capture_payment_date_phrase``
+    tool, and the ``end_conversation`` terminal tool (FEAT-002). The date tool
+    only records the raw natural-language date phrase on the due record and
+    returns immediately so the real-time turn path stays fast; the concrete
+    ``YYYY-MM-DD`` is resolved OFF-path post-call by
+    :func:`app.code_interpreter.resolve_date_phrase`. The returned tools are
+    plain ``@tool``-decorated functions, so they can also be invoked directly in
+    tests.
+
+    Args:
+        store: Store the tools write through (defaults to the process store).
+        call_sid: The live Twilio Call sid for this session, used by
+            ``end_conversation`` for logging/diagnostics. Defaults to ``None``
+            so existing callers/tests keep working.
+        on_end: Injectable callback invoked by ``end_conversation`` to perform
+            the actual Twilio hangup + session teardown. It is called with no
+            arguments and is GUARDED so a failure never raises into the model.
+            Defaults to ``None`` (no-op), keeping the tool safe when unwired.
     """
     store = store or get_default_store()
 
@@ -217,4 +242,53 @@ def build_tools(store: Store | None = None) -> list[Any]:
             return "I didn't catch a specific date - could you say that again?"
         return f"Got it, I've noted '{clean}' as the payment timing."
 
-    return [update_due_record, capture_payment_date_phrase]
+    # Latch so the hangup/teardown runs at most once even if the model emits
+    # ``end_conversation`` more than once (idempotency, FEAT-002).
+    ended = {"done": False}
+
+    @tool
+    def end_conversation(reason: str | None = None) -> str:
+        """End the call after the conversation has reached its conclusion.
+
+        This is the agent's FINAL action: call it exactly once after you have
+        confirmed the outcome and delivered your closing greeting, or when the
+        caller says a parting phrase (e.g. "goodbye", "bye", "that's all"). It
+        terminates the live phone call.
+
+        The handler is idempotent (a second invocation is a no-op) and is
+        GUARDED so the underlying Twilio hangup / session teardown can never
+        raise back into the model. The actual hangup is performed by the
+        injected ``on_end`` callback; it is the intended terminal REST action
+        and is kept off any heavy work.
+
+        Args:
+            reason: Optional short reason the call is ending (diagnostics only).
+
+        Returns:
+            A short spoken confirmation the assistant can say before the line
+            drops.
+        """
+        logger.info(
+            "call_sid=<%s>, reason=<%s> | end_conversation tool invoked",
+            call_sid,
+            (reason or "").strip() or None,
+            extra={"event_type": "tool_invocation", "tool": "end_conversation"},
+        )
+
+        if ended["done"]:
+            # Already ended: do not trigger the hangup/teardown twice.
+            return "Thank you, goodbye."
+        ended["done"] = True
+
+        if on_end is not None:
+            try:
+                on_end()
+            except Exception:  # noqa: BLE001 - a hangup failure must never surface
+                logger.warning(
+                    "call_sid=<%s> | end_conversation on_end callback failed",
+                    call_sid,
+                )
+
+        return "Thank you, goodbye."
+
+    return [update_due_record, capture_payment_date_phrase, end_conversation]

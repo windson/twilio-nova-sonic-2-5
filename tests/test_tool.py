@@ -21,10 +21,11 @@ def _call_tool(decorated_tool, **kwargs):
 def test_update_due_record_mutates_store_and_returns_confirmation():
     store = InMemoryStore()
     tools = build_tools(store)
-    assert len(tools) == 2
+    assert len(tools) == 3
     tool_names = {t.tool_name for t in tools}
     assert "update_due_record" in tool_names
     assert "capture_payment_date_phrase" in tool_names
+    assert "end_conversation" in tool_names
     # The removed hand-written parser tool must be gone.
     assert "compute_future_date" not in tool_names
     update_tool = next(t for t in tools if t.tool_name == "update_due_record")
@@ -100,6 +101,93 @@ def test_capture_payment_date_phrase_empty_phrase_asks_again():
     tool = _capture_phrase_tool(store)
     msg = _call_tool(tool, phrase="   ", account_id="ACC-1001")
     assert "again" in msg.lower() or "didn't" in msg.lower()
+
+
+# --- FEAT-002: end_conversation terminal tool --------------------------------
+
+
+def _end_conversation_tool(store, **kwargs):
+    tools = build_tools(store, **kwargs)
+    return next(t for t in tools if t.tool_name == "end_conversation")
+
+
+def test_build_tools_includes_end_conversation():
+    store = InMemoryStore()
+    tools = build_tools(store, call_sid="CA_live")
+    assert len(tools) == 3
+    names = {t.tool_name for t in tools}
+    assert "end_conversation" in names
+
+
+def test_end_conversation_invokes_on_end_and_returns_confirmation():
+    store = InMemoryStore()
+    calls = []
+
+    def on_end():
+        calls.append("ended")
+
+    tool = _end_conversation_tool(store, call_sid="CA_live", on_end=on_end)
+    msg = _call_tool(tool, reason="caller said goodbye")
+
+    assert isinstance(msg, str) and msg
+    assert "goodbye" in msg.lower()
+    # The on_end callback (which triggers the Twilio hangup) fired exactly once.
+    assert calls == ["ended"]
+
+
+def test_end_conversation_is_idempotent():
+    store = InMemoryStore()
+    calls = []
+    tool = _end_conversation_tool(
+        store, call_sid="CA_live", on_end=lambda: calls.append(1)
+    )
+    _call_tool(tool)
+    _call_tool(tool)
+    # Only the first invocation triggers the hangup/teardown.
+    assert calls == [1]
+
+
+def test_end_conversation_guards_on_end_failure():
+    store = InMemoryStore()
+
+    def boom():
+        raise RuntimeError("twilio exploded")
+
+    tool = _end_conversation_tool(store, call_sid="CA_live", on_end=boom)
+    # A failing on_end must never raise back into the model.
+    msg = _call_tool(tool)
+    assert isinstance(msg, str) and "goodbye" in msg.lower()
+
+
+def test_end_conversation_without_on_end_is_safe():
+    store = InMemoryStore()
+    tool = _end_conversation_tool(store, call_sid="CA_live")
+    msg = _call_tool(tool)
+    assert isinstance(msg, str) and "goodbye" in msg.lower()
+
+
+def test_end_conversation_logs_tool_invocation(caplog):
+    import logging
+
+    store = InMemoryStore()
+    tool = _end_conversation_tool(store, call_sid="CA_live", on_end=lambda: None)
+    with caplog.at_level(logging.INFO):
+        _call_tool(tool)
+    recs = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_type", None) == "tool_invocation"
+        and getattr(r, "tool", None) == "end_conversation"
+    ]
+    assert recs, "end_conversation must log event_type=tool_invocation tool=end_conversation"
+
+
+def test_system_prompt_instructs_end_conversation():
+    store = InMemoryStore()
+    prompt = get_system_prompt(store.get_due("ACC-1001"))
+    assert "end_conversation" in prompt
+    # Instructs calling it exactly once as the final action + on a parting phrase.
+    assert "goodbye" in prompt.lower()
 
 
 def test_system_prompt_instructs_capturing_date_phrase():
