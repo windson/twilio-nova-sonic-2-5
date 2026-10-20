@@ -121,6 +121,66 @@ def _ci_factory(canned_iso="2024-06-03"):
     return factory
 
 
+class ExecutingCodeInterpreter:
+    """Code-interpreter stub that ACTUALLY RUNS the model-authored program.
+
+    Executes the program handed to ``executeCode`` in an isolated local
+    namespace and captures its stdout, so a test can prove the full ASK 8 path
+    (captured phrase -> model program -> real stdout -> parsed ISO ->
+    persisted agreed_date) end-to-end, offline. Fails if the resolution math or
+    the backfill wiring is reverted.
+    """
+
+    def __init__(self, region):
+        self.region = region
+        self.started = False
+        self.stopped = False
+
+    def start(self):
+        self.started = True
+
+    def invoke(self, method, params=None):
+        import contextlib
+        import io
+
+        code = (params or {}).get("code", "")
+        buf = io.StringIO()
+        is_error = False
+        try:
+            with contextlib.redirect_stdout(buf):
+                exec(compile(code, "<model-program>", "exec"), {"__name__": "__main__"})
+        except Exception:  # noqa: BLE001 - surface as an interpreter error
+            is_error = True
+        return {
+            "stream": [
+                {
+                    "result": {
+                        "isError": is_error,
+                        "content": [{"type": "text", "text": buf.getvalue()}],
+                    }
+                }
+            ]
+        }
+
+    def stop(self):
+        self.stopped = True
+
+
+# A realistic program the code-gen model authors for the ASK 8 phrase
+# 'second tuesday of next month': the 2nd Tuesday of the month AFTER the
+# reference month (reference date passed in by the resolver as 2024-05-15).
+_SECOND_TUESDAY_PROGRAM = (
+    "import calendar\n"
+    "from datetime import date\n"
+    "ref = date(2024, 5, 15)\n"
+    "year = ref.year + (1 if ref.month == 12 else 0)\n"
+    "month = 1 if ref.month == 12 else ref.month + 1\n"
+    "tuesdays = [d for d in range(1, calendar.monthrange(year, month)[1] + 1)\n"
+    "            if date(year, month, d).weekday() == calendar.TUESDAY]\n"
+    "print(date(year, month, tuesdays[1]).isoformat())\n"
+)
+
+
 def _call_record(**overrides):
     rec = {
         "call_sid": "CA_pc",
@@ -206,9 +266,13 @@ async def test_extract_and_apply_ptp_sets_fields_pauses_and_sends_sms(store):
     # Account collection paused.
     assert store.get_due("ACC-1001")["collection_paused"] is True
 
-    # SMS attempted with a payment link containing the account id.
+    # SMS attempted with a payment link containing the account id. The injected
+    # factory is used for BOTH the off-path Twilio Call-insights fetch (ASK 2)
+    # and the PTP SMS send, so locate the client that actually sent a message
+    # rather than assuming the first-created client is the SMS one.
     assert created_clients, "twilio client factory should have been used"
-    sms_kwargs = created_clients[0].messages.created[0]
+    sms_client = next(c for c in created_clients if c.messages.created)
+    sms_kwargs = sms_client.messages.created[0]
     assert "pay.example.com" in sms_kwargs["body"]
     assert "ACC-1001" in sms_kwargs["body"]
 
@@ -640,3 +704,262 @@ def test_mask_number_keeps_only_last_four():
     assert _mask_number("+15551234567") == "+******4567"
     assert _mask_number(None) is None
     assert _mask_number("123") == "***"
+
+
+class _FakeCall:
+    sid = "CA_pc"
+    parent_call_sid = None
+    to = "+15005550010"
+    to_formatted = "(500) 555-0010"
+    from_ = "+15005550006"
+    from_formatted = "(500) 555-0006"
+    status = "completed"
+    start_time = "2024-06-01T12:00:00Z"
+    end_time = "2024-06-01T12:01:30Z"
+    duration = "90"
+    price = "-0.017"
+    price_unit = "USD"
+    direction = "outbound-api"
+    answered_by = None
+    queue_time = "0"
+    date_created = "2024-06-01T12:00:00Z"
+    date_updated = "2024-06-01T12:01:30Z"
+
+
+class _InsightsTwilioClient:
+    """Twilio client stub supporting BOTH calls(sid).fetch() and messages."""
+
+    def __init__(self, *_a):
+        self._call = _FakeCall()
+
+        class _Messages:
+            created: list = []
+
+            def create(self, **kwargs):
+                self.created.append(kwargs)
+
+                class _M:
+                    sid = "SM"
+
+                return _M()
+
+        self.messages = _Messages()
+
+    def calls(self, call_sid):
+        call = self._call
+
+        class _Ctx:
+            def fetch(self):
+                return call
+
+        return _Ctx()
+
+
+async def test_extract_and_apply_enriches_twilio_insights_offpath(store):
+    """ASK 2/6 wiring: extract_and_apply persists authentic twilio_insights
+    fetched off-path for the call_sid. Fails if the enrichment call is removed.
+    """
+    bedrock = FakeBedrock(
+        {
+            "disposition": "undetermined",
+            "payment_specifics": {"promised_amount": None, "agreed_date": None,
+                                  "preferred_payment_method": None},
+            "contextual_data": {"reason_for_delinquency": None, "customer_sentiment": None},
+            "next_best_action": None,
+        }
+    )
+
+    changes = await extract_and_apply(
+        _call_record(),
+        store,
+        _settings(),
+        bedrock_client=bedrock,
+        twilio_client_factory=lambda *a: _InsightsTwilioClient(),
+        code_interpreter_factory=_ci_factory(),
+    )
+
+    insights = changes["twilio_insights"]
+    assert insights["available"] is True
+    assert insights["source"] == "twilio_call_resource"
+    assert insights["fields"]["status"] == "completed"
+    assert insights["fields"]["duration"] == "90"
+    assert insights["fields"]["from"] == "+15005550006"
+    # Advanced QoS remains unavailable (trial add-on), never fabricated.
+    assert insights["advanced_qos_available"] is False
+
+    # Persisted onto the stored record for the API/UI to read.
+    persisted = store.get_call("CA_pc")
+    assert persisted["twilio_insights"]["available"] is True
+
+
+async def test_extract_and_apply_twilio_insights_gated_when_fetch_unavailable(store):
+    """Add-on-gated / unavailable branch: a Twilio client that cannot fetch the
+    call yields an explicit unavailable marker (no fabricated metrics), and the
+    pipeline still completes with intelligence_status ready.
+    """
+    bedrock = FakeBedrock(
+        {
+            "disposition": "undetermined",
+            "payment_specifics": {"promised_amount": None, "agreed_date": None,
+                                  "preferred_payment_method": None},
+            "contextual_data": {"reason_for_delinquency": None, "customer_sentiment": None},
+            "next_best_action": None,
+        }
+    )
+
+    class _NoCallsClient:
+        # No .calls attribute -> fetch_call_insights degrades gracefully.
+        def __init__(self, *_a):
+            pass
+
+    changes = await extract_and_apply(
+        _call_record(),
+        store,
+        _settings(),
+        bedrock_client=bedrock,
+        twilio_client_factory=lambda *a: _NoCallsClient(),
+        code_interpreter_factory=_ci_factory(),
+    )
+
+    assert changes["twilio_insights"]["available"] is False
+    assert changes["twilio_insights"]["fields"] == {}
+    assert changes["intelligence_status"] == "ready"
+
+
+async def test_extract_and_apply_records_async_tool_call_for_date_resolution(store):
+    """ASK 5: resolving a natural-language agreed_date off-path records an
+    async (off-path) tool call that does NOT contribute to call latency. The
+    already-ISO fast path would record none. Fails if async tracking reverts.
+    """
+    bedrock = FakeBedrock(
+        {
+            "disposition": "promise_to_pay",
+            "payment_specifics": {
+                "promised_amount": 100,
+                "agreed_date": "next month 1st Monday",  # natural phrase -> CI runs
+                "preferred_payment_method": None,
+            },
+            "contextual_data": {"reason_for_delinquency": None, "customer_sentiment": None},
+            "next_best_action": "Send link",
+        }
+    )
+
+    def twilio_factory(*_a):
+        return _InsightsTwilioClient()
+
+    changes = await extract_and_apply(
+        _call_record(),
+        store,
+        _settings(),
+        bedrock_client=bedrock,
+        twilio_client_factory=twilio_factory,
+        code_interpreter_factory=_ci_factory("2024-06-03"),
+    )
+
+    async_calls = changes["async_tool_calls"]
+    assert any(
+        c["tool"] == "resolve_date_phrase" and c["kind"] == "async"
+        for c in async_calls
+    )
+    # Async entries carry no call-timeline t_ms and are flagged off-path.
+    for c in async_calls:
+        assert c["t_ms"] is None
+        assert c["off_path"] is True
+
+
+async def test_agreed_date_backfilled_from_captured_phrase_when_llm_null(store):
+    """ASK 8 backfill: when the LLM returns agreed_date=null but the in-call
+    capture tool stored a resolvable promised_date_phrase on the due record,
+    the resolved ISO date backfills structured_data.payment_specifics.agreed_date
+    (the field the UI reads), not only due.promised_date.
+    """
+    store.update_due("ACC-1001", promised_date_phrase="second tuesday of next month")
+    bedrock = FakeBedrock(
+        {
+            "disposition": "promise_to_pay",
+            "payment_specifics": {"promised_amount": 625, "agreed_date": None,
+                                  "preferred_payment_method": None},
+            "contextual_data": {"reason_for_delinquency": None, "customer_sentiment": None},
+            "next_best_action": "Follow up",
+        }
+    )
+
+    changes = await extract_and_apply(
+        _call_record(account_id="ACC-1001"),
+        store,
+        _settings(),
+        bedrock_client=bedrock,
+        twilio_client_factory=lambda *a: _InsightsTwilioClient(),
+        code_interpreter_factory=_ci_factory("2024-07-09"),
+    )
+
+    # The UI field is backfilled from the captured phrase resolution.
+    assert changes["structured_data"]["payment_specifics"]["agreed_date"] == "2024-07-09"
+    # due.promised_date also resolved to the ISO date.
+    assert store.get_due("ACC-1001")["promised_date"] == "2024-07-09"
+
+
+class SequencingBedrock:
+    """Bedrock stub: first converse returns the extraction JSON, subsequent
+    converse calls return the model-authored date-resolution program.
+
+    Lets a single injected client serve BOTH roles: the post-call classifier
+    (``_classify``) and the code-interpreter code generator
+    (``_generate_program``), so a test can drive the ASK 8 backfill through the
+    REAL resolution path with an executing sandbox.
+    """
+
+    def __init__(self, extraction_payload: dict, program: str) -> None:
+        self._extraction = extraction_payload
+        self._program = program
+        self.calls: list[dict] = []
+
+    def converse(self, **kwargs):
+        self.calls.append(kwargs)
+        text = self._extraction if len(self.calls) == 1 else self._program
+        payload = json.dumps(text) if isinstance(text, dict) else text
+        return {"output": {"message": {"content": [{"text": payload}]}}}
+
+
+async def test_ask8_backfill_resolves_real_program_end_to_end(store):
+    """ASK 8 end-to-end (OFFLINE): LLM agreed_date=null + captured phrase
+    'second tuesday of next month' -> the resolver asks the model to author a
+    program, the sandbox RUNS it for real, and the concrete ISO date backfills
+    structured_data.payment_specifics.agreed_date AND due.promised_date. The
+    anchor is pinned inside the program (2024-05-15) so the expected date is the
+    2nd Tuesday of June 2024 = 2024-06-11. Fails if either the resolution math
+    or the backfill wiring is reverted.
+    """
+    store.update_due("ACC-1001", promised_date_phrase="second tuesday of next month")
+    bedrock = SequencingBedrock(
+        {
+            "disposition": "promise_to_pay",
+            "payment_specifics": {"promised_amount": 625, "agreed_date": None,
+                                  "preferred_payment_method": None},
+            "contextual_data": {"reason_for_delinquency": None, "customer_sentiment": None},
+            "next_best_action": "Follow up",
+        },
+        _SECOND_TUESDAY_PROGRAM,
+    )
+    captured: list[ExecutingCodeInterpreter] = []
+
+    def ci_factory(region):
+        c = ExecutingCodeInterpreter(region)
+        captured.append(c)
+        return c
+
+    changes = await extract_and_apply(
+        _call_record(account_id="ACC-1001"),
+        store,
+        _settings(),
+        bedrock_client=bedrock,
+        twilio_client_factory=lambda *a: _InsightsTwilioClient(),
+        code_interpreter_factory=ci_factory,
+    )
+
+    # The UI field was backfilled from the REAL model-authored + executed program.
+    assert changes["structured_data"]["payment_specifics"]["agreed_date"] == "2024-06-11"
+    assert store.get_due("ACC-1001")["promised_date"] == "2024-06-11"
+    # The sandbox actually ran (and was cleaned up) at least once.
+    assert captured and captured[0].started and captured[0].stopped
+    assert changes["intelligence_status"] == "ready"

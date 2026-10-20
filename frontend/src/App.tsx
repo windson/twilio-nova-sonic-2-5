@@ -1,7 +1,8 @@
-import { useCallback, useMemo, useState } from "react";
+import { Fragment, useCallback, useMemo, useState } from "react";
 import {
   ChevronDown,
   ExternalLink,
+  Hand,
   Info,
   PhoneCall,
   Settings2,
@@ -9,14 +10,18 @@ import {
 
 import {
   apiPost,
-  cloudwatchLogsUrl,
+  callDashboardUrl,
   DASH,
   dispositionLabel,
+  fmtDateTime,
   fmtMoney,
   fmtMs,
+  fmtRelativeTime,
   fmtText,
   type CallRecord,
+  type CallSummary,
   type DueRecord,
+  type ToolCall,
 } from "@/lib/api";
 import {
   chatSegments,
@@ -75,15 +80,20 @@ import { MetricTile } from "@/components/MetricTile";
 // --- metric help text (preserves the old metrics-note explanatory content) --
 const METRIC_HELP = {
   total:
-    "End-to-end wall-clock time of the whole call. It partitions into Nova Sonic total time plus its true complement, non-Nova time.",
+    "End-to-end wall-clock time of the whole call. It partitions into Nova Sonic total time plus its true complement, non-Sonic time.",
   nova: "Nova Sonic total time: the sum of active response (speaking) windows.",
   nonnova:
-    "Everything that is not Nova speaking: caller speech, silence, and transport. Equals total minus Nova.",
+    "Non-Sonic time: everything that is not Nova speaking (caller speech, silence, and transport). A bookkeeping residual equal to total minus Nova, NOT a transport-latency figure.",
   twilio:
-    "Twilio mean transport delay: a separate per-frame measurement (mean, not a share of total), so it is shown on its own rather than as a half of the end-to-end split.",
-  ttft: "Time to first token / first audio of the agent's reply.",
+    "Transport delay estimate: a per-frame mean derived from Twilio stream-relative timestamps (an estimate, not an authoritative network measurement). When the real Twilio Call resource is available it is shown in the Twilio insights panel below; advanced QoS (RTT/jitter/packet-loss) needs a paid add-on and is never fabricated.",
+  ttft: "Time to first audio (TTFT): from the response start to the first audio frame of Nova's reply.",
   turns: "Number of turns in the conversation (one caller utterance or one Nova reply each).",
   barge: "Count of barge-ins (caller interrupting Nova mid-reply).",
+  // ASK 1: per-turn chat-bubble meta.
+  responseWait:
+    "Response wait: time for Nova Sonic to begin answering after the caller stopped speaking. A wait window, NOT model or network latency.",
+  turnElapsed:
+    "Turn elapsed: how long this turn occupied the conversation (to the next turn's start). An elapsed window, NOT latency.",
 };
 
 function Toast({
@@ -180,10 +190,12 @@ export default function App() {
         <div className="mt-6 grid grid-cols-1 gap-5 lg:grid-cols-2">
           <DuesPanel
             dues={dues}
+            calls={calls}
             loading={duesLoading}
             error={duesError}
             calling={calling}
             onCall={placeCall}
+            onSelectCall={selectCall}
           />
           <CallsPanel
             calls={calls}
@@ -265,83 +277,190 @@ function statusClasses(status?: string | null): string {
   }
 }
 
+// ASK 3: one collapsible per due/account row (collapsed by default) that
+// expands to the calls associated with that account, joined client-side by
+// account_id against the /api/calls list. Each nested call row shows WHEN it
+// happened (absolute + relative), disposition, duration, and outcome.
+function DueRow({
+  due,
+  calls,
+  calling,
+  onCall,
+  onSelectCall,
+}: {
+  due: DueRecord;
+  calls: CallSummary[];
+  calling: string | null;
+  onCall: (accountId?: string) => void;
+  onSelectCall?: (callId?: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const accountCalls = useMemo(
+    () =>
+      calls
+        .filter((c) => c.account_id && c.account_id === due.account_id)
+        .slice()
+        .sort((a, b) => {
+          const ta = a.created_at ? new Date(a.created_at).getTime() : 0;
+          const tb = b.created_at ? new Date(b.created_at).getTime() : 0;
+          return tb - ta;
+        }),
+    [calls, due.account_id]
+  );
+
+  return (
+    <Collapsible
+      open={open}
+      onOpenChange={setOpen}
+      className="rounded-md border"
+    >
+      <div className="flex items-center gap-3 px-3 py-2.5">
+        <CollapsibleTrigger className="flex min-w-0 flex-1 items-center gap-2 text-left">
+          <ChevronDown
+            className={
+              "h-3.5 w-3.5 shrink-0 transition-transform " +
+              (open ? "rotate-0" : "-rotate-90")
+            }
+          />
+          <div className="grid min-w-0 flex-1 grid-cols-2 items-center gap-x-3 gap-y-0.5 sm:grid-cols-4">
+            <span className="truncate font-medium">
+              {due.account_id || ""}
+              {accountCalls.length > 0 && (
+                <span className="ml-1 rounded-full bg-muted px-1.5 text-[0.65rem] text-muted-foreground">
+                  {accountCalls.length}
+                </span>
+              )}
+            </span>
+            <span className="truncate text-muted-foreground">
+              {due.debtor_name || ""}
+            </span>
+            <span className="text-muted-foreground">
+              {fmtMoney(due.amount_due, due.currency)}
+            </span>
+            <span>
+              <Badge variant="outline" className={statusClasses(due.status)}>
+                {due.status || ""}
+              </Badge>
+            </span>
+          </div>
+        </CollapsibleTrigger>
+        <Button
+          size="sm"
+          disabled={calling === due.account_id}
+          onClick={() => onCall(due.account_id)}
+        >
+          <PhoneCall className="mr-1 h-3.5 w-3.5" />
+          {calling === due.account_id ? "Calling\u2026" : "Call now"}
+        </Button>
+      </div>
+      <CollapsibleContent>
+        <div className="border-t bg-muted/30 px-3 py-2">
+          <div className="mb-1 text-xs text-muted-foreground">
+            Due date: {due.due_date || DASH}
+          </div>
+          {accountCalls.length === 0 ? (
+            <p className="py-1 text-xs italic text-muted-foreground">
+              No calls recorded for this account yet.
+            </p>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>When</TableHead>
+                  <TableHead>Disposition</TableHead>
+                  <TableHead>Duration</TableHead>
+                  <TableHead>Outcome</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {accountCalls.map((c) => {
+                  const rel = fmtRelativeTime(c.created_at);
+                  return (
+                    <TableRow
+                      key={c.call_sid}
+                      className="cursor-pointer"
+                      onClick={() => onSelectCall?.(c.call_sid)}
+                    >
+                      <TableCell className="whitespace-nowrap text-xs">
+                        {fmtDateTime(c.created_at)}
+                        {rel && (
+                          <span className="ml-1 text-muted-foreground">
+                            ({rel})
+                          </span>
+                        )}
+                      </TableCell>
+                      <TableCell>
+                        <DispositionBadge disposition={c.disposition} />
+                      </TableCell>
+                      <TableCell className="text-xs">
+                        {fmtMs(c.total_e2e_ms)}
+                      </TableCell>
+                      <TableCell className="text-xs">
+                        {c.disposition
+                          ? dispositionLabel(c.disposition)
+                          : c.intelligence_status === "pending"
+                            ? "Processing\u2026"
+                            : DASH}
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          )}
+        </div>
+      </CollapsibleContent>
+    </Collapsible>
+  );
+}
+
 function DuesPanel({
   dues,
+  calls,
   loading,
   error,
   calling,
   onCall,
+  onSelectCall,
 }: {
   dues: DueRecord[];
+  calls: CallSummary[];
   loading: boolean;
   error: string | null;
   calling: string | null;
   onCall: (accountId?: string) => void;
+  onSelectCall?: (callId?: string) => void;
 }) {
   return (
     <Card>
       <CardHeader>
         <CardTitle className="text-base">Due records</CardTitle>
+        <CardDescription>
+          Expand an account to see its calls, most recent first.
+        </CardDescription>
       </CardHeader>
-      <CardContent>
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Account</TableHead>
-              <TableHead>Debtor</TableHead>
-              <TableHead>Amount due</TableHead>
-              <TableHead>Due date</TableHead>
-              <TableHead>Status</TableHead>
-              <TableHead />
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {loading && (
-              <TableRow>
-                <TableCell colSpan={6}>
-                  <Skeleton className="h-5 w-full" />
-                </TableCell>
-              </TableRow>
-            )}
-            {error && (
-              <TableRow>
-                <TableCell colSpan={6} className="text-center text-muted-foreground">
-                  Failed to load dues: {error}
-                </TableCell>
-              </TableRow>
-            )}
-            {!loading && !error && dues.length === 0 && (
-              <TableRow>
-                <TableCell colSpan={6} className="text-center italic text-muted-foreground">
-                  No due records.
-                </TableCell>
-              </TableRow>
-            )}
-            {dues.map((due) => (
-              <TableRow key={due.account_id}>
-                <TableCell>{due.account_id || ""}</TableCell>
-                <TableCell>{due.debtor_name || ""}</TableCell>
-                <TableCell>{fmtMoney(due.amount_due, due.currency)}</TableCell>
-                <TableCell>{due.due_date || ""}</TableCell>
-                <TableCell>
-                  <Badge variant="outline" className={statusClasses(due.status)}>
-                    {due.status || ""}
-                  </Badge>
-                </TableCell>
-                <TableCell className="text-right">
-                  <Button
-                    size="sm"
-                    disabled={calling === due.account_id}
-                    onClick={() => onCall(due.account_id)}
-                  >
-                    <PhoneCall className="mr-1 h-3.5 w-3.5" />
-                    {calling === due.account_id ? "Calling\u2026" : "Call now"}
-                  </Button>
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+      <CardContent className="space-y-2">
+        {loading && <Skeleton className="h-10 w-full" />}
+        {error && (
+          <p className="text-center text-sm text-muted-foreground">
+            Failed to load dues: {error}
+          </p>
+        )}
+        {!loading && !error && dues.length === 0 && (
+          <p className="text-center text-sm italic text-muted-foreground">
+            No due records.
+          </p>
+        )}
+        {dues.map((due) => (
+          <DueRow
+            key={due.account_id}
+            due={due}
+            calls={calls}
+            calling={calling}
+            onCall={onCall}
+            onSelectCall={onSelectCall}
+          />
+        ))}
       </CardContent>
     </Card>
   );
@@ -378,7 +497,7 @@ function CallsPanel({
               <TableHead>Disposition</TableHead>
               <TableHead>Turns</TableHead>
               <TableHead>Total e2e</TableHead>
-              <TableHead>CloudWatch</TableHead>
+              <TableHead>Dashboard</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -432,6 +551,7 @@ function CallsPanel({
                     {call.call_sid && (
                       <CloudWatchLink
                         callSid={call.call_sid}
+                        dashboardUrl={call.dashboard_url}
                         config={config}
                       />
                     )}
@@ -446,21 +566,26 @@ function CallsPanel({
   );
 }
 
-// CloudWatch deep link in a popover so the user can read exactly what it opens
-// (and the region/log group it targets) before following it.
+// ASK 4: per-call CloudWatch DASHBOARD deep link in a popover so the user can
+// read exactly what it opens (region/log group) before following it. Prefers
+// the backend-built dashboard_url and falls back to the client-side builder.
 function CloudWatchLink({
   callSid,
+  dashboardUrl,
   config,
 }: {
   callSid: string;
+  dashboardUrl?: string | null;
   config: ReturnType<typeof useConfig>;
 }) {
-  const url = cloudwatchLogsUrl(callSid, config?.aws_region, config?.app_log_group);
+  const url =
+    dashboardUrl ||
+    callDashboardUrl(callSid, config?.aws_region, config?.app_log_group);
   return (
     <Popover>
       <PopoverTrigger asChild onClick={(e) => e.stopPropagation()}>
         <button className="inline-flex items-center gap-1 text-xs text-primary hover:underline">
-          Logs <ExternalLink className="h-3 w-3" />
+          Call dashboard <ExternalLink className="h-3 w-3" />
         </button>
       </PopoverTrigger>
       <PopoverContent
@@ -468,7 +593,8 @@ function CloudWatchLink({
         onClick={(e) => e.stopPropagation()}
       >
         <p className="mb-2 text-muted-foreground">
-          Opens CloudWatch Logs filtered to this call.
+          Opens a CloudWatch dashboard scoped to this call (TTFT, turns, token
+          usage, barge-ins, transport, timeline).
         </p>
         <dl className="mb-3 space-y-1">
           <div className="flex justify-between gap-2">
@@ -482,7 +608,7 @@ function CloudWatchLink({
             </dd>
           </div>
           <div className="flex justify-between gap-2">
-            <dt className="text-muted-foreground">Filter</dt>
+            <dt className="text-muted-foreground">Scoped to call</dt>
             <dd className="truncate font-mono">{callSid}</dd>
           </div>
         </dl>
@@ -492,7 +618,7 @@ function CloudWatchLink({
           rel="noopener"
           className="inline-flex items-center gap-1 font-medium text-primary hover:underline"
         >
-          Open in CloudWatch <ExternalLink className="h-3 w-3" />
+          Open CloudWatch dashboard <ExternalLink className="h-3 w-3" />
         </a>
       </PopoverContent>
     </Popover>
@@ -583,9 +709,14 @@ function CallDetail({
 
             <Separator />
 
+            <TwilioInsightsPanel record={r} />
+
+            <Separator />
+
             <div>
-              <h3 className="mb-2 text-sm font-semibold">Turn-by-turn latency</h3>
+              <h3 className="mb-2 text-sm font-semibold">Turn-by-turn metrics</h3>
               <TurnLatencyTable record={r} />
+              <AsyncToolCalls record={r} />
             </div>
 
             <Separator />
@@ -681,12 +812,20 @@ function IntelStatusBadge({ status }: { status?: string | null }) {
 
 function MetricTiles({ record }: { record: CallRecord | null }) {
   const r = record;
+  // ASK 6: the transport figure is an ESTIMATE (per-frame mean). Prefer the
+  // accurate-named field and fall back to the deprecated alias.
+  const transportEstimate =
+    r?.transport_delay_estimate_ms ?? r?.twilio_latency_ms ?? null;
   return (
     <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
       <MetricTile label="Total end-to-end" value={fmtMs(r?.total_e2e_ms)} help={METRIC_HELP.total} />
       <MetricTile label="Nova Sonic total" value={fmtMs(r?.nova_total_ms)} help={METRIC_HELP.nova} />
-      <MetricTile label="Non-Nova time" value={fmtMs(r?.non_nova_ms)} help={METRIC_HELP.nonnova} />
-      <MetricTile label="Twilio transport" value={fmtMs(r?.twilio_latency_ms)} help={METRIC_HELP.twilio} />
+      <MetricTile label="Non-Sonic time" value={fmtMs(r?.non_nova_ms)} help={METRIC_HELP.nonnova} />
+      <MetricTile
+        label="Transport delay (est.)"
+        value={fmtMs(transportEstimate)}
+        help={METRIC_HELP.twilio}
+      />
       <MetricTile label="TTFT" value={fmtMs(r?.ttft_ms)} help={METRIC_HELP.ttft} />
       <MetricTile
         label="Turn count"
@@ -702,8 +841,140 @@ function MetricTiles({ record }: { record: CallRecord | null }) {
   );
 }
 
-// Per-turn latency table from conversation_turns: # | Role | TTFT | Response |
-// Tool, with em-dashes for blank cells. Caller rows have no TTFT/Response.
+// ASK 6: honest Twilio insights panel. Shows the authentic Twilio Call-resource
+// facts when enrichment has run (source === 'twilio_call_resource'), an explicit
+// "pending" note before enrichment, or an "unavailable" note (with reason) when
+// creds/sid were missing or the fetch failed. Advanced QoS (RTT/jitter/packet
+// loss/MOS) is a paid add-on: we state the limitation rather than fabricate.
+function TwilioInsightsPanel({ record }: { record: CallRecord | null }) {
+  const ins = record?.twilio_insights;
+  if (!ins) return null;
+  const available = Boolean(ins.available);
+  const source = ins.source || "pending";
+  const fields = (ins.fields || {}) as Record<string, unknown>;
+
+  const fieldRow = (label: string, key: string) => {
+    const v = fields[key];
+    if (v === null || v === undefined || v === "") return null;
+    return <SummaryField key={key} label={label} value={String(v)} />;
+  };
+
+  return (
+    <div>
+      <h3 className="mb-1 flex items-center gap-2 text-sm font-semibold">
+        Twilio insights
+        <Badge
+          variant="outline"
+          className={
+            available
+              ? "border-emerald-500/40 text-emerald-300"
+              : source === "pending"
+                ? "border-amber-500/40 text-amber-300"
+                : "border-slate-500/40 text-slate-300"
+          }
+        >
+          {available
+            ? "authentic Call resource"
+            : source === "pending"
+              ? "pending enrichment"
+              : "unavailable"}
+        </Badge>
+      </h3>
+      {!available && source === "pending" && (
+        <p className="mb-2 text-xs text-muted-foreground">
+          Real Twilio Call-resource data is fetched off the audio path after the
+          call ends; it has not been enriched yet for this call.
+        </p>
+      )}
+      {!available && source !== "pending" && (
+        <p className="mb-2 text-xs text-muted-foreground">
+          Authentic Twilio data is unavailable for this call
+          {ins.error ? ` (${ins.error})` : ""}. No metrics are shown rather than
+          fabricated.
+        </p>
+      )}
+      {available && (
+        <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm sm:grid-cols-3">
+          {fieldRow("Status", "status")}
+          {fieldRow("Direction", "direction")}
+          {fieldRow("Duration (s)", "duration")}
+          {fieldRow("From", "from_formatted") || fieldRow("From", "from")}
+          {fieldRow("To", "to_formatted") || fieldRow("To", "to")}
+          {fieldRow("Start", "start_time")}
+          {fieldRow("End", "end_time")}
+          {fieldRow("Price", "price")}
+          {fieldRow("Answered by", "answered_by")}
+          {fieldRow("Queue time", "queue_time")}
+        </dl>
+      )}
+      <p className="mt-2 text-xs text-muted-foreground">
+        {ins.advanced_qos_available
+          ? "Advanced Voice Insights QoS metrics are available."
+          : `Advanced QoS (RTT / jitter / packet loss / MOS) is not available${
+              ins.advanced_qos_reason ? `: ${ins.advanced_qos_reason}` : ""
+            }. These are never estimated or fabricated.`}
+      </p>
+    </div>
+  );
+}
+
+// ASK 5: render the sync/async tool calls for a turn. Sync in-call tools show
+// a timing; async (post-call) tools are visually marked as off-path (they add
+// no call latency).
+function ToolCalls({ calls }: { calls: ToolCall[] }) {
+  if (!calls.length) return <>{DASH}</>;
+  return (
+    <div className="flex flex-wrap gap-1">
+      {calls.map((c, i) => {
+        const async = c.kind === "async" || c.off_path === true;
+        return (
+          <Badge
+            key={i}
+            variant="outline"
+            className={
+              "font-mono text-[0.65rem] " +
+              (async
+                ? "border-amber-500/40 text-amber-300"
+                : "border-sky-500/40 text-sky-300")
+            }
+            title={
+              async
+                ? "async / post-call tool (off-path, adds no call latency)"
+                : c.t_ms != null
+                  ? `sync in-call tool at ${fmtMs(c.t_ms)}`
+                  : "sync in-call tool"
+            }
+          >
+            {c.tool || "tool"} &middot; {async ? "async" : "sync"}
+            {!async && c.t_ms != null ? ` \u00b7 ${fmtMs(c.t_ms)}` : ""}
+            {async ? " \u00b7 off-path" : ""}
+          </Badge>
+        );
+      })}
+    </div>
+  );
+}
+
+// ASK 5: call-level async (post-call, off-path) tool calls. These are NOT part
+// of any live turn and add no call latency, so they are listed separately
+// beneath the turn table with an explicit off-path note.
+function AsyncToolCalls({ record }: { record: CallRecord | null }) {
+  const calls = record?.async_tool_calls || [];
+  if (!calls.length) return null;
+  return (
+    <div className="mt-3">
+      <p className="mb-1 text-xs font-medium text-muted-foreground">
+        Async tool calls (post-call, off-path &mdash; add no call latency)
+      </p>
+      <ToolCalls calls={calls} />
+    </div>
+  );
+}
+
+// Per-turn metrics table from conversation_turns:
+// # | Role | TTFT | Response wait | Turn elapsed | Tool. ASK 1 uses accurate
+// labels (no "latency"); ASK 5 fills the Tool column with sync/async tool
+// calls; ASK 7 marks interrupted assistant turns.
 function TurnLatencyTable({ record }: { record: CallRecord | null }) {
   const turns = (record?.conversation_turns || [])
     .slice()
@@ -725,7 +996,8 @@ function TurnLatencyTable({ record }: { record: CallRecord | null }) {
           <TableHead className="w-10">#</TableHead>
           <TableHead>Role</TableHead>
           <TableHead>TTFT</TableHead>
-          <TableHead>Response</TableHead>
+          <TableHead>Response wait</TableHead>
+          <TableHead>Turn elapsed</TableHead>
           <TableHead>Tool</TableHead>
         </TableRow>
       </TableHeader>
@@ -736,26 +1008,42 @@ function TurnLatencyTable({ record }: { record: CallRecord | null }) {
             isAgent && t.ttft_ms != null
               ? fmtMs(t.ttft_ms)
               : isAgent && t.ttft_source === "unavailable"
-                ? "n/a (shared response)"
+                ? "n/a (single response window)"
                 : DASH;
+          const responseWait = t.response_wait_ms ?? t.latency_ms ?? null;
+          const turnElapsed = t.turn_elapsed_ms ?? t.total_ms ?? null;
           return (
             <TableRow key={i}>
               <TableCell>{i + 1}</TableCell>
               <TableCell>
-                <Badge
-                  variant="outline"
-                  className={
-                    isAgent
-                      ? "border-emerald-500/40 text-emerald-300"
-                      : "border-primary/40 text-primary"
-                  }
-                >
-                  {isAgent ? "AGENT" : "CALLER"}
-                </Badge>
+                <div className="flex flex-wrap items-center gap-1">
+                  <Badge
+                    variant="outline"
+                    className={
+                      isAgent
+                        ? "border-emerald-500/40 text-emerald-300"
+                        : "border-primary/40 text-primary"
+                    }
+                  >
+                    {isAgent ? "AGENT" : "CALLER"}
+                  </Badge>
+                  {t.interrupted && (
+                    <Badge
+                      variant="outline"
+                      className="border-amber-500/50 text-amber-300"
+                      title="A barge-in interrupted this turn; the full intended reply may not have been delivered."
+                    >
+                      interrupted
+                    </Badge>
+                  )}
+                </div>
               </TableCell>
               <TableCell>{ttft}</TableCell>
-              <TableCell>{isAgent ? fmtMs(t.total_ms) : DASH}</TableCell>
-              <TableCell>{DASH}</TableCell>
+              <TableCell>{isAgent ? fmtMs(responseWait) : DASH}</TableCell>
+              <TableCell>{isAgent ? fmtMs(turnElapsed) : DASH}</TableCell>
+              <TableCell>
+                <ToolCalls calls={t.tool_calls || []} />
+              </TableCell>
             </TableRow>
           );
         })}
@@ -797,6 +1085,20 @@ function TranscriptPanel({
   );
 }
 
+// ASK 7: an inline barge-in marker interleaved into the conversation timeline
+// at the point a turn was interrupted. We surface the interruption honestly
+// (GA exposes no delivered-vs-intended transcript) rather than implying the
+// full intended utterance was delivered.
+function BargeInMarker() {
+  return (
+    <div className="flex justify-center">
+      <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/50 bg-amber-500/10 px-2.5 py-0.5 text-[0.65rem] font-medium uppercase tracking-wide text-amber-300">
+        <Hand className="h-3 w-3" /> caller barged in
+      </span>
+    </div>
+  );
+}
+
 function ChatView({ record }: { record: CallRecord | null }) {
   const segments = record ? chatSegments(record) : [];
   if (!segments.length) {
@@ -809,45 +1111,58 @@ function ChatView({ record }: { record: CallRecord | null }) {
   return (
     <div className="flex flex-col gap-2.5">
       {segments.map((seg, i) => {
+        // ASK 1: truthful meta labels. The large numbers are a wait/elapsed
+        // window, NOT "latency", so they no longer contradict a small TTFT.
         const parts: string[] = [];
-        if (seg.totalMs != null) parts.push(`turn ${fmtMs(seg.totalMs)}`);
+        if (seg.turnElapsedMs != null)
+          parts.push(`turn elapsed ${fmtMs(seg.turnElapsedMs)}`);
         if (seg.speaker === "assistant") {
-          if (seg.latencyMs != null) parts.push(`latency ${fmtMs(seg.latencyMs)}`);
+          if (seg.responseWaitMs != null)
+            parts.push(`response wait ${fmtMs(seg.responseWaitMs)}`);
           if (seg.ttftMs != null) {
-            const label =
-              seg.ttftSource === "response_window" ? "TTFT (response)" : "TTFT";
-            parts.push(`${label} ${fmtMs(seg.ttftMs)}`);
+            parts.push(`TTFT ${fmtMs(seg.ttftMs)}`);
           } else if (seg.ttftSource === "unavailable") {
-            parts.push("TTFT n/a (shared response)");
+            parts.push("TTFT n/a (single response window)");
           }
         }
         const isAgent = seg.speaker === "assistant";
         return (
-          <div
-            key={i}
-            className={"flex " + (isAgent ? "justify-end" : "justify-start")}
-          >
-            <div
-              className={
-                "max-w-[72%] rounded-xl border px-3 py-2 " +
-                (isAgent
-                  ? "border-emerald-500/40 bg-emerald-500/10"
-                  : "border-primary/40 bg-primary/10")
-              }
-            >
-              <div className="text-[0.65rem] uppercase tracking-wide text-muted-foreground">
-                {isAgent ? "Nova Sonic" : "Caller"}
-              </div>
-              <div className="whitespace-pre-wrap break-words text-sm">
-                {seg.text}
-              </div>
-              {parts.length > 0 && (
-                <div className="mt-1 text-[0.7rem] text-muted-foreground">
-                  {parts.join(" \u00b7 ")}
+          <Fragment key={i}>
+            <div className={"flex " + (isAgent ? "justify-end" : "justify-start")}>
+              <div
+                className={
+                  "max-w-[72%] rounded-xl border px-3 py-2 " +
+                  (seg.interrupted
+                    ? "border-amber-500/50 bg-amber-500/10"
+                    : isAgent
+                      ? "border-emerald-500/40 bg-emerald-500/10"
+                      : "border-primary/40 bg-primary/10")
+                }
+              >
+                <div className="flex items-center gap-1.5 text-[0.65rem] uppercase tracking-wide text-muted-foreground">
+                  {isAgent ? "Nova Sonic" : "Caller"}
+                  {seg.interrupted && (
+                    <Badge
+                      variant="outline"
+                      className="border-amber-500/50 px-1 py-0 text-[0.6rem] text-amber-300"
+                      title="A barge-in interrupted this reply; the text shown is what Nova intended, not necessarily what was delivered before the caller cut in."
+                    >
+                      interrupted
+                    </Badge>
+                  )}
                 </div>
-              )}
+                <div className="whitespace-pre-wrap break-words text-sm">
+                  {seg.text}
+                </div>
+                {parts.length > 0 && (
+                  <div className="mt-1 text-[0.7rem] text-muted-foreground">
+                    {parts.join(" \u00b7 ")}
+                  </div>
+                )}
+              </div>
             </div>
-          </div>
+            {seg.interrupted && <BargeInMarker />}
+          </Fragment>
         );
       })}
     </div>

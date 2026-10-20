@@ -14,8 +14,14 @@ export interface DueRecord {
 export interface CallSummary {
   call_sid?: string;
   account_id?: string;
+  // ASK 3: absolute wall-clock start time (UTC ISO-8601) used to join calls
+  // under their due record and render WHEN each call happened.
+  created_at?: string | null;
   total_e2e_ms?: number | null;
   nova_total_ms?: number | null;
+  // ASK 6: accurate-named transport ESTIMATE; twilio_latency_ms is the
+  // deprecated alias (same value) kept until the backend drops it.
+  transport_delay_estimate_ms?: number | null;
   twilio_latency_ms?: number | null;
   ttft_ms?: number | null;
   turn_count?: number | null;
@@ -23,6 +29,9 @@ export interface CallSummary {
   barge_in_count?: number | null;
   disposition?: string | null;
   intelligence_status?: string | null;
+  // ASK 4: backend-built per-call CloudWatch dashboard deep-link (config-built,
+  // scoped to this call_sid). The UI prefers this over client-side building.
+  dashboard_url?: string | null;
 }
 
 export interface Turn {
@@ -33,16 +42,44 @@ export interface Turn {
   duration_ms?: number | null;
 }
 
+// ASK 5: a tool invocation attached to a conversation turn (sync, in-call) or
+// to the call record (async, post-call, off-path).
+export interface ToolCall {
+  tool?: string | null;
+  kind?: "sync" | "async" | string;
+  t_ms?: number | null;
+  duration_ms?: number | null;
+  // Present and true on async (post-call) entries: they do NOT add call
+  // latency.
+  off_path?: boolean;
+}
+
+// ASK 7: an inline barge-in marker interleaved into the conversation timeline.
+export interface BargeInEvent {
+  type?: string; // 'barge_in'
+  t_ms?: number | null;
+}
+
 export interface ConversationTurn {
   index?: number;
   speaker?: string;
   start_ms?: number | null;
   end_ms?: number | null;
   text?: string;
+  // ASK 1 accurate names (the legacy total_ms / latency_ms aliases carry the
+  // same values and are kept until the backend drops them).
+  turn_elapsed_ms?: number | null;
   total_ms?: number | null;
+  response_wait_ms?: number | null;
+  latency_ms?: number | null;
+  transcript_span_ms?: number | null;
   ttft_ms?: number | null;
   ttft_source?: string | null;
-  latency_ms?: number | null;
+  // ASK 7: assistant turns interrupted by a barge-in.
+  interrupted?: boolean;
+  barge_in_ms?: number[];
+  // ASK 5: sync in-call tool invocations attached to this turn.
+  tool_calls?: ToolCall[];
 }
 
 export interface Transcript {
@@ -71,12 +108,29 @@ export interface StructuredData {
   [key: string]: unknown;
 }
 
+// ASK 2/6: authentic Twilio Call-resource facts fetched off-path post-call.
+// Advanced QoS (RTT/jitter/packet-loss/MOS) is a paid add-on and is never
+// fabricated; advanced_qos_available is false on the trial account.
+export interface TwilioInsights {
+  available?: boolean;
+  source?: string; // 'pending' | 'twilio_call_resource' | 'unavailable'
+  advanced_qos_available?: boolean;
+  advanced_qos_reason?: string | null;
+  fields?: Record<string, unknown>;
+  error?: string;
+}
+
 export interface CallRecord {
   call_sid?: string;
   account_id?: string;
+  // ASK 3: absolute wall-clock start time (UTC ISO-8601).
+  created_at?: string | null;
   total_e2e_ms?: number | null;
   nova_total_ms?: number | null;
   non_nova_ms?: number | null;
+  // ASK 6: accurate-named transport ESTIMATE; twilio_latency_ms is the
+  // deprecated alias (same value).
+  transport_delay_estimate_ms?: number | null;
   twilio_latency_ms?: number | null;
   ttft_ms?: number | null;
   turn_count?: number | null;
@@ -88,6 +142,12 @@ export interface CallRecord {
   conversation_turns?: ConversationTurn[];
   transcripts?: Transcript[];
   events_log?: EventLogEntry[];
+  // ASK 2/6: authentic Twilio Call-resource facts (pending until enrichment).
+  twilio_insights?: TwilioInsights | null;
+  // ASK 5: call-level async (post-call, off-path) tool calls.
+  async_tool_calls?: ToolCall[];
+  // ASK 7: inline barge-in timeline markers (ordered by t_ms).
+  barge_in_events?: BargeInEvent[];
   disposition?: string | null;
   structured_data?: StructuredData | null;
   next_best_action?: string | null;
@@ -97,6 +157,8 @@ export interface CallRecord {
   ptp_sms_status?: string | null;
   ptp_sms_to?: string | null;
   triggers?: string[];
+  // ASK 4: backend-built per-call CloudWatch dashboard deep-link.
+  dashboard_url?: string | null;
 }
 
 export interface AppConfig {
@@ -194,6 +256,41 @@ export function fmtText(value: unknown): string {
   return String(value);
 }
 
+// ASK 3: render an absolute wall-clock timestamp (local, human readable) for
+// the calls-under-dues "WHEN" column. Returns the dash placeholder for a
+// missing/invalid value.
+export function fmtDateTime(iso: string | null | undefined): string {
+  if (!iso) return DASH;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return DASH;
+  return d.toLocaleString();
+}
+
+// ASK 3: render a coarse relative time like "2h ago" / "just now" for the
+// calls-under-dues "WHEN" column (shown alongside the absolute timestamp).
+export function fmtRelativeTime(
+  iso: string | null | undefined,
+  now: number = Date.now()
+): string {
+  if (!iso) return "";
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return "";
+  const diffMs = now - t;
+  const future = diffMs < 0;
+  const abs = Math.abs(diffMs);
+  const sec = Math.round(abs / 1000);
+  const min = Math.round(sec / 60);
+  const hr = Math.round(min / 60);
+  const day = Math.round(hr / 24);
+  let text: string;
+  if (sec < 45) text = "just now";
+  else if (min < 60) text = `${min}m`;
+  else if (hr < 24) text = `${hr}h`;
+  else text = `${day}d`;
+  if (text === "just now") return text;
+  return future ? `in ${text}` : `${text} ago`;
+}
+
 // Map a snake_case disposition tag to a human-readable label (ported from
 // web/app.js DISPOSITION_LABELS).
 const DISPOSITION_LABELS: Record<string, string> = {
@@ -217,23 +314,55 @@ export function dispositionLabel(disposition?: string | null): string {
     .join(" ");
 }
 
-// Build the CloudWatch Logs console deep link scoped to a single call. This is
-// a verbatim port of web/app.js cloudwatchLogsUrl: the log-group path is
-// double-URL-encoded (each "/" -> "%2F" -> console "$252F"), and "?"/"="
-// inside the fragment are written as the console's "$3F"/"$3D" escapes; the
-// call_sid is passed as a PLAIN filterPattern term (not quoted).
-export function cloudwatchLogsUrl(
+// ASK 4: build the consolidated per-call CloudWatch DASHBOARD deep-link scoped
+// to a single call_sid. This opens a CloudWatch Logs Insights view filtered to
+// the call that surfaces TTFT, turns, token usage, barge-ins, tool invocations,
+// transport and the call timeline by parsing the app's JSON-line logs. The
+// backend returns this same URL on each call record (dashboard_url); this
+// client-side builder mirrors that construction exactly and is used as a
+// fallback when the backend field is absent.
+//
+// Encoding mirrors app/dashboard.py: each literal is percent-encoded then "%"
+// is rewritten to the console's "*" escape; "?"/"=" in the fragment use the
+// console's "$3F"/"$3D" escapes; the queryDetail value is the console's
+// RISON-like "~(...)" token tree.
+function consoleToken(value: string): string {
+  let out = "";
+  for (const ch of value) {
+    if (/[A-Za-z0-9\-_.]/.test(ch)) {
+      out += ch;
+    } else {
+      for (const byte of new TextEncoder().encode(ch)) {
+        out += "*" + byte.toString(16).toUpperCase().padStart(2, "0");
+      }
+    }
+  }
+  return out;
+}
+
+export function callDashboardQuery(callSid: string, appLogGroup: string): string {
+  return (
+    `SOURCE '${appLogGroup}'` +
+    ` | fields t_ms, event_type, ttft_ms, turn_latency_ms, duration_ms,` +
+    ` tool, role, input_tokens, output_tokens, total_tokens, message` +
+    ` | filter call_sid = '${callSid}'` +
+    ` | sort t_ms asc` +
+    ` | limit 1000`
+  );
+}
+
+export function callDashboardUrl(
   callSid: string,
   awsRegion?: string | null,
   appLogGroup?: string | null
 ): string {
   const region = awsRegion || "us-east-1";
   const logGroup = appLogGroup || "/ecs/ar-collections-nova-sonic/app";
-  const encGroup = encodeURIComponent(logGroup).replace(/%/g, "$25");
-  const filter = encodeURIComponent(callSid).replace(/%/g, "$25");
+  const query = callDashboardQuery(callSid, logGroup);
+  const detail =
+    "~(end~0~start~-3600~timeType~'RELATIVE~unit~'seconds" +
+    `~editorString~'${consoleToken(query)}` +
+    `~source~(~'${consoleToken(logGroup)}))`;
   const base = `https://${region}.console.aws.amazon.com/cloudwatch/home?region=${region}`;
-  return (
-    `${base}#logsV2:log-groups/log-group/${encGroup}/log-events` +
-    `$3FfilterPattern$3D${filter}`
-  );
+  return `${base}#logsV2:logs-insights$3FqueryDetail$3D${detail}`;
 }

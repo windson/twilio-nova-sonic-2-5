@@ -66,17 +66,29 @@ _ISO_DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 # The model reasons from today's date and the phrase and emits a self-contained
 # program. It must print ONLY the resolved date (or the sentinel).
 _CODE_GEN_SYSTEM = (
-    "You are a Python programmer. Write a short, self-contained Python 3 "
-    "program that computes a concrete calendar date from a reference date "
-    "(treated as TODAY) and a natural-language date phrase. Reason from the "
-    "reference date. Handle relative and natural phrasings generally, for "
-    "example: 'today', 'tomorrow', 'next <weekday>', 'in N days/weeks/months', "
-    "'the first/second/last <weekday> of next month', 'end of (next) month', "
-    "and explicit calendar dates. Use only the Python standard library "
-    "(datetime, calendar). The program must print EXACTLY ONE line: the "
-    "resolved date as YYYY-MM-DD, or the literal token " + _UNRESOLVED + " if "
-    "the phrase cannot be resolved to a single date. Output ONLY the Python "
-    "source code - no markdown fences, no prose, no explanation."
+    "You are a Python programmer. Write a SHORT, self-contained Python 3 "
+    "program that computes the single concrete calendar date meant by THIS "
+    "specific reference date (treated as TODAY) and date phrase. Do NOT write a "
+    "general-purpose parser that handles many phrasings - reason about the one "
+    "given phrase yourself and write the minimal code that computes just that "
+    "date. Use only the Python standard library (datetime, calendar). Define "
+    "the reference date inline from the value given. The program MUST end by "
+    "printing EXACTLY ONE line: the resolved date as YYYY-MM-DD, or the literal "
+    "token " + _UNRESOLVED + " if it cannot be resolved to a single date. "
+    "Output ONLY the complete Python source code - no markdown fences, no "
+    "prose, no explanation, and make sure the program is syntactically "
+    "complete.\n"
+    "For an 'Nth <weekday> of <month>' phrase, use calendar.monthcalendar("
+    "year, month), which returns weeks as lists where index 0=Monday..6=Sunday "
+    "and 0 marks days outside the month; collect the non-zero entries for the "
+    "target weekday column and take the Nth. Example - second Tuesday of a "
+    "month:\n"
+    "  import calendar, datetime\n"
+    "  weeks = calendar.monthcalendar(year, month)\n"
+    "  tuesdays = [w[calendar.TUESDAY] for w in weeks if w[calendar.TUESDAY]]\n"
+    "  day = tuesdays[1]  # index 1 == second\n"
+    "  print(datetime.date(year, month, day).isoformat())\n"
+    "Adapt that pattern to the actual weekday and ordinal in the phrase."
 )
 
 
@@ -89,7 +101,10 @@ def _code_gen_prompt(phrase: str, reference_date: str) -> str:
     return (
         "Reference date (today): " + reference_date + "\n"
         "Natural-language date phrase: " + phrase + "\n\n"
-        "Write the Python program now."
+        "Guidance: be careful and correct with the arithmetic; 'next month' is "
+        "the month after the reference month (roll the year over in December). "
+        "Verify the printed date actually falls on the requested weekday.\n\n"
+        "Write the complete Python program now."
     )
 
 
@@ -138,7 +153,7 @@ def _generate_program(
                     "content": [{"text": _code_gen_prompt(phrase, reference_date)}],
                 }
             ],
-            inferenceConfig={"maxTokens": 512, "temperature": 0.0},
+            inferenceConfig={"maxTokens": 1500, "temperature": 0.0},
         )
     except Exception as exc:  # noqa: BLE001 - never raise into the caller
         logger.warning("phrase=<%s> | code generation call failed: %s", phrase, exc)

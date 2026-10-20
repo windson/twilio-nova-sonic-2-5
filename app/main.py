@@ -22,6 +22,7 @@ import asyncio
 
 from app.collections_agent import build_tools, get_system_prompt
 from app.config import get_settings
+from app.dashboard import call_dashboard_url
 from app.metrics import CallMetrics, configure_json_logging
 from app.postcall import extract_and_apply
 from app.sonic_bridge import DEFAULT_KICKOFF_TEXT, SonicSession
@@ -154,13 +155,38 @@ def _launch_postcall(
     return task
 
 
+def _dashboard_url(call_sid: str | None) -> str | None:
+    """Build the per-call CloudWatch dashboard deep-link from config (ASK 4).
+
+    Pure string construction (no AWS call): a consolidated CloudWatch Logs
+    Insights view scoped to ``call_sid`` against the configured app log group +
+    region, surfacing TTFT, turns, token usage, barge-ins, tool invocations,
+    transport and the call timeline. ``None`` when the record has no call_sid.
+    """
+    if not call_sid:
+        return None
+    settings = get_settings()
+    return call_dashboard_url(
+        call_sid,
+        aws_region=settings.aws_region,
+        app_log_group=settings.app_log_group,
+    )
+
+
 def _call_summary(record: dict[str, Any]) -> dict[str, Any]:
     """Project a CallAnalytics record to a compact list summary."""
     return {
         "call_sid": record.get("call_sid"),
         "account_id": record.get("account_id"),
+        # ASK 3: absolute wall-clock start time so the calls-under-dues view can
+        # render WHEN each call happened (absolute + relative) via a
+        # client-side join on account_id against this list endpoint.
+        "created_at": record.get("created_at"),
         "total_e2e_ms": record.get("total_e2e_ms"),
         "nova_total_ms": record.get("nova_total_ms"),
+        # ASK 6: accurate-named transport ESTIMATE (legacy alias kept for the UI
+        # during the FEAT-004 transition).
+        "transport_delay_estimate_ms": record.get("transport_delay_estimate_ms"),
         "twilio_latency_ms": record.get("twilio_latency_ms"),
         "ttft_ms": record.get("ttft_ms"),
         "turn_count": record.get("turn_count"),
@@ -170,6 +196,9 @@ def _call_summary(record: dict[str, Any]) -> dict[str, Any]:
         # show the disposition tag and whether extraction is still pending.
         "disposition": record.get("disposition"),
         "intelligence_status": record.get("intelligence_status"),
+        # ASK 4: per-call CloudWatch dashboard deep-link (replaces the old raw
+        # "Logs" link) so each row links to a consolidated call-scoped view.
+        "dashboard_url": _dashboard_url(record.get("call_sid")),
     }
 
 
@@ -257,7 +286,12 @@ async def get_call(call_id: str) -> dict[str, Any]:
     record = get_default_store().get_call(call_id)
     if record is None:
         raise HTTPException(status_code=404, detail=f"Unknown call_id: {call_id}")
-    return record
+    # ASK 4: attach the per-call CloudWatch dashboard deep-link (config-built,
+    # no live AWS call) so the detail view can open the consolidated call-scoped
+    # dashboard. Non-destructive: we return a shallow copy with the field added.
+    enriched = dict(record)
+    enriched["dashboard_url"] = _dashboard_url(record.get("call_sid"))
+    return enriched
 
 
 @app.websocket("/media")

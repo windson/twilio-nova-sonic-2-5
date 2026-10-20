@@ -138,6 +138,10 @@ def test_get_calls_and_get_call_by_id_return_persisted_analytics(store):
     summary = next(c for c in calls if c["call_sid"] == "CA_persisted")
     assert summary["turn_count"] == 3
     assert summary["total_e2e_ms"] == 12345.0
+    # ASK 3: the list summary exposes the created_at key (None when the
+    # persisted record carried no wall-clock stamp) so the UI can join calls
+    # under their due record and render WHEN each call happened.
+    assert "created_at" in summary
 
     detail_resp = client.get("/api/calls/CA_persisted")
     assert detail_resp.status_code == 200
@@ -188,9 +192,168 @@ def test_calls_expose_postcall_intelligence_fields(store):
     assert full["ptp_sms_status"] == "sent"
 
 
+def test_calls_serialize_feat003_fields(store):
+    """FEAT-003: the full record serialized by GET /api/calls/{id} must carry
+    the renamed/added fields so FEAT-004's UI can read them -- twilio_insights,
+    transport_delay_estimate_ms, per-turn tool_calls + response_wait_ms +
+    turn_elapsed_ms + interrupted, barge_in_events, and async_tool_calls. The
+    list summary also exposes transport_delay_estimate_ms.
+    """
+    analytics = {
+        "call_sid": "CA_feat003",
+        "account_id": "ACC-1001",
+        "total_e2e_ms": 5000.0,
+        "nova_total_ms": 3000.0,
+        "transport_delay_estimate_ms": 42.0,
+        "twilio_latency_ms": 42.0,
+        "non_nova_ms": 2000.0,
+        "turn_count": 2,
+        "conversation_turns": [
+            {
+                "index": 0,
+                "speaker": "assistant",
+                "text": "Hello.",
+                "response_wait_ms": 120.0,
+                "latency_ms": 120.0,
+                "turn_elapsed_ms": 500.0,
+                "total_ms": 500.0,
+                "interrupted": True,
+                "barge_in_ms": [1500.0],
+                "tool_calls": [
+                    {"tool": "update_due_record", "kind": "sync", "t_ms": 1200.0}
+                ],
+            },
+            {"index": 1, "speaker": "user", "text": "Hi.", "interrupted": False,
+             "tool_calls": []},
+        ],
+        "barge_in_events": [{"type": "barge_in", "t_ms": 1500.0}],
+        "async_tool_calls": [
+            {"tool": "resolve_date_phrase", "kind": "async", "t_ms": None, "off_path": True}
+        ],
+        "twilio_insights": {
+            "available": True,
+            "source": "twilio_call_resource",
+            "advanced_qos_available": False,
+            "advanced_qos_reason": "advanced QoS add-on not enabled",
+            "fields": {"status": "completed", "duration": "90", "from": "+15005550006"},
+        },
+    }
+    store.save_call_analytics(analytics)
+
+    # List summary carries the accurate-named transport estimate.
+    calls = client.get("/api/calls").json()["calls"]
+    summary = next(c for c in calls if c["call_sid"] == "CA_feat003")
+    assert summary["transport_delay_estimate_ms"] == 42.0
+
+    full = client.get("/api/calls/CA_feat003").json()
+    # ASK 2/6 twilio_insights.
+    assert full["twilio_insights"]["available"] is True
+    assert full["twilio_insights"]["advanced_qos_available"] is False
+    assert full["twilio_insights"]["fields"]["status"] == "completed"
+    assert full["transport_delay_estimate_ms"] == 42.0
+    # ASK 1 accurate per-turn field names.
+    asst = full["conversation_turns"][0]
+    assert asst["response_wait_ms"] == 120.0
+    assert asst["turn_elapsed_ms"] == 500.0
+    # ASK 5 per-turn tool_calls + call-level async_tool_calls.
+    assert asst["tool_calls"][0]["tool"] == "update_due_record"
+    assert asst["tool_calls"][0]["kind"] == "sync"
+    assert full["async_tool_calls"][0]["kind"] == "async"
+    assert full["async_tool_calls"][0]["t_ms"] is None
+    # ASK 7 interrupted + inline barge-in markers.
+    assert asst["interrupted"] is True
+    assert full["barge_in_events"] == [{"type": "barge_in", "t_ms": 1500.0}]
+
+
+def test_call_record_carries_created_at_for_calls_under_dues(store):
+    """ASK 3: CallMetrics stamps an absolute wall-clock created_at at session
+    start, it is serialized on the full record, and the /api/calls list summary
+    exposes it so the UI can join calls under their due record and show WHEN
+    each call happened. Fails if created_at is dropped from either the record
+    or the summary.
+    """
+    from app.metrics import CallMetrics
+
+    m = CallMetrics(call_sid="CA_when", account_id="ACC-1001")
+    m.on_session_start()
+    m.on_session_end()
+    record = m.to_call_analytics()
+    assert isinstance(record.get("created_at"), str) and record["created_at"]
+    store.save_call_analytics(record)
+
+    calls = client.get("/api/calls").json()["calls"]
+    summary = next(c for c in calls if c["call_sid"] == "CA_when")
+    assert summary["created_at"] == record["created_at"]
+
+    full = client.get("/api/calls/CA_when").json()
+    assert full["created_at"] == record["created_at"]
+
+
 def test_get_call_unknown_id_returns_404(store):
     resp = client.get("/api/calls/does-not-exist")
     assert resp.status_code == 404
+
+
+def test_call_dashboard_url_scoped_to_call_sid_and_config(store):
+    """ASK 4: both the /api/calls list summary and the full /api/calls/{id}
+    record carry a per-call CloudWatch dashboard deep-link that is scoped to the
+    call_sid and built from the configured region + app log group (no live AWS
+    call). The link opens a consolidated Logs Insights view filtered to the
+    call. Fails if the dashboard_url is dropped, is not scoped to the call, or
+    ignores the configured log group/region.
+    """
+    analytics = {
+        "call_sid": "CA_dash",
+        "account_id": "ACC-1001",
+        "total_e2e_ms": 5000.0,
+        "turn_count": 2,
+    }
+    store.save_call_analytics(analytics)
+
+    custom = _settings(
+        aws_region="eu-west-1",
+        app_log_group="/ecs/my-stack/app",
+    )
+    with patch("app.main.get_settings", return_value=custom):
+        summary = next(
+            c
+            for c in client.get("/api/calls").json()["calls"]
+            if c["call_sid"] == "CA_dash"
+        )
+        full = client.get("/api/calls/CA_dash").json()
+
+    for url in (summary["dashboard_url"], full["dashboard_url"]):
+        assert url
+        # Built from the configured region (host + region query param).
+        assert "eu-west-1.console.aws.amazon.com" in url
+        assert "region=eu-west-1" in url
+        # Consolidated CloudWatch Logs Insights (dashboard) deep-link.
+        assert "#logsV2:logs-insights" in url
+        assert "queryDetail" in url
+        # Scoped to THIS call_sid (console-token encoded: filter call_sid = ...).
+        assert "CA_dash" in url
+        # References the configured app log group (console-token encoded "/" ->
+        # "*2F"), not the default group.
+        assert "*2Fecs*2Fmy-stack*2Fapp" in url
+        assert "ar-collections-nova-sonic" not in url
+
+
+def test_call_dashboard_url_builder_unit():
+    """Unit-level assertions on the pure string builder: the query filters by
+    call_sid against the given log group and surfaces the metric fields.
+    """
+    from app.dashboard import call_dashboard_query, call_dashboard_url
+
+    q = call_dashboard_query("CA_unit", "/ecs/s/app")
+    assert "SOURCE '/ecs/s/app'" in q
+    assert "filter call_sid = 'CA_unit'" in q
+    for field in ("ttft_ms", "turn_latency_ms", "duration_ms", "total_tokens"):
+        assert field in q
+
+    url = call_dashboard_url("CA_unit", aws_region="us-west-2", app_log_group="/ecs/s/app")
+    assert url.startswith("https://us-west-2.console.aws.amazon.com/cloudwatch/home")
+    assert "#logsV2:logs-insights$3FqueryDetail$3D" in url
+    assert "CA_unit" in url
 
 
 async def test_launch_postcall_registers_offpath_task_and_discards_on_done(store):

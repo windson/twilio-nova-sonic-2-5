@@ -3,15 +3,37 @@ Description: >-
   AR Collections Nova Sonic 2.5 Agent - ECS Fargate service behind an
   Application Load Balancer (WebSocket/WSS capable) bridging Twilio Media
   Streams to Amazon Bedrock Nova Sonic 2.5. Provisions DynamoDB persistence,
-  CloudWatch logs + dashboard, a CloudTrail management-event trail, and a
-  least-privilege IAM task role scoped to the Nova Sonic model.
+  CloudWatch logs + dashboard, a CloudTrail management-event trail, an in-stack
+  CodeBuild image build + demo-dues seeding (both via Lambda custom resources),
+  and a least-privilege IAM task role scoped to the Nova Sonic model. Pure
+  CloudFormation: see DEPLOYMENT.md for the single create-stack command.
 
 Parameters:
+  # Optional explicit ECR image URI. Leave blank (default) to use the image the
+  # in-stack CodeBuild project builds and pushes to the stack's own ECR repo at
+  # <acct>.dkr.ecr.<region>.amazonaws.com/<AppEcrRepo>:<ImageTag>. See DEPLOYMENT.md.
   ContainerImage:
     Type: String
+    Default: ""
     Description: >-
-      Full ECR image URI for the app (e.g.
-      <acct>.dkr.ecr.us-east-1.amazonaws.com/ar-collections-nova-sonic:latest).
+      Optional full ECR image URI override. Blank = use the image built in-stack
+      by CodeBuild in the stack's ECR repo, tagged ImageTag.
+  # In-stack image build (replaces scripts/codebuild_image.sh). CodeBuild clones
+  # the PUBLIC GitHub repo (no credentials) and builds infra/buildspec.yml.
+  GitHubRepoUrl:
+    Type: String
+    Default: https://github.com/windson/twilio-nova-sonic-2-5.git
+    Description: HTTPS clone URL of the public source repo CodeBuild builds.
+  SourceVersion:
+    Type: String
+    Default: main
+    Description: Git branch, tag, or commit sha CodeBuild builds from.
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: >-
+      Image tag the in-stack CodeBuild build pushes and the ECS task consumes.
+      Change it (e.g. to a git sha) and update the stack to force a fresh build.
   VpcId:
     Type: AWS::EC2::VPC::Id
     Description: VPC in which to run the Fargate service and ALB.
@@ -29,14 +51,9 @@ Parameters:
       - amazon.nova-lite-v1:0
       - amazon.nova-micro-v1:0
     Description: >-
-      Bedrock TEXT model id for the OFF-PATH post-call intelligence extraction
-      (Bedrock Converse). This SAME value feeds BOTH the EXTRACTION_MODEL_ID
-      container env var AND the Resource ARN in the bedrock-text-extraction IAM
-      grant, so the app's configured model and its IAM permission can never
-      drift (an unpermitted model would otherwise surface at runtime as
-      intelligence_status=failed). Constrained to the TEXT models verified
-      available in us-east-1; to use another model, add it here so the grant
-      and the env var stay in lockstep.
+      TEXT model for the off-path post-call extraction (Bedrock Converse). Feeds
+      BOTH the EXTRACTION_MODEL_ID env var AND the bedrock-text-extraction IAM
+      grant Resource so they cannot drift. See DEPLOYMENT.md.
   OtelEnabled:
     Type: String
     Default: "true"
@@ -44,9 +61,8 @@ Parameters:
       - "true"
       - "false"
     Description: >-
-      Master switch for GA Strands OTEL telemetry. When true the GA bidi agent
-      loop auto-emits OTEL spans (session token usage, per-response
-      time-to-first-audio/TTFT, tool-call and connection-restart spans).
+      Master switch for GA Strands OTEL telemetry (spans auto-emitted by the
+      bidi agent loop). See DEPLOYMENT.md.
   OtelExporter:
     Type: String
     Default: console
@@ -55,22 +71,15 @@ Parameters:
       - otlp
       - none
     Description: >-
-      OTEL span exporter. "console" (default) writes spans to stdout, which the
-      ECS awslogs driver already ships to CloudWatch Logs - so NO new IAM and NO
-      new infrastructure are required for telemetry. "otlp" ships to the
-      collector named by OtelExporterOtlpEndpoint; "none" disables export.
+      OTEL span exporter. console (default) -> stdout -> awslogs -> CloudWatch
+      (no new IAM/infra); otlp -> OtelExporterOtlpEndpoint; none disables export.
   OtelExporterOtlpEndpoint:
     Type: String
     Default: ""
-    Description: >-
-      OTLP collector endpoint URL. Only used when OtelExporter=otlp; read by the
-      OpenTelemetry SDK via OTEL_EXPORTER_OTLP_ENDPOINT. Leave blank for the
-      console exporter.
+    Description: OTLP collector endpoint URL (only when OtelExporter=otlp).
   TwilioAccountSidArn:
     Type: String
-    Description: >-
-      Secrets Manager secret ARN (or SSM parameter ARN) that holds the Twilio
-      account SID. Referenced by ARN only - never inline the value.
+    Description: Secrets Manager/SSM ARN holding the Twilio account SID (by ARN only).
   TwilioAuthTokenArn:
     Type: String
     Description: Secrets Manager/SSM ARN holding the Twilio auth token.
@@ -93,19 +102,14 @@ Parameters:
     Type: String
     Default: ""
     Description: >-
-      ACM certificate ARN for the HTTPS:443 listener. REQUIRED for live Twilio
-      Media Streams, which only connect over wss:// (TLS). Leave empty to
-      provision an HTTP:80-only ALB (health checks / internal testing only -
-      Twilio will refuse a plaintext ws:// endpoint).
+      ACM certificate ARN for HTTPS:443 (required for live Twilio wss://). Blank
+      = HTTP:80-only ALB (health checks / internal testing). See DEPLOYMENT.md.
   PublicHostname:
     Type: String
     Default: ""
     Description: >-
-      Public DNS hostname that resolves (via a CNAME/alias) to the ALB and that
-      the ACM certificate in CertificateArn is issued for, e.g.
-      collections.example.com. When set, PUBLIC_BASE_URL is this hostname so
-      TwiML emits wss://<hostname>/media. Must be used together with
-      CertificateArn for a live call.
+      Public DNS hostname (CNAME/alias to the ALB, covered by CertificateArn)
+      used for PUBLIC_BASE_URL -> wss://<hostname>/media. See DEPLOYMENT.md.
   EnableCloudFront:
     Type: String
     Default: "false"
@@ -113,38 +117,16 @@ Parameters:
       - "true"
       - "false"
     Description: >-
-      Option 1 (CloudFront TLS front door). When "true", provision an Amazon
-      CloudFront distribution in front of the HTTP:80 ALB to obtain a free
-      AWS-managed *.cloudfront.net TLS hostname so Twilio Media Streams can
-      connect over wss://<dist>.cloudfront.net/media WITHOUT a custom domain or
-      ACM certificate. When "true", PUBLIC_BASE_URL and the PublicBaseUrl output
-      resolve to the CloudFront domain, AND the ALB ingress is locked down to
-      the CloudFront origin-facing managed prefix list so the raw ALB DNS can no
-      longer be reached directly over plaintext (the CloudFront edge becomes the
-      only ingress path). Leave "false" to keep the plain HTTP:80/ALB (or the
-      ACM custom-domain) behavior with open ingress.
+      Option 1 (CloudFront TLS front door). true = provision CloudFront in front
+      of the HTTP:80 ALB for a free *.cloudfront.net wss:// hostname and lock ALB
+      ingress to the CloudFront origin-facing prefix list. See DEPLOYMENT.md.
   CloudFrontOriginFacingPrefixListId:
     Type: String
     Default: pl-3b927c52
     Description: >-
-      AWS-managed prefix list id for com.amazonaws.global.cloudfront.origin-facing
-      in this region (us-east-1 default: pl-3b927c52). Used to restrict the ALB
-      security group ingress to CloudFront edge IPs only when EnableCloudFront is
-      "true", enforcing the CloudFront TLS front door and closing the plaintext
-      ws://<alb-dns>/media bypass. Resolve with:
-      aws ec2 describe-managed-prefix-lists --filters
-      Name=prefix-list-name,Values=com.amazonaws.global.cloudfront.origin-facing
-      --region us-east-1.
-  # --- Option 2 (CloudFront VPC origin) parameters -------------------------
-  # Option 2 is a strictly stronger security posture than Option 1: instead of
-  # an internet-facing ALB whose SG allow-lists the CloudFront origin-facing
-  # prefix list (an IP filter over AWS-managed ranges that change over time),
-  # the ALB becomes INTERNAL in private subnets with NO public IP, reachable
-  # ONLY through the CloudFront distribution's service-managed VPC origin ENI -
-  # i.e. true network-level isolation rather than an allow-list. These params
-  # take effect only when BOTH EnableCloudFront AND UseVpcOrigin are "true";
-  # with the default UseVpcOrigin="false" the template is byte-compatible with
-  # the existing internet-facing ALB + prefix-list behavior and nothing changes.
+      Managed prefix list id for com.amazonaws.global.cloudfront.origin-facing
+      (us-east-1 default pl-3b927c52); restricts ALB ingress to CloudFront edge
+      IPs when EnableCloudFront=true. See DEPLOYMENT.md.
   UseVpcOrigin:
     Type: String
     Default: "false"
@@ -152,76 +134,47 @@ Parameters:
       - "true"
       - "false"
     Description: >-
-      Option 2 (CloudFront VPC origin). When "true" AND EnableCloudFront is also
-      "true", the ALB is provisioned INTERNAL in PrivateSubnetIds with no public
-      IP, the Fargate tasks run in those private subnets (AssignPublicIp
-      DISABLED, egress via the NAT gateway), and the CloudFront distribution
-      reaches the origin through an AWS::CloudFront::VpcOrigin (service-managed
-      ENI) rather than over the public internet. This gives the origin
-      network-level isolation (only the distribution can reach it) instead of
-      the Option 1 prefix-list allow-list. Requires PrivateSubnetIds and
-      NatGatewaySubnetId. Leave "false" (default) to keep the existing
-      internet-facing ALB + prefix-list posture unchanged.
+      Option 2 (CloudFront VPC origin). true (with EnableCloudFront=true) = ALB
+      INTERNAL in PrivateSubnetIds (no public IP), tasks private with NAT egress,
+      CloudFront reaches the origin via a service-managed VpcOrigin ENI. Requires
+      PrivateSubnetIds and NatGatewaySubnetId. See DEPLOYMENT.md.
   PrivateSubnetIds:
     Type: CommaDelimitedList
     Default: ""
     Description: >-
-      Two or more EXISTING private subnets (different AZs) that host the
-      internal ALB, the CloudFront VPC origin ENI, and the Fargate tasks when
-      UseVpcOrigin="true". Each must have at least one free IPv4 address so
-      CloudFront can place its service-managed ENI. Parameterized (rather than hard-coding CIDRs) so
-      the template provisions no overlapping address space and stays account
-      agnostic. Leave blank when UseVpcOrigin="false".
+      Existing private subnets (>=2 AZs) for the internal ALB, VPC origin ENI,
+      and tasks when UseVpcOrigin=true; blank = stack provisions them. See
+      DEPLOYMENT.md.
   NatGatewaySubnetId:
     Type: String
     Default: ""
     Description: >-
-      A PUBLIC subnet (with an internet gateway route) in which to place the NAT
-      gateway when UseVpcOrigin="true". Private-subnet tasks lose the public
-      egress they had via AssignPublicIp=ENABLED, so the NAT gateway restores
-      their required OUTBOUND internet access to the Twilio REST API plus AWS
-      egress (Bedrock Nova Sonic, DynamoDB, ECR image pulls, AgentCore). Leave
-      blank when UseVpcOrigin="false".
+      Public subnet for the NAT gateway when UseVpcOrigin=true (restores private
+      tasks' outbound egress). Blank when UseVpcOrigin=false. See DEPLOYMENT.md.
 
 Conditions:
-  # HTTPS/WSS is enabled only when an ACM certificate ARN is supplied, so the
-  # template still validates and deploys (HTTP:80 only) without a real cert.
+  # HTTPS/WSS only when an ACM cert is supplied (template still deploys without).
   HasCertificate: !Not [!Equals [!Ref CertificateArn, ""]]
-  # Prefer the real TLS hostname for PUBLIC_BASE_URL when provided.
   HasPublicHostname: !Not [!Equals [!Ref PublicHostname, ""]]
-  # Option 1: gate the CloudFront distribution + its outputs / PUBLIC_BASE_URL
-  # branch so the template still validates and deploys when CloudFront is off.
+  # Option 1 CloudFront on/off (gates distribution, outputs, ALB ingress style).
   EnableCf: !Equals [!Ref EnableCloudFront, "true"]
-  # Inverse of EnableCf: open ALB ingress (0.0.0.0/0) only when CloudFront is
-  # off. When CloudFront is on, ingress is locked to the managed prefix list.
   CloudFrontDisabled: !Not [!Equals [!Ref EnableCloudFront, "true"]]
-  # Option 2: the CloudFront VPC origin posture is active only when BOTH
-  # EnableCloudFront and UseVpcOrigin are "true" (UseVpcOrigin is meaningless
-  # without the CloudFront front door it sits behind). When active, the ALB is
-  # internal in private subnets, the tasks run private with NAT egress, and the
-  # distribution reaches the origin via the service-managed VPC origin ENI.
+  # Option 2 active only when BOTH EnableCloudFront and UseVpcOrigin are true.
   UseVpcOriginCond: !And
     - !Equals [!Ref EnableCloudFront, "true"]
     - !Equals [!Ref UseVpcOrigin, "true"]
-  # Option 1 (prefix-list) ALB path: CloudFront on but WITHOUT the VPC origin.
-  # This is the existing internet-facing ALB + origin-facing prefix list; it is
-  # intentionally mutually exclusive with UseVpcOriginCond so exactly one origin
-  # style is wired at a time.
+  # Option 1 prefix-list ALB path: CloudFront on WITHOUT the VPC origin
+  # (mutually exclusive with UseVpcOriginCond).
   CloudFrontPrefixListOrigin: !And
     - !Equals [!Ref EnableCloudFront, "true"]
     - !Not [!Equals [!Ref UseVpcOrigin, "true"]]
-  # When the VPC-origin posture is active AND no PrivateSubnetIds were supplied,
-  # the stack provisions its own IPv4 private subnets (PrivateSubnet1/2
-  # below) and wires the internal ALB, the Fargate service, and the private
-  # route-table associations to them. Supplying PrivateSubnetIds overrides this
-  # (an operator can bring existing private subnets), keeping the parameter path
-  # intact. !Join over the CommaDelimitedList yields "" only when it is empty.
+  # VPC-origin active AND no PrivateSubnetIds supplied -> stack provisions them.
   ProvisionPrivateSubnets: !And
     - !Condition UseVpcOriginCond
     - !Equals [!Join ["", !Ref PrivateSubnetIds], ""]
-  # Wire the OTLP endpoint env var only when an endpoint is actually supplied,
-  # so the console/stdout path (the default) carries no empty OTLP config.
   HasOtelEndpoint: !Not [!Equals [!Ref OtelExporterOtlpEndpoint, ""]]
+  # Use the in-stack CodeBuild image (stack ECR repo) unless ContainerImage set.
+  HasContainerImageOverride: !Not [!Equals [!Ref ContainerImage, ""]]
 
 Resources:
   # --- DynamoDB persistence --------------------------------------------------
@@ -254,6 +207,199 @@ Resources:
         PointInTimeRecoveryEnabled: true
       SSESpecification:
         SSEEnabled: true
+
+  # --- ECR repository (holds the in-stack CodeBuild image) -------------------
+  AppEcrRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AWS::StackName}-app"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+  # --- In-stack image build (replaces scripts/codebuild_image.sh) ------------
+  # CodeBuild clones the GitHub repo (GitHubRepoUrl@SourceVersion; add an
+  # AWS::CodeBuild::SourceCredential if the repo is private) and runs
+  # infra/buildspec.yml to build + push the image to AppEcrRepo. Triggered on
+  # Create/Update by the ImageBuildTrigger custom resource. When a ContainerImage
+  # override is supplied, the trigger skips the build (SkipBuild=true).
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/codebuild/${AWS::StackName}-image-build"
+      RetentionInDays: !Ref LogRetentionDays
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: build-and-push
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt CodeBuildLogGroup.Arn
+                  - !Sub "${CodeBuildLogGroup.Arn}:*"
+              # ECR auth token is a wildcard-only action (not resource-scopable).
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt AppEcrRepo.Arn
+
+  ImageBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-image-build"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      # privilegedMode=true is required to run the Docker daemon for docker build.
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: ECR_REPO
+            Value: !Ref AppEcrRepo
+          - Name: IMAGE_TAG
+            Value: !Ref ImageTag
+      Source:
+        Type: GITHUB
+        Location: !Ref GitHubRepoUrl
+        BuildSpec: infra/buildspec.yml
+      SourceVersion: !Ref SourceVersion
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref CodeBuildLogGroup
+      TimeoutInMinutes: 30
+
+  ImageBuildFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: start-and-poll-build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt ImageBuildProject.Arn
+              # Self re-invoke (async) while the build is IN_PROGRESS so the
+              # poller never exceeds the Lambda timeout. Name-pattern ARN avoids
+              # a circular dependency on ImageBuildFn.
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-ImageBuildFn-*"
+
+  # Lambda-backed custom resource: on Create/Update it starts the CodeBuild
+  # build and polls BatchGetBuilds until completion, then signals CloudFormation
+  # (cfnresponse). It re-invokes itself while the build is IN_PROGRESS so it
+  # never exceeds the Lambda timeout. Delete is a no-op.
+  ImageBuildFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 300
+      Role: !GetAtt ImageBuildFnRole.Arn
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ImageBuildProject
+      Code:
+        ZipFile: |
+          import json, os, time, urllib.request, boto3
+          cb = boto3.client("codebuild")
+          lam = boto3.client("lambda")
+
+          def send(event, context, status, data=None, pid=None, reason=None):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or ("see " + context.log_stream_name),
+                  "PhysicalResourceId": pid or context.log_stream_name,
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False, "Data": data or {},
+              }).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                           headers={"content-type": "", "content-length": str(len(body))})
+              urllib.request.urlopen(req)
+
+          def handler(event, context):
+              rt = event.get("RequestType")
+              props = event.get("ResourceProperties", {}) or {}
+              try:
+                  if rt == "Delete":
+                      return send(event, context, "SUCCESS", {}, event.get("PhysicalResourceId"))
+                  # ContainerImage override set => task runs that image; skip build.
+                  if str(props.get("SkipBuild", "")).lower() == "true":
+                      return send(event, context, "SUCCESS", {"Skipped": "true"},
+                                  event.get("PhysicalResourceId") or "image-build-skipped")
+                  build_id = event.get("BuildId")
+                  if not build_id:
+                      build_id = cb.start_build(projectName=os.environ["PROJECT_NAME"])["build"]["id"]
+                  # Poll within this invocation, then re-invoke for the rest so we
+                  # never exceed the timeout nor drop the poller mid-build.
+                  for _ in range(12):
+                      status = cb.batch_get_builds(ids=[build_id])["builds"][0]["buildStatus"]
+                      if status != "IN_PROGRESS":
+                          break
+                      time.sleep(15)
+                  if status == "IN_PROGRESS":
+                      ev = dict(event); ev["BuildId"] = build_id
+                      lam.invoke(FunctionName=context.function_name,
+                                 InvocationType="Event", Payload=json.dumps(ev).encode())
+                      return
+                  if status == "SUCCEEDED":
+                      return send(event, context, "SUCCESS", {"BuildId": build_id}, build_id)
+                  return send(event, context, "FAILED", {}, build_id, "build %s: %s" % (build_id, status))
+              except Exception as e:
+                  return send(event, context, "FAILED", {}, event.get("PhysicalResourceId"), str(e))
+
+  # Triggering custom resource. ImageTag is a property so changing the tag (or
+  # SourceVersion) on a stack update re-runs the build for the new source.
+  ImageBuildTrigger:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ImageBuildFn.Arn
+      ImageTag: !Ref ImageTag
+      SourceVersion: !Ref SourceVersion
+      # When ContainerImage is set, the task runs that image and the in-stack
+      # build is skipped (the source repo need not be cloneable here).
+      SkipBuild: !If [HasContainerImageOverride, "true", "false"]
 
   # --- CloudWatch logs -------------------------------------------------------
   AppLogGroup:
@@ -291,17 +437,15 @@ Resources:
                   - !Ref TwilioFromNumberArn
                   - !Ref TwilioVerifiedCallerIdArn
 
-  # Least-privilege task role: Bedrock bidi stream on the Nova Sonic model,
-  # DynamoDB RW on just the two tables, and CloudWatch Logs write.
+  # Least-privilege task role: Bedrock bidi on Nova Sonic, Bedrock Converse on
+  # the text extraction model, AgentCore code-interpreter (off-path date
+  # resolution), DynamoDB RW on the two tables, and CloudWatch Logs write.
   TaskRole:
     Type: AWS::IAM::Role
     Metadata:
-      # bedrock:InvokeModelWithBidirectionalStream (Nova Sonic bi-di streaming)
-      # and the bedrock-agentcore:*CodeInterpreterSession /
-      # bedrock-agentcore:InvokeCodeInterpreter actions (AgentCore Code
-      # Interpreter, used off-path for date resolution) are all valid IAM
-      # actions that cfn-lint's bundled action catalog does not yet list, so
-      # W3037 is a false positive for this role.
+      # W3037: bedrock:InvokeModelWithBidirectionalStream and the
+      # bedrock-agentcore:*CodeInterpreter* actions are valid IAM actions not yet
+      # in cfn-lint's bundled catalog (false positive).
       cfn-lint:
         config:
           ignore_checks:
@@ -325,15 +469,8 @@ Resources:
                   - bedrock:InvokeModel
                 Resource:
                   - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${NovaModelId}"
-        # Separate, narrowly-scoped grant for the OFF-PATH post-call intelligence
-        # (app/postcall.py), which calls the Bedrock Converse API on a TEXT model
-        # (default amazon.nova-lite-v1:0, EXTRACTION_MODEL_ID). The SAME model +
-        # grant is reused by app/code_interpreter.py to GENERATE the on-the-fly
-        # date-resolution Python program (also via Converse -> bedrock:InvokeModel
-        # on the same ExtractionModelId ARN), so NO additional IAM is required for
-        # the model that authors the code. Kept distinct from the Nova Sonic bidi
-        # statement above so the extraction grant stays scoped to just the text
-        # model ARN(s) and the two policies evolve independently.
+        # Off-path post-call extraction (app/postcall.py) on the TEXT model, also
+        # reused by app/code_interpreter.py. Scoped to exactly ExtractionModelId.
         - PolicyName: bedrock-text-extraction
           PolicyDocument:
             Version: "2012-10-17"
@@ -341,25 +478,12 @@ Resources:
               - Effect: Allow
                 Action:
                   - bedrock:InvokeModel
-                # Scoped to EXACTLY the configured ExtractionModelId so the grant
-                # and the EXTRACTION_MODEL_ID env var (both derived from the same
-                # parameter) cannot drift. An override there is permitted here in
-                # the same deploy, so a configured model is never access-denied
-                # at invoke time.
                 Resource:
                   - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${ExtractionModelId}"
-        # Separate, least-privilege grant for the OFF-PATH natural-language date
-        # resolution (app/code_interpreter.py), which ships a generated Python
-        # program to the AWS Bedrock AgentCore Code Interpreter sandbox and reads
-        # back the computed ISO date. The SDK path used
-        # (bedrock_agentcore.tools.code_interpreter_client.CodeInterpreter:
-        # start() -> invoke("executeCode", ...) -> stop()) maps to EXACTLY these
-        # three session actions; no Create/Delete/List/Get is used because the
-        # app targets the MANAGED default interpreter (aws.codeinterpreter.v1),
-        # which requires no CreateCodeInterpreter. This ~1.9s call runs only in
-        # the post-call async task (app/postcall.py), never on the real-time
-        # audio/turn path, so it adds zero call latency. Kept distinct from the
-        # Nova Sonic bidi and text-extraction grants so each evolves on its own.
+        # Off-path date resolution (app/code_interpreter.py), post-call only. The
+        # BUILT-IN interpreter arn uses the literal account segment "aws" (per the
+        # official CFN pattern (aws|[0-9]{12})), not the caller account; also allow
+        # custom in-account interpreters + the per-session resource. See DEPLOYMENT.md.
         - PolicyName: agentcore-code-interpreter
           PolicyDocument:
             Version: "2012-10-17"
@@ -369,19 +493,12 @@ Resources:
                   - bedrock-agentcore:StartCodeInterpreterSession
                   - bedrock-agentcore:InvokeCodeInterpreter
                   - bedrock-agentcore:StopCodeInterpreterSession
-                # Scoped to the code-interpreter resource namespace in this
-                # account/region, which covers the managed aws.codeinterpreter.v1
-                # default the app uses (arn:...:code-interpreter/*). VERIFIED at
-                # runtime: a live end-to-end resolution ran from the deployed
-                # task role (/api/config reports code_interpreter=agentcore and a
-                # real phrase resolved in ~1.9s), confirming this account-scoped
-                # code-interpreter/* ARN authorizes the managed default.
                 Resource:
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:aws:code-interpreter/aws.codeinterpreter.v1"
                   - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:code-interpreter/*"
+                  - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:code-interpreter-session/*"
         # Note: the PTP payment-link SMS (app/twilio_client.send_sms) needs NO new
-        # IAM. It reuses the task's existing egress (ServiceSecurityGroup allows
-        # all outbound to the Twilio API) and the Twilio credentials already
-        # injected from Secrets Manager via the TaskDefinition Secrets block.
+        # IAM (reuses task egress + the Twilio secrets injected into the task).
         - PolicyName: dynamodb-rw
           PolicyDocument:
             Version: "2012-10-17"
@@ -411,13 +528,97 @@ Resources:
                   - !GetAtt AppLogGroup.Arn
                   - !Sub "${AppLogGroup.Arn}:*"
 
+  # --- Demo-dues seeding (replaces scripts/seed_dues.py) ---------------------
+  # Lambda-backed custom resource: on Create it PutItems ACC-1001 / ACC-1002
+  # into DuesTable with the same schema app/store._seed_dues writes (idempotent
+  # put_item). Update/Delete are no-ops. Role scoped to PutItem on DuesTable.
+  SeedDuesFnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: seed-dues
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt DuesTable.Arn
+
+  SeedDuesFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 60
+      Role: !GetAtt SeedDuesFnRole.Arn
+      Environment:
+        Variables:
+          DUES_TABLE: !Ref DuesTable
+      Code:
+        ZipFile: |
+          import json, os, urllib.request
+          from datetime import datetime, timezone
+          from decimal import Decimal
+          import boto3
+
+          def send(event, context, status, data=None, pid=None, reason=None):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or ("see " + context.log_stream_name),
+                  "PhysicalResourceId": pid or "seed-dues",
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False, "Data": data or {},
+              }).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                           headers={"content-type": "", "content-length": str(len(body))})
+              urllib.request.urlopen(req)
+
+          def records():
+              now = datetime.now(timezone.utc).isoformat()
+              return [
+                  {"account_id": "ACC-1001", "debtor_name": "Jordan Rivera",
+                   "amount_due": Decimal("428.57"), "currency": "USD",
+                   "due_date": "2024-05-15", "status": "open", "notes": "",
+                   "phone": None, "collection_paused": False, "escalated": False,
+                   "last_updated": now},
+                  {"account_id": "ACC-1002", "debtor_name": "Pavan Navule",
+                   "amount_due": Decimal("1250.00"), "currency": "USD",
+                   "due_date": "2024-06-01", "status": "open", "notes": "",
+                   "phone": None, "collection_paused": False, "escalated": False,
+                   "last_updated": now},
+              ]
+
+          def handler(event, context):
+              try:
+                  if event.get("RequestType") in ("Update", "Delete"):
+                      return send(event, context, "SUCCESS", {}, event.get("PhysicalResourceId"))
+                  table = boto3.resource("dynamodb").Table(os.environ["DUES_TABLE"])
+                  for rec in records():
+                      table.put_item(Item=rec)
+                  return send(event, context, "SUCCESS", {"Seeded": 2})
+              except Exception as e:
+                  return send(event, context, "FAILED", {}, event.get("PhysicalResourceId"), str(e))
+
+  SeedDuesTrigger:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt SeedDuesFn.Arn
+      DuesTable: !Ref DuesTable
+
   # --- Networking / security groups -----------------------------------------
-  # ALB security group. Ingress is attached as separate SecurityGroupIngress
-  # resources (below) because a single CloudFormation ingress rule cannot mix
-  # CidrIp and SourcePrefixListId: when EnableCloudFront is "true" the ALB
-  # accepts :80/:443 ONLY from the CloudFront origin-facing managed prefix list
-  # (so the raw ALB DNS is unreachable over plaintext and the CloudFront TLS
-  # front door is enforced); when "false" it accepts :80/:443 from 0.0.0.0/0.
+  # ALB SG. Ingress is attached as separate SecurityGroupIngress resources
+  # because one rule cannot mix CidrIp and SourcePrefixListId: CloudFront on ->
+  # :80/:443 from the origin-facing prefix list only; off -> from 0.0.0.0/0.
   AlbSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -428,17 +629,9 @@ Resources:
           CidrIp: 0.0.0.0/0
           Description: Allow all egress.
 
-  # --- ALB ingress (CloudFront-only when Option 1 is enabled) ---------------
-  # EnableCloudFront=true WITHOUT the VPC origin (Option 1): lock ingress to
-  # CloudFront edge IPs via the managed prefix list so only the CloudFront
-  # distribution can reach the internet-facing ALB origin. Only the :80 rule is
-  # created: CloudFront talks to this origin over http-only on port 80 (see
-  # Distribution.OriginProtocolPolicy), and no HTTPS:443 listener exists on the
-  # ALB in the CloudFront path (HttpsListener requires a certificate).
-  # Referencing a managed prefix list counts its entry count (49) against the
-  # per-SG rule quota (60), so a second :443 prefix-list rule would exceed the
-  # limit and is unnecessary here. Mutually exclusive with the VPC-origin path
-  # below (CloudFrontPrefixListOrigin excludes UseVpcOrigin).
+  # Option 1 (CloudFront, no VPC origin): lock :80 ingress to the CloudFront
+  # origin-facing prefix list. Only :80 (CloudFront talks http-only to origin;
+  # the prefix list's ~49 entries against the 60-rule quota preclude a 2nd rule).
   AlbIngressHttpCloudFront:
     Type: AWS::EC2::SecurityGroupIngress
     Condition: CloudFrontPrefixListOrigin
@@ -450,20 +643,8 @@ Resources:
       SourcePrefixListId: !Ref CloudFrontOriginFacingPrefixListId
       Description: HTTP from CloudFront origin-facing edge IPs only (Option 1).
 
-  # --- ALB ingress (Option 2: CloudFront VPC origin) ------------------------
-  # UseVpcOrigin=true: the ALB is INTERNAL in private subnets and is reached
-  # only through the CloudFront service-managed VPC origin ENI. Per the AWS VPC
-  # origins guidance, the origin SG is opened to the CloudFront origin-facing
-  # managed prefix list(s) (Option 1 in that guide) BEFORE the VPC origin
-  # exists, which avoids a circular dependency on CloudFront's service-managed
-  # security group (that SG can only be referenced after the VPC origin is
-  # created). The IPv4 VPC origin is admitted via the IPv4 origin-facing managed
-  # prefix list. Even though the prefix list is reused, the security improvement
-  # comes from the ALB itself being internal with no public IP in a private
-  # subnet: the allow-list now sits in front of an origin that is already
-  # network-isolated to the distribution's ENI. (Referencing the managed prefix
-  # list consumes its ~49 entries against the per-SG rule quota of 60, so only
-  # this single IPv4 rule is added here - well within the limit.)
+  # Option 2 (CloudFront VPC origin): internal ALB reached only via the VPC origin
+  # ENI; origin SG opened to the origin-facing prefix list. See DEPLOYMENT.md.
   AlbIngressHttpVpcOriginV4:
     Type: AWS::EC2::SecurityGroupIngress
     Condition: UseVpcOriginCond
@@ -475,7 +656,7 @@ Resources:
       SourcePrefixListId: !Ref CloudFrontOriginFacingPrefixListId
       Description: HTTP from the CloudFront VPC origin (IPv4 origin-facing).
 
-  # EnableCloudFront=false: original open ingress (plain ALB / ACM custom domain).
+  # CloudFront off: original open ingress (plain ALB / ACM custom domain).
   AlbIngressHttpOpen:
     Type: AWS::EC2::SecurityGroupIngress
     Condition: CloudFrontDisabled
@@ -519,27 +700,11 @@ Resources:
       Description: App port reachable only from the ALB.
 
   # --- Private networking the VPC origin requires (Option 2) -----------------
-  # The target VPC ships with only PUBLIC subnets, yet the CloudFront VPC origin
-  # needs the ALB to be INTERNAL in PRIVATE subnets with no public IP. So, only
-  # under UseVpcOriginCond, the stack carves two IPv4 private subnets from the
-  # VPC's 10.0.0.0/16. These are created only when UseVpcOrigin="true"; the
-  # default "false" path provisions none of them and stays byte-compatible. An
-  # operator who supplies PrivateSubnetIds bypasses the stack-created subnets
-  # (see the ProvisionPrivateSubnets condition), but the subnets below are still
-  # created (harmless, unreferenced) when UseVpcOrigin="true" with an explicit
-  # list.
-  #
-  # IPv4-only: the internal ALB and VPC origin are IpAddressType=ipv4. A
-  # dualstack ALB would require each ALB subnet to carry an IPv6 /64 sliced from
-  # an Amazon-provided VPC /56, but the VPC here is externally owned (referenced
-  # by VpcId, not created by this stack) so its IPv6 CIDR is not a GetAtt-able
-  # stack attribute and cannot be sliced in a single CloudFormation pass. IPv4
-  # is fully sufficient for the private CloudFront-VPC-origin -> ALB path.
-  #
-  # Two private subnets in two AZs (!GetAZs picks the region's AZs wherever the
-  # stack deploys). VPC CIDR is 10.0.0.0/16 with 10.0.1.0/24 and 10.0.2.0/24
-  # already used by the two public subnets, so 10.0.11.0/24 and 10.0.12.0/24 do
-  # not overlap. MapPublicIpOnLaunch is false (private).
+  # Only under UseVpcOriginCond. The target VPC ships only public subnets, so
+  # the stack carves two non-overlapping IPv4 /24 private subnets (VPC is
+  # 10.0.0.0/16; 10.0.1/2.0.0/24 used by public subnets). IPv4-only because the
+  # externally-owned VPC's IPv6 CIDR is not a GetAtt-able stack attribute.
+  # Created even when PrivateSubnetIds is supplied (harmless/unreferenced then).
   PrivateSubnet1:
     Type: AWS::EC2::Subnet
     Condition: UseVpcOriginCond
@@ -558,24 +723,9 @@ Resources:
       AvailabilityZone: !Select [1, !GetAZs ""]
       MapPublicIpOnLaunch: false
 
-  # --- Private-subnet egress (Option 2: CloudFront VPC origin) ---------------
-  # EGRESS DESIGN. When UseVpcOrigin=true the Fargate tasks move from public
-  # subnets (AssignPublicIp=ENABLED, which gave them direct outbound internet)
-  # into the supplied private subnets with AssignPublicIp=DISABLED. They still
-  # require OUTBOUND access to:
-  #   * the Twilio REST API (public internet - placing/updating calls, SMS);
-  #   * AWS service endpoints - Bedrock Nova Sonic (bidi stream), DynamoDB,
-  #     ECR (image pulls on task start), CloudWatch Logs, AgentCore.
-  # A NAT gateway in a PUBLIC subnet (NatGatewaySubnetId) plus a private route
-  # table whose default route (0.0.0.0/0) targets the NAT restores that egress.
-  # Twilio is a public third-party API, so NAT is REQUIRED regardless of VPC
-  # endpoints. (A hardening follow-up could ALSO add gateway endpoints for
-  # DynamoDB + S3-for-ECR-layers and interface endpoints for
-  # ecr.api/ecr.dkr/bedrock-runtime/logs to cut AWS traffic off the NAT path;
-  # that is an additive optimization and is intentionally left out here to keep
-  # this change focused and the per-endpoint cost/complexity out of the default
-  # sample.) These resources exist only under UseVpcOriginCond, so the default
-  # UseVpcOrigin="false" deploy provisions none of them.
+  # Private-subnet egress: tasks move to private subnets (no public IP) and
+  # reach Twilio REST + AWS endpoints (Bedrock/DynamoDB/ECR/Logs/AgentCore) via
+  # a NAT gateway in NatGatewaySubnetId. Only under UseVpcOriginCond.
   NatEip:
     Type: AWS::EC2::EIP
     Condition: UseVpcOriginCond
@@ -586,12 +736,9 @@ Resources:
     Type: AWS::EC2::NatGateway
     Condition: UseVpcOriginCond
     Metadata:
-      # W1030: cfn-lint resolves the intentional empty-string DEFAULT of
-      # NatGatewaySubnetId against the AWS::EC2::Subnet::Id regex and flags it.
-      # This is a false positive: the empty default only exists so the stack
-      # deploys with UseVpcOrigin="false" (this resource is not created then);
-      # when UseVpcOrigin="true" a real subnet id is supplied. Same rationale as
-      # the existing W3037 ignore on TaskRole.
+      # W1030: false positive - cfn-lint resolves the empty-string DEFAULT of
+      # NatGatewaySubnetId against the Subnet::Id regex; the default only exists
+      # for the UseVpcOrigin=false path (this resource is not created then).
       cfn-lint:
         config:
           ignore_checks:
@@ -615,21 +762,14 @@ Resources:
       NatGatewayId: !Ref NatGateway
 
   # Associate the private route table (NAT default route) with each private
-  # subnet. Two associations cover the required >=2 AZ layout; supplying a third
-  # private subnet is supported by the ALB/Service but would need a third
-  # association here. cfn-lint has no issue with associating a route table to a
-  # subnet it does not also create.
+  # subnet (stack-created or operator-supplied).
   PrivateSubnet1RouteAssoc:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Condition: UseVpcOriginCond
     Metadata:
-      # W1035: on the supplied-list branch cfn-lint resolves !Select against the
-      # empty-string DEFAULT of PrivateSubnetIds (an empty list) and flags the
-      # element against the AWS::EC2::Subnet::Id regex. False positive: that
-      # branch is only taken when an operator actually supplies PrivateSubnetIds
-      # (ProvisionPrivateSubnets false); otherwise the stack-created
-      # PrivateSubnet1 is used. The empty default only keeps the "false" path
-      # deployable.
+      # W1035: false positive - !Select resolves against the empty-list DEFAULT
+      # of PrivateSubnetIds on the supplied-list branch, only taken when an
+      # operator actually supplies the list.
       cfn-lint:
         config:
           ignore_checks:
@@ -658,22 +798,15 @@ Resources:
         - !Select [1, !Ref PrivateSubnetIds]
 
   # --- Application Load Balancer (WebSocket/WSS capable) ---------------------
-  # When UseVpcOrigin=true the ALB is INTERNAL (no public IP) in the private
-  # subnets and is reachable only via the CloudFront VPC origin ENI; otherwise
-  # it keeps today's internet-facing posture in the public subnets. Scheme and
-  # Subnets are both "update requires replacement" on an ALB, so flipping an
-  # already-deployed internet-facing stack to UseVpcOrigin=true REPLACES the
-  # load balancer (new ALB DNS/ARN); the VPC origin + distribution rebind to the
-  # new ALB in the same change set. See findings for the FEAT-005 rollout note.
-  # The internal ALB is IpAddressType=ipv4 (see the IpAddressType comment below).
+  # Internal in private subnets when UseVpcOrigin=true (reached only via the VPC
+  # origin ENI), else internet-facing in public subnets. Scheme + Subnets
+  # require replacement, so flipping an existing stack REPLACES the ALB. IPv4.
   LoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Metadata:
-      # W1030: cfn-lint resolves the !If false branch's !Ref PrivateSubnetIds
-      # empty-string DEFAULT against the subnet-id regex. False positive: the
-      # PrivateSubnetIds branch is only selected when UseVpcOrigin="true", where
-      # real subnet ids are supplied; the empty default keeps the "false" path
-      # (which uses PublicSubnetIds) deployable. Same rationale as W3037/W1035.
+      # W1030: false positive - !If false branch !Ref PrivateSubnetIds empty
+      # default resolved against the subnet-id regex; that branch is only taken
+      # when UseVpcOrigin=true with real subnet ids.
       cfn-lint:
         config:
           ignore_checks:
@@ -681,16 +814,8 @@ Resources:
     Properties:
       Type: application
       Scheme: !If [UseVpcOriginCond, internal, internet-facing]
-      # IPv4 in both postures. The VPC-origin ALB is INTERNAL (no public IP) and
-      # reached only via the CloudFront VPC origin ENI; IPv4 is sufficient for
-      # that private path. (A dualstack internal ALB would require every ALB
-      # subnet to carry an IPv6 /64 sliced from an Amazon-provided VPC block,
-      # which cannot be derived in one pass for an externally-owned VPC whose
-      # IPv6 CIDR is not a GetAtt-able stack resource, so IPv4-only is used.)
+      # IPv4 in both postures (sufficient for the VPC-origin path). See DEPLOYMENT.md.
       IpAddressType: ipv4
-      # When the stack provisions its own private subnets, use them; when an
-      # operator supplied PrivateSubnetIds, use those; otherwise (VPC origin
-      # off) the public subnets.
       Subnets: !If
         - UseVpcOriginCond
         - !If
@@ -701,21 +826,16 @@ Resources:
       SecurityGroups:
         - !Ref AlbSecurityGroup
       LoadBalancerAttributes:
-        # >= 120s so Nova's long-lived bi-di WebSocket is not closed by the ALB
-        # idle timeout mid-conversation.
+        # >= 120s so Nova's long-lived bi-di WebSocket is not idle-timed out.
         - Key: idle_timeout.timeout_seconds
           Value: "120"
 
   TargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      # A posture-specific Name forces the target group to be REPLACED in lock
-      # step with the ALB when UseVpcOrigin flips. The ALB is replaced (Scheme +
-      # Subnets require replacement); if the target group were reused, the new
-      # listener would attach the existing TG while the old listener still holds
-      # it, and ELB forbids one target group on two load balancers at once. The
-      # two names differ, so the new TG and the old TG coexist during the swap
-      # without a name collision, then the old one is cleaned up.
+      # Posture-specific Name forces the TG to be replaced in lock step with the
+      # ALB when UseVpcOrigin flips (ELB forbids one TG on two load balancers);
+      # the two names coexist during the swap, then the old one is cleaned up.
       Name: !If [UseVpcOriginCond, arcol-tg-vpcorigin, arcol-tg-internet]
       VpcId: !Ref VpcId
       Port: 8080
@@ -737,10 +857,8 @@ Resources:
         - Key: stickiness.type
           Value: lb_cookie
 
-  # HTTP:80 listener. Always present (ALB health checks + a reachable endpoint
-  # when no cert is configured). It forwards to the app so plaintext testing
-  # works; for a live Twilio call the HTTPS:443 listener below carries the wss
-  # WebSocket.
+  # HTTP:80 listener. Always present (health checks + a reachable endpoint when
+  # no cert is configured); the HTTPS:443 listener below carries live wss.
   Listener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:
@@ -751,9 +869,8 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref TargetGroup
 
-  # HTTPS:443 listener with an ACM certificate - required for Twilio Media
-  # Streams (wss://). Only created when CertificateArn is supplied so the
-  # template still validates/deploys without a real certificate.
+  # HTTPS:443 (wss) listener with an ACM cert - required for Twilio Media
+  # Streams. Only created when CertificateArn is supplied.
   HttpsListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Condition: HasCertificate
@@ -768,25 +885,11 @@ Resources:
         - Type: forward
           TargetGroupArn: !Ref TargetGroup
 
-  # --- CloudFront distribution (Option 1: free AWS-managed TLS front door) ---
-  # Puts a CloudFront distribution in front of the HTTP:80 ALB so Twilio Media
-  # Streams can connect over wss://<dist>.cloudfront.net/media using the free
-  # *.cloudfront.net managed certificate - no custom domain / ACM required.
-  # CloudFront supports WebSockets automatically; the wss:// upgrade passes
-  # through because the managed AllViewer origin-request policy forwards the
-  # Sec-WebSocket-* / Upgrade / Connection headers to the origin, and the
-  # managed CachingDisabled cache policy keeps the dynamic /media traffic
-  # uncached. Origin read/keepalive timeouts are set to their 60s max so the
-  # initial WS 101 Switching Protocols handshake is not cut off.
   # --- CloudFront VPC origin (Option 2) -------------------------------------
-  # Creates the service-managed VPC origin that fronts the INTERNAL ALB. The
-  # distribution references it per-origin via VpcOriginConfig (below) instead of
-  # a public CustomOriginConfig/DomainName, so CloudFront reaches the origin
-  # over the private VPC-origin ENI rather than the public internet. IpAddressType
-  # ipv4 matches the IPv4 internal ALB. HTTPPort 80 + OriginProtocolPolicy
-  # http-only mirror the plaintext HTTP:80 contract the ALB listener already
-  # serves (CloudFront terminates TLS at the edge). Created only under
-  # UseVpcOriginCond.
+  # Service-managed VPC origin fronting the INTERNAL ALB. The distribution
+  # references it per-origin via VpcOriginConfig (private ENI) rather than a
+  # public DomainName. http-only:80 mirrors the ALB HTTP listener (CloudFront
+  # terminates TLS at the edge). Created only under UseVpcOriginCond.
   VpcOrigin:
     Type: AWS::CloudFront::VpcOrigin
     Condition: UseVpcOriginCond
@@ -799,6 +902,12 @@ Resources:
         OriginProtocolPolicy: http-only
         IpAddressType: ipv4
 
+  # --- CloudFront distribution (Option 1: free AWS-managed TLS front door) ---
+  # Fronts the HTTP:80 ALB so Twilio connects over wss://<dist>.cloudfront.net/
+  # media with the free managed cert (no domain/ACM). WebSockets pass through
+  # via the managed AllViewer origin-request policy (forwards Sec-WebSocket-*/
+  # Upgrade/Connection) and CachingDisabled; 60s origin timeouts keep the WS 101
+  # handshake open.
   Distribution:
     Type: AWS::CloudFront::Distribution
     Condition: EnableCf
@@ -810,15 +919,10 @@ Resources:
         HttpVersion: http2and3
         IPV6Enabled: true
         Origins:
-          # A single origin entry whose connection style is selected by the
-          # UseVpcOrigin condition. Option 2 (VPC origin): drop CustomOriginConfig
-          # and reference the service-managed VpcOrigin via VpcOriginConfig, so
-          # the origin is the INTERNAL ALB reached privately. Option 1 / plain:
-          # keep the public CustomOriginConfig to the internet-facing ALB DNS.
-          # OriginReadTimeout/OriginKeepaliveTimeout are set to their 60s max in
-          # both styles so the WebSocket 101 handshake is not cut off. DomainName
-          # is still required by CloudFront in both styles and resolves to the
-          # ALB DNS name.
+          # Single origin; connection style selected by UseVpcOrigin. Option 2:
+          # VpcOriginConfig -> the internal ALB via the service-managed ENI.
+          # Option 1/plain: public CustomOriginConfig to the ALB DNS. DomainName
+          # is required by CloudFront in both styles.
           - Id: alb-origin
             DomainName: !GetAtt LoadBalancer.DNSName
             VpcOriginConfig: !If
@@ -830,8 +934,7 @@ Resources:
             CustomOriginConfig: !If
               - UseVpcOriginCond
               - !Ref AWS::NoValue
-              # ALB is HTTP:80 only (no cert on the ALB); CloudFront terminates
-              # TLS at the edge and talks plaintext HTTP to the origin.
+              # ALB is HTTP:80 only; CloudFront terminates TLS at the edge.
               - OriginProtocolPolicy: http-only
                 HTTPPort: 80
                 OriginReadTimeout: 60
@@ -853,8 +956,7 @@ Resources:
             - HEAD
           # Managed CachingDisabled - dynamic REST + WebSocket traffic.
           CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
-          # Managed AllViewer - forwards all viewer headers (including the
-          # Sec-WebSocket-* headers) so the wss:// upgrade reaches the origin.
+          # Managed AllViewer - forwards the Sec-WebSocket-* headers for wss.
           OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
         ViewerCertificate:
           # Free AWS-managed *.cloudfront.net certificate (trusted TLS).
@@ -868,6 +970,8 @@ Resources:
 
   TaskDefinition:
     Type: AWS::ECS::TaskDefinition
+    # Wait for the in-stack image build so the task consumes a pushed image.
+    DependsOn: ImageBuildTrigger
     Properties:
       Family: !Sub "${AWS::StackName}-app"
       RequiresCompatibilities:
@@ -879,7 +983,12 @@ Resources:
       TaskRoleArn: !GetAtt TaskRole.Arn
       ContainerDefinitions:
         - Name: app
-          Image: !Ref ContainerImage
+          # Use the explicit ContainerImage override when set, else the image
+          # the in-stack CodeBuild build pushed to the stack's ECR repo:ImageTag.
+          Image: !If
+            - HasContainerImageOverride
+            - !Ref ContainerImage
+            - !Sub "${AppEcrRepo.RepositoryUri}:${ImageTag}"
           Essential: true
           PortMappings:
             - ContainerPort: 8080
@@ -893,27 +1002,20 @@ Resources:
               Value: !Ref DuesTable
             - Name: CALLS_TABLE
               Value: !Ref CallsTable
-            # APP_LOG_GROUP is surfaced to the dashboard UI (via /api/config) so
-            # it can build a per-call CloudWatch Logs Insights deep link filtered
-            # by call_sid. Keep in sync with the awslogs-group below.
+            # APP_LOG_GROUP -> /api/config -> per-call CloudWatch Logs Insights
+            # deep link. Keep in sync with the awslogs-group below.
             - Name: APP_LOG_GROUP
               Value: !Ref AppLogGroup
-            # TEXT model used by the off-path post-call intelligence extraction
-            # (Bedrock Converse). Non-secret; driven by the ExtractionModelId
-            # parameter so this env var and the bedrock-text-extraction IAM
-            # grant Resource above are ALWAYS the same model (no drift).
+            # TEXT model for off-path post-call extraction; driven by
+            # ExtractionModelId so this env var and the IAM grant never drift.
             - Name: EXTRACTION_MODEL_ID
               Value: !Ref ExtractionModelId
-            # Base URL for the PTP payment-link SMS. Non-secret placeholder;
-            # override with the real pay URL at deploy time. Matches
-            # app/config.py PAYMENT_LINK_BASE_URL.
+            # PTP payment-link SMS base URL (non-secret placeholder; override at
+            # deploy). Matches app/config.py PAYMENT_LINK_BASE_URL.
             - Name: PAYMENT_LINK_BASE_URL
               Value: https://pay.example.com/
-            # PUBLIC_BASE_URL drives the TwiML wss://<host>/media URL.
-            # Precedence: (1) CloudFront domain when Option 1 is enabled (free
-            # managed TLS); (2) the ACM-covered TLS hostname when PublicHostname
-            # is set; (3) the raw ALB DNS (HTTP-only/internal testing). The app
-            # normalizes whatever host it receives to wss://<host>/media.
+            # PUBLIC_BASE_URL -> TwiML wss://<host>/media. Precedence: CloudFront
+            # domain (Option 1) -> ACM hostname -> raw ALB DNS.
             - Name: PUBLIC_BASE_URL
               Value: !If
                 - EnableCf
@@ -922,17 +1024,9 @@ Resources:
                   - HasPublicHostname
                   - !Ref PublicHostname
                   - !GetAtt LoadBalancer.DNSName
-            # GA Strands OTEL telemetry. The app configures StrandsTelemetry
-            # once at startup (before any BidiAgent.run) so the GA bidi agent
-            # loop auto-emits OTEL spans: a bidi_session span with reported token
-            # usage (gen_ai.usage.*), a bidi_response span with native TTFT
-            # (gen_ai.server.time_to_first_audio), plus tool-call and
-            # connection-restart spans. With the default OTEL_EXPORTER=console,
-            # spans are written to stdout and the awslogs LogDriver below already
-            # ships them to CloudWatch Logs -- so NO new IAM and NO new
-            # infrastructure are required for telemetry. OTEL_EXPORTER=otlp is
-            # the only setting that needs an external collector; if you adopt it,
-            # that collector's auth (not this task role) governs access.
+            # GA Strands OTEL telemetry. Default console exporter -> stdout ->
+            # awslogs -> CloudWatch (no new IAM/infra). Only otlp needs a
+            # collector. See DEPLOYMENT.md.
             - Name: OTEL_ENABLED
               Value: !Ref OtelEnabled
             - Name: OTEL_EXPORTER
@@ -942,8 +1036,8 @@ Resources:
               - Name: OTEL_EXPORTER_OTLP_ENDPOINT
                 Value: !Ref OtelExporterOtlpEndpoint
               - !Ref AWS::NoValue
-          # Twilio credentials are injected from Secrets Manager/SSM by ARN;
-          # no secret value appears in this template.
+          # Twilio credentials injected from Secrets Manager/SSM by ARN (no
+          # secret value in this template).
           Secrets:
             - Name: TWILIO_ACCOUNT_SID
               ValueFrom: !Ref TwilioAccountSidArn
@@ -964,11 +1058,9 @@ Resources:
     Type: AWS::ECS::Service
     DependsOn: Listener
     Metadata:
-      # W1030: cfn-lint resolves the !If false branch's !Ref PrivateSubnetIds
-      # empty-string DEFAULT against the subnet-id regex. False positive: the
-      # PrivateSubnetIds branch is only selected when UseVpcOrigin="true" (real
-      # subnet ids supplied); the empty default keeps the default "false" path
-      # (public subnets) deployable. Same rationale as the W3037/W1035 ignores.
+      # W1030: false positive - !If false branch !Ref PrivateSubnetIds empty
+      # default resolved against the subnet-id regex (only taken when
+      # UseVpcOrigin=true with real subnet ids).
       cfn-lint:
         config:
           ignore_checks:
@@ -980,10 +1072,8 @@ Resources:
       TaskDefinition: !Ref TaskDefinition
       # >= 120s matches the ALB idle timeout so the WebSocket stays open.
       HealthCheckGracePeriodSeconds: 120
-      # When UseVpcOrigin=true the tasks run in the private subnets with NO
-      # public IP (AssignPublicIp=DISABLED) and reach Twilio/Bedrock/DynamoDB/
-      # ECR/AgentCore outbound via the NAT gateway. Otherwise they keep today's
-      # public-subnet + AssignPublicIp=ENABLED posture.
+      # UseVpcOrigin=true: tasks run private (AssignPublicIp DISABLED) with NAT
+      # egress; else public-subnet + AssignPublicIp ENABLED.
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: !If [UseVpcOriginCond, DISABLED, ENABLED]
@@ -1002,12 +1092,13 @@ Resources:
           TargetGroupArn: !Ref TargetGroup
 
   # --- CloudWatch dashboard --------------------------------------------------
-  # Observability note (POC approach A): the per-call drill-down link rendered
-  # in the dashboard UI is a client-side CloudWatch Logs Insights deep link
-  # filtered by call_sid against AppLogGroup. It needs no new IAM and no
-  # cloudwatch:PutMetricData, so none is added here. The ARCollections/TTFTms
-  # widget below remains an aspirational custom-metric placeholder (nothing
-  # emits it yet); wiring it live would be POC approach B (PutMetricData).
+  # Static, aggregate (not per-call) observability dashboard. The per-call
+  # drill-down link in the UI is a client/backend-built CloudWatch Logs Insights
+  # deep link scoped to one call_sid (no new IAM, no PutMetricData). The log
+  # widgets below parse the app's one-JSON-object-per-line logs (fields such as
+  # event_type, ttft_ms, turn_latency_ms, duration_ms, tool, input_tokens,
+  # output_tokens, total_tokens -- see app/metrics.py) for TTFT, turns, token
+  # usage, barge-ins, transport and a recent call timeline across ALL calls.
   Dashboard:
     Type: AWS::CloudWatch::Dashboard
     Properties:
@@ -1016,44 +1107,59 @@ Resources:
         {
           "widgets": [
             {
-              "type": "metric", "x": 0, "y": 0, "width": 8, "height": 6,
+              "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
               "properties": {
                 "title": "Call volume (ALB requests)",
-                "region": "${AWS::Region}",
-                "stat": "Sum",
-                "metrics": [
-                  [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ]
-                ]
+                "region": "${AWS::Region}", "stat": "Sum",
+                "metrics": [ [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ] ]
               }
             },
             {
-              "type": "metric", "x": 8, "y": 0, "width": 8, "height": 6,
-              "properties": {
-                "title": "Avg TTFT (custom metric: ARCollections/TTFTms)",
-                "region": "${AWS::Region}",
-                "stat": "Average",
-                "metrics": [
-                  [ "ARCollections", "TTFTms" ]
-                ]
-              }
-            },
-            {
-              "type": "metric", "x": 16, "y": 0, "width": 8, "height": 6,
+              "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
               "properties": {
                 "title": "Request latency (ALB target response time)",
-                "region": "${AWS::Region}",
-                "stat": "Average",
-                "metrics": [
-                  [ "AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ]
-                ]
+                "region": "${AWS::Region}", "stat": "Average",
+                "metrics": [ [ "AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${LoadBalancer.LoadBalancerFullName}" ] ]
               }
             },
             {
-              "type": "log", "x": 0, "y": 6, "width": 24, "height": 6,
+              "type": "log", "x": 0, "y": 6, "width": 12, "height": 6,
               "properties": {
-                "title": "Recent app logs (call lifecycle / metrics JSON lines)",
-                "region": "${AWS::Region}",
-                "query": "SOURCE '${AppLogGroup}' | fields @timestamp, @message | sort @timestamp desc | limit 50"
+                "title": "TTFT (time to first audio, ms) over time",
+                "region": "${AWS::Region}", "view": "timeSeries", "stacked": false,
+                "query": "SOURCE '${AppLogGroup}' | filter event_type = 'ttft_measured' | stats avg(ttft_ms) as avg_ttft_ms, max(ttft_ms) as max_ttft_ms by bin(5m)"
+              }
+            },
+            {
+              "type": "log", "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Turns: response wait and turn elapsed (ms)",
+                "region": "${AWS::Region}", "view": "timeSeries", "stacked": false,
+                "query": "SOURCE '${AppLogGroup}' | filter event_type = 'turn_complete' | stats avg(turn_latency_ms) as avg_response_wait_ms, avg(duration_ms) as avg_turn_elapsed_ms, count(*) as turns by bin(5m)"
+              }
+            },
+            {
+              "type": "log", "x": 0, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "Token usage (input / output / total)",
+                "region": "${AWS::Region}", "view": "timeSeries", "stacked": false,
+                "query": "SOURCE '${AppLogGroup}' | filter event_type = 'usage' | stats sum(input_tokens) as input_tokens, sum(output_tokens) as output_tokens, sum(total_tokens) as total_tokens by bin(5m)"
+              }
+            },
+            {
+              "type": "log", "x": 12, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "Barge-ins and tool invocations per call",
+                "region": "${AWS::Region}", "view": "table",
+                "query": "SOURCE '${AppLogGroup}' | filter event_type = 'barge_in' or event_type = 'tool_invocation' | stats count(*) as events by call_sid, event_type | sort call_sid desc | limit 100"
+              }
+            },
+            {
+              "type": "log", "x": 0, "y": 18, "width": 24, "height": 6,
+              "properties": {
+                "title": "Recent call timeline (lifecycle / metrics JSON lines)",
+                "region": "${AWS::Region}", "view": "table",
+                "query": "SOURCE '${AppLogGroup}' | fields @timestamp, call_sid, event_type, t_ms, ttft_ms, turn_latency_ms, duration_ms, tool, total_tokens | sort @timestamp desc | limit 100"
               }
             }
           ]
@@ -1111,12 +1217,9 @@ Resources:
 Outputs:
   PublicBaseUrl:
     Description: >-
-      Host used for PUBLIC_BASE_URL (TwiML emits wss://<this>/media). The
-      CloudFront domain when Option 1 (EnableCloudFront) is on, else the TLS
-      hostname when PublicHostname is set, else the raw ALB DNS. A live Twilio
-      call REQUIRES a TLS endpoint (CloudFront, or CertificateArn +
-      PublicHostname); the raw ALB DNS has no certificate and Twilio will
-      refuse wss:// to it.
+      Host for PUBLIC_BASE_URL (TwiML emits wss://<this>/media): CloudFront
+      domain (Option 1) else PublicHostname else raw ALB DNS. A live call needs
+      a TLS endpoint.
     Value: !If
       - EnableCf
       - !GetAtt Distribution.DomainName
@@ -1125,8 +1228,7 @@ Outputs:
         - !Ref PublicHostname
         - !GetAtt LoadBalancer.DNSName
   AlbDnsName:
-    Description: >-
-      Raw ALB DNS name. Point your PublicHostname CNAME/alias record at this.
+    Description: Raw ALB DNS name. Point your PublicHostname CNAME/alias at this.
     Value: !GetAtt LoadBalancer.DNSName
   HttpsEnabled:
     Description: Whether the HTTPS:443 (wss) listener was provisioned.
@@ -1134,12 +1236,21 @@ Outputs:
   CloudFrontDomainName:
     Condition: EnableCf
     Description: >-
-      CloudFront distribution domain (*.cloudfront.net). Twilio Media Streams
-      connect over wss://<this>/media via the free AWS-managed TLS cert.
+      CloudFront distribution domain (*.cloudfront.net). Twilio connects over
+      wss://<this>/media via the free AWS-managed TLS cert.
     Value: !GetAtt Distribution.DomainName
   DashboardUrl:
     Description: CloudWatch dashboard console URL.
     Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${Dashboard}"
+  EcrRepositoryUri:
+    Description: ECR repo the in-stack CodeBuild build pushes the app image to.
+    Value: !GetAtt AppEcrRepo.RepositoryUri
+  ContainerImageUri:
+    Description: Full image URI the ECS task consumes (override or built image).
+    Value: !If
+      - HasContainerImageOverride
+      - !Ref ContainerImage
+      - !Sub "${AppEcrRepo.RepositoryUri}:${ImageTag}"
   DuesTableName:
     Description: DynamoDB table for due/account records (DUES_TABLE).
     Value: !Ref DuesTable
@@ -1155,9 +1266,9 @@ Outputs:
   ProvisionedPrivateSubnetIds:
     Condition: UseVpcOriginCond
     Description: >-
-      The private subnet ids backing the internal ALB, the VPC origin ENI, and
-      the Fargate tasks when UseVpcOrigin="true": the stack-created subnets when
-      PrivateSubnetIds was left blank, else the operator-supplied list.
+      Private subnet ids backing the internal ALB, VPC origin ENI, and tasks
+      when UseVpcOrigin=true: stack-created when PrivateSubnetIds was blank, else
+      the operator-supplied list.
     Value: !If
       - ProvisionPrivateSubnets
       - !Join [",", [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
