@@ -38,9 +38,18 @@ def _final_transcript(text: str, role: str) -> BidiTranscriptBlockEvent:
     return BidiTranscriptBlockEvent(transcript=text, role=role, content_id=_cid())
 
 
-def _partial_transcript(delta: str, role: str) -> BidiTranscriptDeltaEvent:
-    """GA partial transcript delta (the old is_final=False transcript)."""
-    return BidiTranscriptDeltaEvent(delta=delta, role=role, content_id=_cid())
+def _partial_transcript(
+    delta: str, role: str, content_id: str | None = None
+) -> BidiTranscriptDeltaEvent:
+    """GA partial transcript delta (the old is_final=False transcript).
+
+    Deltas of one utterance share a ``content_id``; pass an explicit one to
+    group consecutive deltas into the same utterance (a new/omitted id means a
+    new utterance).
+    """
+    return BidiTranscriptDeltaEvent(
+        delta=delta, role=role, content_id=content_id or _cid()
+    )
 
 
 class FakeClock:
@@ -395,11 +404,12 @@ def test_user_partial_transcript_fallback_populates_chat():
 
     clock.set(1.0)
     m.record_event(_final_transcript("Hello.", role="assistant"))
-    # User only emits partial (delta) transcripts -> accumulate to "I will pay".
+    # User only emits partial (delta) transcripts for ONE utterance (same
+    # content_id) -> accumulate to "I will pay".
     clock.set(1.5)
-    m.record_event(_partial_transcript("I", role="user"))
+    m.record_event(_partial_transcript("I", role="user", content_id="u1"))
     clock.set(1.8)
-    m.record_event(_partial_transcript(" will pay", role="user"))
+    m.record_event(_partial_transcript(" will pay", role="user", content_id="u1"))
     clock.set(2.0)
     m.on_session_end()
 
@@ -408,6 +418,65 @@ def test_user_partial_transcript_fallback_populates_chat():
     assert "user" in speakers
     user_turn = next(t for t in turns if t["speaker"] == "user")
     assert user_turn["text"] == "I will pay"
+
+
+def test_partial_only_utterances_do_not_concatenate_across_content_ids():
+    """On a partial-only call with several user utterances (deltas with
+    DIFFERENT content_ids and no block), the fallback is the LATEST utterance's
+    text, not a run-on concatenation of every utterance.
+    """
+    clock = FakeClock()
+    m = CallMetrics(clock=clock)
+    clock.set(0.0)
+    m.on_session_start()
+
+    clock.set(1.0)
+    m.record_event(_final_transcript("Hello.", role="assistant"))
+
+    # Utterance 1: two deltas sharing content_id "u1".
+    clock.set(1.5)
+    m.record_event(_partial_transcript("I will", role="user", content_id="u1"))
+    clock.set(1.7)
+    m.record_event(_partial_transcript(" pay today", role="user", content_id="u1"))
+
+    # Utterance 2: a NEW content_id "u2" -> must NOT append to utterance 1.
+    clock.set(2.5)
+    m.record_event(_partial_transcript("Actually", role="user", content_id="u2"))
+    clock.set(2.7)
+    m.record_event(_partial_transcript(" next week", role="user", content_id="u2"))
+
+    clock.set(3.0)
+    m.on_session_end()
+
+    # The accumulator reflects only the latest utterance, not the concatenation.
+    assert m._last_user_partial_text == "Actually next week"
+    assert "I will pay today" not in (m._last_user_partial_text or "")
+
+    user_turns = [t for t in m.conversation_turns if t["speaker"] == "user"]
+    assert len(user_turns) == 1
+    assert user_turns[0]["text"] == "Actually next week"
+
+
+def test_user_block_final_clears_partial_fallback_accumulator():
+    """A real final (BlockEvent) takes precedence over the partial fallback and
+    resets the accumulator so a later utterance's deltas start fresh.
+    """
+    clock = FakeClock()
+    m = CallMetrics(clock=clock)
+    clock.set(0.0)
+    m.on_session_start()
+
+    clock.set(1.0)
+    m.record_event(_partial_transcript("I will", role="user", content_id="u1"))
+    clock.set(1.2)
+    # Block closes utterance u1 -> clears the partial accumulator.
+    m.record_event(_final_transcript("I will pay today.", role="user"))
+    assert m._last_user_partial_text is None
+
+    # A fresh partial-only utterance accumulates on its own, uncontaminated.
+    clock.set(2.0)
+    m.record_event(_partial_transcript("Thanks", role="user", content_id="u2"))
+    assert m._last_user_partial_text == "Thanks"
 
 
 def test_metrics_emits_json_log_lines_for_lifecycle(caplog):

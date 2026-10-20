@@ -32,9 +32,9 @@ prerequisites  ->  store Twilio secrets  ->  build image (CodeBuild -> ECR)
 | 3 | Collect VPC / subnet inputs | manual (your existing VPC) |
 | 4 | Build the container image | `scripts/codebuild_image.sh` (CodeBuild → ECR) |
 | 5 | Deploy the stack (IaC) | `scripts/deploy.sh deploy` |
-| 6 | Seed the demo dues data | `scripts/seed_dues.py` |
+| 6 | Seed the demo dues data | `.venv/bin/python scripts/seed_dues.py` |
 | 7 | Force a new ECS deployment | `scripts/deploy.sh redeploy` |
-| 8 | Reach the dashboard + place a call | dashboard / `scripts/place_call.py` |
+| 8 | Reach the dashboard + place a call | dashboard / `.venv/bin/python scripts/place_call.py` |
 
 ---
 
@@ -243,11 +243,13 @@ export DUES_TABLE=$(aws cloudformation describe-stacks \
   --stack-name "$STACK_NAME" --region us-east-1 \
   --query "Stacks[0].Outputs[?OutputKey=='DuesTableName'].OutputValue|[0]" --output text)
 
-AWS_REGION=us-east-1 scripts/seed_dues.py        # or: scripts/seed_dues.py --dues-table "$DUES_TABLE" --region us-east-1
+AWS_REGION=us-east-1 .venv/bin/python scripts/seed_dues.py        # or: .venv/bin/python scripts/seed_dues.py --dues-table "$DUES_TABLE" --region us-east-1
 ```
 
-It is safe to re-run (it uses `put_item`, insert-or-replace). Add `--dry-run` to
-preview the records without writing.
+Run it with the project venv (`.venv` from the prerequisites step) because the
+script imports `app.store` (boto3); if you have the venv activated you can drop
+the `.venv/bin/` prefix. It is safe to re-run (it uses `put_item`,
+insert-or-replace). Add `--dry-run` to preview the records without writing.
 
 ---
 
@@ -286,8 +288,9 @@ STACK_NAME=ar-collections-nova-sonic AWS_REGION=us-east-1 scripts/deploy.sh rede
 2. **Place a call** — any of:
 
    - the dashboard **"Call now"** button on a due record;
-   - the CLI: `scripts/place_call.py --account-id ACC-1001` (dry-run with
-     `--dry-run`); or
+   - the CLI: `.venv/bin/python scripts/place_call.py --account-id ACC-1001`
+     (dry-run with `--dry-run`; needs the project venv since it imports
+     `app.config`/`app.store`); or
    - the REST API:
 
      ```bash
@@ -310,8 +313,9 @@ STACK_NAME=ar-collections-nova-sonic AWS_REGION=us-east-1 scripts/deploy.sh rede
   shows the per-call JSON lines and the GA Strands OTEL spans (session token
   usage, per-response native TTFT, tool calls).
 - **WebSocket upgrade probe (optional):**
-  `python scripts/ws_probe.py "$CF"` proves the `wss://<cloudfront-domain>/media`
-  101 handshake end-to-end.
+  `.venv/bin/python scripts/ws_probe.py "$CF"` proves the
+  `wss://<cloudfront-domain>/media` 101 handshake end-to-end (uses the
+  `websockets` dependency from the project venv).
 
 ## Updating a running deployment
 

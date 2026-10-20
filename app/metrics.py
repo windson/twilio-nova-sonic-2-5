@@ -158,8 +158,18 @@ class CallMetrics:
         # Fallback: latest non-final user transcript text seen. If a call only
         # yields partial (non-final) user transcripts, we still want the chat
         # view to show what the user said rather than an empty bubble.
+        #
+        # GA keys each transcript stream by ``content_id``: all deltas of one
+        # user utterance share a content_id, a new utterance opens a new one,
+        # and a ``BidiTranscriptBlockEvent`` closes that content_id's stream. We
+        # therefore accumulate deltas only within the CURRENT user content_id
+        # and start fresh when the content_id changes (or when the matching
+        # block finalizes the utterance), so the fallback reflects a SINGLE
+        # utterance rather than a run-on concatenation of every utterance in the
+        # call.
         self._last_user_partial_text: str | None = None
         self._last_user_partial_t_ms: float | None = None
+        self._user_partial_content_id: str | None = None
 
         # Conversation-level aggregates.
         self.first_ttft_ms: float | None = None
@@ -413,6 +423,13 @@ class CallMetrics:
         text = getattr(event, "transcript", None)
         if role == "user":
             self._last_user_final_wall = now
+            # The block closes this user utterance's transcript stream. A real
+            # final takes precedence over the partial fallback, so clear the
+            # per-utterance delta accumulator; the next utterance's deltas start
+            # fresh under their own content_id.
+            self._last_user_partial_text = None
+            self._last_user_partial_t_ms = None
+            self._user_partial_content_id = None
         self.transcripts.append(
             {
                 "role": role,
@@ -434,10 +451,19 @@ class CallMetrics:
         """
         role = getattr(event, "role", None)
         delta = getattr(event, "delta", None)
+        content_id = getattr(event, "content_id", None)
         if role == "user" and delta:
-            # Accumulate consecutive user deltas so the fallback reflects the
-            # full partial utterance, not just the last chunk.
-            self._last_user_partial_text = (self._last_user_partial_text or "") + delta
+            # Accumulate consecutive deltas of the SAME user utterance (keyed by
+            # ``content_id``) so the fallback reflects the full partial
+            # utterance, not just the last chunk. When the content_id changes a
+            # new utterance has started, so reset the accumulator instead of
+            # concatenating across utterances (which would produce a single
+            # run-on turn on a partial-only call).
+            if content_id != self._user_partial_content_id:
+                self._user_partial_content_id = content_id
+                self._last_user_partial_text = delta
+            else:
+                self._last_user_partial_text = (self._last_user_partial_text or "") + delta
             self._last_user_partial_t_ms = self._rel_ms(now)
             text: str | None = self._last_user_partial_text
         else:
