@@ -24,6 +24,8 @@ def _settings(**overrides) -> Settings:
         nova_model_id="amazon.nova-2-5-sonic",
         aws_region="us-east-1",
         app_log_group="/ecs/ar-collections-nova-sonic/app",
+        extraction_model_id="amazon.nova-lite-v1:0",
+        payment_link_base_url="https://pay.example.com/",
         twilio_account_sid="AC_test_sid",
         twilio_auth_token="test_token_value",
         twilio_from_number="+15005550006",
@@ -137,6 +139,47 @@ def test_get_calls_and_get_call_by_id_return_persisted_analytics(store):
     assert full["turns"][0]["duration_ms"] == 900.0
     assert full["transcripts"][0]["text"] == "Hello"
     assert full["events_log"][0]["event_type"] == "call_placed"
+
+
+def test_calls_expose_postcall_intelligence_fields(store):
+    analytics = {
+        "call_sid": "CA_intel",
+        "account_id": "ACC-1001",
+        "total_e2e_ms": 5000.0,
+        "turn_count": 2,
+        "disposition": "promise_to_pay",
+        "intelligence_status": "ready",
+        "structured_data": {
+            "payment_specifics": {
+                "promised_amount": 428.57,
+                "agreed_date": "2024-06-03",
+                "preferred_payment_method": "card",
+            },
+            "contextual_data": {
+                "reason_for_delinquency": "medical emergency",
+                "customer_sentiment": "cooperative",
+            },
+        },
+        "next_best_action": "Schedule follow-up call",
+        "collection_paused": True,
+        "escalated": False,
+        "ptp_sms_status": "sent",
+    }
+    store.save_call_analytics(analytics)
+
+    # List summary carries disposition + intelligence_status.
+    calls = client.get("/api/calls").json()["calls"]
+    summary = next(c for c in calls if c["call_sid"] == "CA_intel")
+    assert summary["disposition"] == "promise_to_pay"
+    assert summary["intelligence_status"] == "ready"
+
+    # Detail carries the full structured data + NBA + trigger context.
+    full = client.get("/api/calls/CA_intel").json()
+    assert full["disposition"] == "promise_to_pay"
+    assert full["next_best_action"] == "Schedule follow-up call"
+    assert full["structured_data"]["payment_specifics"]["agreed_date"] == "2024-06-03"
+    assert full["collection_paused"] is True
+    assert full["ptp_sms_status"] == "sent"
 
 
 def test_get_call_unknown_id_returns_404(store):

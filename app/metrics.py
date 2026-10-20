@@ -676,6 +676,11 @@ class CallMetrics:
         the chat-style user<->assistant model for the UI.
         """
         conversation_turns = self._build_conversation_turns()
+        # Post-call intelligence fields (FEAT-002) start BLANK here and are
+        # filled asynchronously, OFF the audio path, by app.postcall after the
+        # call ends. total_e2e_ms / nova_total_ms / ttft_ms above are computed
+        # from session_start..session_end on the audio path only, so the
+        # post-call extraction can never inflate those latency numbers.
         return {
             "call_sid": self.call_sid,
             "account_id": self.account_id,
@@ -692,7 +697,23 @@ class CallMetrics:
             "turns": list(self.turns),
             "transcripts": list(self.transcripts),
             "events_log": list(self.events_log),
+            # -- post-call intelligence (blank at call end) ------------------
+            "disposition": None,
+            "structured_data": _blank_structured_data(),
+            "next_best_action": None,
+            "intelligence_status": "pending",
+            "collection_paused": False,
+            "escalated": False,
+            "ptp_sms_status": None,
+            "triggers": [],
         }
+
+
+def _blank_structured_data() -> dict[str, Any]:
+    """Empty structured-conversation-data skeleton (see app.store)."""
+    from app.store import blank_structured_data
+
+    return blank_structured_data()
 
 
 def _tool_name(event: Any) -> Any:

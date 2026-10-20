@@ -32,6 +32,15 @@ class OutboundCallResult:
     account_id: str | None
 
 
+@dataclass(frozen=True)
+class SmsResult:
+    """Outcome of sending an SMS."""
+
+    message_sid: str
+    to: str
+    from_number: str
+
+
 def _media_ws_url(public_base_url: str) -> str:
     """Derive the ``wss://<host>/media`` WebSocket URL from PUBLIC_BASE_URL.
 
@@ -89,6 +98,58 @@ def _make_client(settings: Settings, client_factory: Any | None = None) -> Any:
     if client_factory is None:
         from twilio.rest import Client as client_factory  # type: ignore[no-redef]
     return client_factory(settings.twilio_account_sid, settings.twilio_auth_token)
+
+
+def send_sms(
+    to: str,
+    body: str,
+    *,
+    settings: Settings | None = None,
+    client_factory: Any | None = None,
+) -> SmsResult:
+    """Send an SMS using the same Twilio REST client + credentials.
+
+    Used by the post-call PTP downstream trigger to deliver a payment link.
+
+    Note: on a Twilio TRIAL account messages can only be delivered to the
+    verified number; sending to any other destination raises a Twilio API
+    error. Callers are expected to attempt the real send and catch/flag the
+    trial restriction (``app.postcall`` records ``ptp_sms_status`` accordingly)
+    rather than faking a success.
+
+    Args:
+        to: Destination phone number (E.164).
+        body: Message body.
+        settings: Settings override (defaults to :func:`get_settings`).
+        client_factory: Injectable ``twilio.rest.Client`` factory (mocked in
+            tests). Defaults to the real client.
+
+    Returns:
+        :class:`SmsResult` describing the created message.
+
+    Raises:
+        ValueError: If required Twilio configuration is missing.
+    """
+    settings = settings or get_settings()
+
+    if not settings.twilio_configured:
+        raise ValueError("Twilio is not configured (missing TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN)")
+    if not settings.twilio_from_number:
+        raise ValueError("TWILIO_FROM_NUMBER is not configured")
+
+    client = _make_client(settings, client_factory=client_factory)
+    message = client.messages.create(
+        to=to,
+        from_=settings.twilio_from_number,
+        body=body,
+    )
+    message_sid = getattr(message, "sid", None) or ""
+    logger.info("message_sid=<%s> | payment-link SMS sent", message_sid)
+    return SmsResult(
+        message_sid=message_sid,
+        to=to,
+        from_number=settings.twilio_from_number,
+    )
 
 
 def place_outbound_call(

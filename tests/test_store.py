@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.store import InMemoryStore
+from app.store import CALL_DISPOSITIONS, InMemoryStore
 
 
 def test_seeded_dues_present():
@@ -94,3 +94,50 @@ def test_save_call_analytics_without_call_sid_uses_fallback_key():
     saved = store.save_call_analytics({"account_id": "ACC-1002"})
     assert saved["call_sid"] == "ACC-1002"
     assert store.get_call("ACC-1002") is not None
+
+
+def test_call_dispositions_taxonomy_contains_required_tags():
+    for tag in (
+        "promise_to_pay",
+        "refusal_to_pay",
+        "dispute_raised",
+        "inbound_callback_requested",
+        "wrong_number",
+    ):
+        assert tag in CALL_DISPOSITIONS
+    # Plus the added sensible others.
+    for tag in ("no_answer", "left_voicemail", "already_paid", "undetermined"):
+        assert tag in CALL_DISPOSITIONS
+
+
+def test_seeded_dues_carry_new_state_fields():
+    store = InMemoryStore()
+    rec = store.get_due("ACC-1001")
+    assert rec["collection_paused"] is False
+    assert rec["escalated"] is False
+
+
+def test_update_call_analytics_merges_intelligence():
+    store = InMemoryStore()
+    store.save_call_analytics(
+        {"call_sid": "CA-INT", "account_id": "ACC-1001", "intelligence_status": "pending"}
+    )
+    updated = store.update_call_analytics(
+        "CA-INT",
+        disposition="promise_to_pay",
+        intelligence_status="ready",
+        next_best_action="Send payment link",
+    )
+    assert updated["disposition"] == "promise_to_pay"
+    assert updated["intelligence_status"] == "ready"
+    # Original fields preserved.
+    assert updated["account_id"] == "ACC-1001"
+
+    again = store.get_call("CA-INT")
+    assert again["next_best_action"] == "Send payment link"
+
+
+def test_update_call_analytics_unknown_id_raises():
+    store = InMemoryStore()
+    with pytest.raises(KeyError):
+        store.update_call_analytics("NOPE", disposition="paid")

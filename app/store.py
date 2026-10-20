@@ -16,16 +16,41 @@ Due/Account record::
         "due_date": str,            # ISO date, e.g. "2024-05-01"
         "status": str,              # open|promised_to_pay|paid|disputed|callback
         "notes": str,
+        "collection_paused": bool,  # true when a PTP pauses auto-collection
+        "escalated": bool,          # true when a dispute escalates to a human
         "last_updated": str,        # ISO timestamp
     }
 
-CallAnalytics record (produced by :mod:`app.metrics`)::
+CallAnalytics record (produced by :mod:`app.metrics`, enriched post-call by
+:mod:`app.postcall`)::
 
     {
         "call_sid": str,
         "account_id": str,
-        ...metrics fields..., "turns": [...], "events_log": [...]
+        ...metrics fields..., "turns": [...], "events_log": [...],
+        # Post-call intelligence (FEAT-002), blank at call end, filled async:
+        "disposition": str | None,          # one of CALL_DISPOSITIONS
+        "structured_data": {
+            "payment_specifics": {
+                "promised_amount": float | None,
+                "agreed_date": str | None,       # resolved ISO date
+                "preferred_payment_method": str | None,
+            },
+            "contextual_data": {
+                "reason_for_delinquency": str | None,
+                "customer_sentiment": str | None,
+            },
+        },
+        "next_best_action": str | None,
+        "intelligence_status": str,          # pending|ready|failed
+        "collection_paused": bool,           # downstream trigger result (PTP)
+        "escalated": bool,                   # downstream trigger result (dispute)
+        "ptp_sms_status": str | None,        # sent|blocked_trial|failed
+        "triggers": [str, ...],              # which downstream triggers ran
     }
+
+``promised_amount`` is numeric and is stored as ``Decimal`` in DynamoDB via
+:func:`_to_dynamo` (and converted back by :func:`_from_dynamo`).
 """
 
 from __future__ import annotations
@@ -50,9 +75,64 @@ DUE_STATUSES = (
     "callback",
 )
 
+# Standardized Call Disposition taxonomy (the "what happened" outcome tag).
+#
+# A disposition is a richer, post-call outcome tag than DUE_STATUSES; it drives
+# downstream automation (CRM update, workflow routing, compliance). Each tag's
+# downstream directive is documented inline:
+#
+# - promise_to_pay (PTP): debtor committed to a date/amount. Directive: send a
+#   payment-link SMS and PAUSE further automated collection attempts
+#   (collection_paused=true on the account).
+# - refusal_to_pay: debtor explicitly refuses. Directive: route to a human
+#   collections strategy queue; do not keep auto-dialing on the same cadence.
+# - dispute_raised: debtor disputes the balance. Directive: ESCALATE the account
+#   to a human specialist immediately (escalated=true) and emit an escalation
+#   event; compliance-sensitive.
+# - inbound_callback_requested: debtor asked to be called back / will call back.
+#   Directive: schedule a follow-up touchpoint.
+# - wrong_number: reached the wrong party. Directive: flag the account so the
+#   number is not re-dialed; suppress further contact to that number.
+# - no_answer: nobody picked up. Directive: reschedule per retry policy.
+# - left_voicemail: voicemail left. Directive: reschedule and wait for callback.
+# - already_paid: debtor states the balance is already paid. Directive: verify
+#   and reconcile; pause collection.
+# - undetermined: outcome could not be classified from the transcript.
+#   Directive: leave for human review; no automated trigger.
+CALL_DISPOSITIONS = (
+    "promise_to_pay",
+    "refusal_to_pay",
+    "dispute_raised",
+    "inbound_callback_requested",
+    "wrong_number",
+    "no_answer",
+    "left_voicemail",
+    "already_paid",
+    "undetermined",
+)
+
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def blank_structured_data() -> dict[str, Any]:
+    """Return an empty structured-conversation-data skeleton.
+
+    The UI renders blank placeholders from this shape before the post-call
+    intelligence has run; :mod:`app.postcall` fills it in afterwards.
+    """
+    return {
+        "payment_specifics": {
+            "promised_amount": None,
+            "agreed_date": None,
+            "preferred_payment_method": None,
+        },
+        "contextual_data": {
+            "reason_for_delinquency": None,
+            "customer_sentiment": None,
+        },
+    }
 
 
 @runtime_checkable
@@ -74,6 +154,9 @@ class Store(Protocol):
     def save_call_analytics(self, record: Mapping[str, Any]) -> dict[str, Any]:  # pragma: no cover
         ...
 
+    def update_call_analytics(self, call_id: str, **changes: Any) -> dict[str, Any]:  # pragma: no cover
+        ...
+
     def list_calls(self) -> list[dict[str, Any]]:  # pragma: no cover - protocol
         ...
 
@@ -93,6 +176,8 @@ def _seed_dues() -> dict[str, dict[str, Any]]:
             "due_date": "2024-05-15",
             "status": "open",
             "notes": "",
+            "collection_paused": False,
+            "escalated": False,
             "last_updated": now,
         },
         {
@@ -103,6 +188,8 @@ def _seed_dues() -> dict[str, dict[str, Any]]:
             "due_date": "2024-06-01",
             "status": "open",
             "notes": "",
+            "collection_paused": False,
+            "escalated": False,
             "last_updated": now,
         },
     ]
@@ -135,6 +222,8 @@ class InMemoryStore:
         rec.setdefault("currency", "USD")
         rec.setdefault("status", "open")
         rec.setdefault("notes", "")
+        rec.setdefault("collection_paused", False)
+        rec.setdefault("escalated", False)
         rec["account_id"] = account_id
         rec["last_updated"] = _utcnow_iso()
         with self._lock:
@@ -176,6 +265,20 @@ class InMemoryStore:
         rec.setdefault("call_sid", call_id)
         with self._lock:
             self._calls[str(call_id)] = rec
+            return copy.deepcopy(rec)
+
+    def update_call_analytics(self, call_id: str, **changes: Any) -> dict[str, Any]:
+        """Merge ``changes`` onto a persisted CallAnalytics record.
+
+        Used by :mod:`app.postcall` to write post-call intelligence onto the
+        record saved at call end. Raises ``KeyError`` if the call is unknown.
+        """
+        with self._lock:
+            rec = self._calls.get(call_id)
+            if rec is None:
+                raise KeyError(f"unknown call_id: {call_id}")
+            for key, value in changes.items():
+                rec[key] = value
             return copy.deepcopy(rec)
 
     def list_calls(self) -> list[dict[str, Any]]:
@@ -293,6 +396,8 @@ class DynamoDbStore:
         rec.setdefault("currency", "USD")
         rec.setdefault("status", "open")
         rec.setdefault("notes", "")
+        rec.setdefault("collection_paused", False)
+        rec.setdefault("escalated", False)
         rec["last_updated"] = _utcnow_iso()
         self._dues_table().put_item(Item=_to_dynamo(rec))
         return rec
@@ -351,6 +456,40 @@ class DynamoDbStore:
         rec["call_sid"] = str(call_id)
         self._calls_table().put_item(Item=_to_dynamo(rec))
         return rec
+
+    def update_call_analytics(self, call_id: str, **changes: Any) -> dict[str, Any]:
+        """Merge ``changes`` onto a persisted CallAnalytics item.
+
+        Uses a single conditional ``update_item`` (``attribute_exists(call_sid)``)
+        so post-call intelligence is written without clobbering the metrics
+        fields. ``promised_amount`` and other numerics are converted to
+        ``Decimal`` via :func:`_to_dynamo`. Raises ``KeyError`` when unknown.
+        """
+        set_parts: list[str] = []
+        expr_names: dict[str, str] = {"#pk": "call_sid"}
+        expr_values: dict[str, Any] = {}
+        for i, (key, value) in enumerate(changes.items()):
+            name_ph = f"#n{i}"
+            value_ph = f":v{i}"
+            set_parts.append(f"{name_ph} = {value_ph}")
+            expr_names[name_ph] = key
+            expr_values[value_ph] = _to_dynamo(value)
+        update_expr = "SET " + ", ".join(set_parts)
+
+        try:
+            resp = self._calls_table().update_item(
+                Key={"call_sid": call_id},
+                UpdateExpression=update_expr,
+                ConditionExpression="attribute_exists(#pk)",
+                ExpressionAttributeNames=expr_names,
+                ExpressionAttributeValues=expr_values,
+                ReturnValues="ALL_NEW",
+            )
+        except Exception as exc:  # noqa: BLE001 - map the conditional failure
+            if type(exc).__name__ == "ConditionalCheckFailedException":
+                raise KeyError(f"unknown call_id: {call_id}") from exc
+            raise
+        return _from_dynamo(resp.get("Attributes", {}))
 
     def list_calls(self) -> list[dict[str, Any]]:
         resp = self._calls_table().scan()

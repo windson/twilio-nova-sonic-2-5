@@ -13,6 +13,12 @@ from dataclasses import dataclass
 DEFAULT_NOVA_MODEL_ID = "amazon.nova-2-5-sonic"
 DEFAULT_AWS_REGION = "us-east-1"
 DEFAULT_APP_LOG_GROUP = "/ecs/ar-collections-nova-sonic/app"
+# TEXT model used by the off-path post-call intelligence extraction (Bedrock
+# Converse). Non-secret; overridable via EXTRACTION_MODEL_ID.
+DEFAULT_EXTRACTION_MODEL_ID = "amazon.nova-lite-v1:0"
+# Base URL used to build the payment link embedded in the PTP SMS. Non-secret
+# placeholder; overridable via PAYMENT_LINK_BASE_URL.
+DEFAULT_PAYMENT_LINK_BASE_URL = "https://pay.example.com/"
 
 
 @dataclass(frozen=True)
@@ -26,6 +32,8 @@ class Settings:
     nova_model_id: str
     aws_region: str
     app_log_group: str
+    extraction_model_id: str
+    payment_link_base_url: str
     twilio_account_sid: str | None
     twilio_auth_token: str | None
     twilio_from_number: str | None
@@ -41,6 +49,7 @@ class Settings:
         """Non-secret summary safe to log or render in the UI."""
         return {
             "nova_model_id": self.nova_model_id,
+            "extraction_model_id": self.extraction_model_id,
             "aws_region": self.aws_region,
             # Non-secret CloudWatch log group name so the dashboard UI can build
             # a per-call Logs Insights deep link client-side (no IAM needed).
@@ -60,6 +69,12 @@ def get_settings() -> Settings:
             "AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", DEFAULT_AWS_REGION)
         ),
         app_log_group=os.environ.get("APP_LOG_GROUP", DEFAULT_APP_LOG_GROUP),
+        extraction_model_id=os.environ.get(
+            "EXTRACTION_MODEL_ID", DEFAULT_EXTRACTION_MODEL_ID
+        ),
+        payment_link_base_url=os.environ.get(
+            "PAYMENT_LINK_BASE_URL", DEFAULT_PAYMENT_LINK_BASE_URL
+        ),
         twilio_account_sid=os.environ.get("TWILIO_ACCOUNT_SID") or None,
         twilio_auth_token=os.environ.get("TWILIO_AUTH_TOKEN") or None,
         twilio_from_number=os.environ.get("TWILIO_FROM_NUMBER") or None,

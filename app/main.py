@@ -18,9 +18,12 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import asyncio
+
 from app.collections_agent import build_tools, get_system_prompt
 from app.config import get_settings
 from app.metrics import CallMetrics, configure_json_logging
+from app.postcall import extract_and_apply
 from app.sonic_bridge import DEFAULT_KICKOFF_TEXT, SonicSession
 from app.store import get_default_store
 from app.twilio_client import place_outbound_call
@@ -87,6 +90,21 @@ class PlaceCallRequest(BaseModel):
     account_id: str
 
 
+def _log_postcall_task_result(task: "asyncio.Task[Any]") -> None:
+    """Done-callback for the fire-and-forget post-call extraction task.
+
+    :func:`app.postcall.extract_and_apply` never raises, but we still retrieve
+    the task result so a cancellation/unexpected error is logged rather than
+    swallowed as a "task exception was never retrieved" warning.
+    """
+    try:
+        task.result()
+    except asyncio.CancelledError:  # pragma: no cover - teardown race
+        pass
+    except Exception:  # noqa: BLE001 - defensive; extract_and_apply guards itself
+        logger.exception("post-call intelligence task raised")
+
+
 def _call_summary(record: dict[str, Any]) -> dict[str, Any]:
     """Project a CallAnalytics record to a compact list summary."""
     return {
@@ -99,6 +117,10 @@ def _call_summary(record: dict[str, Any]) -> dict[str, Any]:
         "turn_count": record.get("turn_count"),
         "nova_response_count": record.get("nova_response_count"),
         "barge_in_count": record.get("barge_in_count"),
+        # Post-call intelligence (FEAT-002): surfaced in the list so the UI can
+        # show the disposition tag and whether extraction is still pending.
+        "disposition": record.get("disposition"),
+        "intelligence_status": record.get("intelligence_status"),
     }
 
 
@@ -294,10 +316,31 @@ async def media_stream(websocket: WebSocket) -> None:
             await session.close()
         # Persist post-call analytics so the UI/API (FEAT-004) can read history.
         if metrics is not None:
+            saved_record: dict[str, Any] | None = None
             try:
-                store.save_call_analytics(metrics.to_call_analytics())
+                saved_record = store.save_call_analytics(metrics.to_call_analytics())
             except Exception:  # noqa: BLE001 - persistence must not crash teardown
                 logger.exception("stream_sid=<%s> | failed to persist analytics", stream_sid)
+
+            # Launch the post-call intelligence extraction as a FIRE-AND-FORGET
+            # asyncio task AFTER the call ended and analytics were saved. It
+            # runs entirely off the real-time audio/turn path, so it cannot add
+            # to call latency or to the metrics already frozen above. It is
+            # guarded so a missing config / scheduling issue never raises into
+            # the websocket teardown.
+            if saved_record is not None:
+                try:
+                    settings = get_settings()
+                    task = asyncio.create_task(
+                        extract_and_apply(saved_record, store, settings)
+                    )
+                    # Avoid "task was never retrieved" warnings / silent errors.
+                    task.add_done_callback(_log_postcall_task_result)
+                except Exception:  # noqa: BLE001 - scheduling must not crash teardown
+                    logger.exception(
+                        "stream_sid=<%s> | failed to launch post-call intelligence",
+                        stream_sid,
+                    )
 
 
 # Mount the vanilla-JS dashboard assets (web/app.js, web/styles.css) as static
