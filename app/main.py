@@ -372,8 +372,9 @@ async def media_stream(websocket: WebSocket) -> None:
                 _launch_postcall(saved_record, store, get_settings())
 
 
-# Mount the vanilla-JS dashboard assets (web/app.js, web/styles.css) as static
-# files. GET / above serves web/index.html when present (the real dashboard),
-# falling back to the placeholder only if web/ has not been built yet.
+# Mount the compiled React/shadcn dashboard bundle (built from frontend/ into
+# web/ at image-build time: web/index.html + web/assets/*) as static files.
+# GET / above serves web/index.html when present (the real dashboard), falling
+# back to the placeholder only if web/ has not been built yet.
 if _WEB_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(_WEB_DIR)), name="static")

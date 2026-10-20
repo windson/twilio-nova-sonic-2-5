@@ -460,14 +460,19 @@ fast** while the actual computation is delegated to a **real code interpreter**:
 - **Off-path (post-call).** `app/code_interpreter.py` wraps the **AWS Bedrock
   AgentCore Code Interpreter** (`bedrock_agentcore.tools.code_interpreter_client`,
   managed identifier `aws.codeinterpreter.v1`). `resolve_date_phrase(phrase,
-  reference_date, region, client_factory=None)` **writes a Python program on the
-  fly** that reasons from today's date and the phrase, ships it to the sandbox
-  via `invoke("executeCode", {"language": "python", "code": ...})`, and parses
-  the `YYYY-MM-DD` the program prints. The orchestration only supplies the
-  arguments (the phrase + today's date); the executed program does the date
-  math. The client is injectable so tests never hit AWS, and the wrapper is
-  fully defensive (any error / `isError` returns `None`, and the session is
-  always `stop()`-ped in a `finally`).
+  reference_date, region, model_id=None, bedrock_client=None,
+  client_factory=None)` first asks a Bedrock **TEXT model** (the same
+  `EXTRACTION_MODEL_ID`, via the Converse API) to **author a Python program on
+  the fly** - the prompt supplies only the arguments (the phrase + today's
+  date), and the **model** reasons from today's date and writes the date math.
+  That model-generated program is then shipped to the sandbox via
+  `invoke("executeCode", {"language": "python", "code": ...})`, and the wrapper
+  parses the `YYYY-MM-DD` the program prints. The orchestration never
+  hand-writes the date logic; a tiny labelled harness only guarantees a single
+  printed line. Both the model client (`bedrock_client`) and the sandbox client
+  (`client_factory`) are injectable so tests never hit AWS, and the wrapper is
+  fully defensive (any error / `isError` / unparseable output returns `None`,
+  and the session is always `stop()`-ped in a `finally`).
 
 **Why off-path:** a Code Interpreter session costs roughly **~1.9s** (~1.75s to
 start + ~0.13s to execute), which is why the heavy resolution runs only inside

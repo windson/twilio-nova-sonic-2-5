@@ -1,14 +1,48 @@
 """Unit tests for app.code_interpreter.resolve_date_phrase.
 
-An injected fake CodeInterpreter client stands in for the AgentCore sandbox so
-NO AWS call happens. The tests assert the wrapper ships a Python program
-(language='python') that references the phrase + reference date, parses the ISO
-date the sandbox prints, returns None on isError, and always calls stop().
+The resolution program is MODEL-AUTHORED then executed in the sandbox, so these
+tests inject BOTH:
+
+  * a fake bedrock-runtime client whose ``converse`` returns a canned, generated
+    Python program (proving the module asks the MODEL to write the code, and
+    that it passes the phrase + reference date as arguments), and
+  * a fake AgentCore CodeInterpreter client whose ``executeCode`` returns the
+    printed ISO date (proving the module feeds the model's program to the
+    sandbox and parses stdout).
+
+No AWS call happens. The tests assert the wrapper prompts the model with the
+phrase + reference date, feeds the returned program to executeCode with
+language='python', parses the ISO date, returns None on isError / exception /
+unparseable output, always calls stop(), and short-circuits an already-ISO
+phrase before touching either client.
 """
 
 from __future__ import annotations
 
 from app import code_interpreter
+
+
+class FakeBedrock:
+    """Stub bedrock-runtime client returning a canned generated program.
+
+    Records the converse kwargs so tests can assert the phrase + reference date
+    were supplied to the model as arguments.
+    """
+
+    def __init__(self, program: str = "print('2024-06-03')") -> None:
+        self.program = program
+        self.calls: list[dict] = []
+        self.raise_on_converse: Exception | None = None
+
+    def converse(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.raise_on_converse is not None:
+            raise self.raise_on_converse
+        return {
+            "output": {
+                "message": {"content": [{"text": self.program}]},
+            }
+        }
 
 
 class FakeCodeInterpreter:
@@ -49,7 +83,14 @@ class FakeCodeInterpreter:
         self.stopped = True
 
 
-def test_resolve_date_phrase_sends_python_program_and_parses_iso():
+def test_model_authors_program_fed_to_sandbox_and_iso_parsed():
+    """The model WRITES the program; the sandbox EXECUTES it; ISO parsed out."""
+    generated = (
+        "from datetime import date, timedelta\n"
+        "ref = date(2024, 5, 15)\n"
+        "print((ref + timedelta(days=19)).isoformat())\n"
+    )
+    bedrock = FakeBedrock(program=generated)
     captured: list[FakeCodeInterpreter] = []
 
     def factory(region):
@@ -61,29 +102,58 @@ def test_resolve_date_phrase_sends_python_program_and_parses_iso():
         "next month, the first Monday",
         reference_date="2024-05-15",
         region="us-east-1",
+        bedrock_client=bedrock,
         client_factory=factory,
     )
 
     assert result == "2024-06-03"
+
+    # The MODEL was prompted with the phrase + the reference date as arguments.
+    assert bedrock.calls, "the model should have been asked to write the program"
+    user_text = bedrock.calls[0]["messages"][0]["content"][0]["text"]
+    assert "next month, the first Monday" in user_text
+    assert "2024-05-15" in user_text
+
+    # The sandbox ran the MODEL's program via executeCode(language='python').
     assert len(captured) == 1
     client = captured[0]
     assert client.region == "us-east-1"
     assert client.started is True
-    # Always stops the session.
     assert client.stopped is True
-
-    # executeCode was invoked with language='python' and a program referencing
-    # both the phrase and the reference date.
     assert client.invocations, "invoke should have been called"
     method, params = client.invocations[0]
     assert method == "executeCode"
     assert params["language"] == "python"
-    program = params["code"]
-    assert "next month, the first Monday" in program
-    assert "2024-05-15" in program
+    # The executed code is the model-authored snippet (wrapped in the harness),
+    # NOT a hand-written parser shipped from app/.
+    assert "ref + timedelta(days=19)" in params["code"]
+    assert "model-generated date-resolution program" in params["code"]
 
 
-def test_resolve_date_phrase_returns_none_on_is_error_but_still_stops():
+def test_already_iso_phrase_short_circuits_without_model_or_sandbox():
+    bedrock = FakeBedrock()
+    called = {"n": 0}
+
+    def factory(region):
+        called["n"] += 1
+        return FakeCodeInterpreter(region)
+
+    result = code_interpreter.resolve_date_phrase(
+        "2024-07-04",
+        reference_date="2024-05-15",
+        region="us-east-1",
+        bedrock_client=bedrock,
+        client_factory=factory,
+    )
+
+    assert result == "2024-07-04"
+    # Neither the model nor the sandbox was touched.
+    assert bedrock.calls == []
+    assert called["n"] == 0
+
+
+def test_returns_none_on_is_error_but_still_stops():
+    bedrock = FakeBedrock()
     client_box = {}
 
     def factory(region):
@@ -97,6 +167,7 @@ def test_resolve_date_phrase_returns_none_on_is_error_but_still_stops():
         "in two weeks",
         reference_date="2024-05-15",
         region="us-east-1",
+        bedrock_client=bedrock,
         client_factory=factory,
     )
 
@@ -104,7 +175,9 @@ def test_resolve_date_phrase_returns_none_on_is_error_but_still_stops():
     assert client_box["c"].stopped is True
 
 
-def test_resolve_date_phrase_returns_none_when_unresolved_sentinel_printed():
+def test_returns_none_when_unresolved_sentinel_printed():
+    bedrock = FakeBedrock(program="print('UNRESOLVED')")
+
     def factory(region):
         c = FakeCodeInterpreter(region)
         c.stdout = "UNRESOLVED\n"
@@ -114,12 +187,14 @@ def test_resolve_date_phrase_returns_none_when_unresolved_sentinel_printed():
         "whenever I feel like it",
         reference_date="2024-05-15",
         region="us-east-1",
+        bedrock_client=bedrock,
         client_factory=factory,
     )
     assert result is None
 
 
-def test_resolve_date_phrase_returns_none_and_stops_on_invoke_exception():
+def test_returns_none_and_stops_on_invoke_exception():
+    bedrock = FakeBedrock()
     client_box = {}
 
     def factory(region):
@@ -132,6 +207,7 @@ def test_resolve_date_phrase_returns_none_and_stops_on_invoke_exception():
         "next Friday",
         reference_date="2024-05-15",
         region="us-east-1",
+        bedrock_client=bedrock,
         client_factory=factory,
     )
 
@@ -140,7 +216,10 @@ def test_resolve_date_phrase_returns_none_and_stops_on_invoke_exception():
     assert client_box["c"].stopped is True
 
 
-def test_resolve_date_phrase_empty_phrase_short_circuits_without_session():
+def test_returns_none_when_model_call_fails_without_starting_sandbox():
+    """A failed code-generation call returns None and never starts a session."""
+    bedrock = FakeBedrock()
+    bedrock.raise_on_converse = RuntimeError("model boom")
     called = {"n": 0}
 
     def factory(region):
@@ -148,8 +227,77 @@ def test_resolve_date_phrase_empty_phrase_short_circuits_without_session():
         return FakeCodeInterpreter(region)
 
     result = code_interpreter.resolve_date_phrase(
-        "   ", reference_date="2024-05-15", region="us-east-1", client_factory=factory
+        "next Friday",
+        reference_date="2024-05-15",
+        region="us-east-1",
+        bedrock_client=bedrock,
+        client_factory=factory,
     )
     assert result is None
-    # No session is started for an empty phrase.
+    # The model was attempted, but the sandbox was never started.
+    assert bedrock.calls, "the model should have been attempted"
+    assert called["n"] == 0
+
+
+def test_empty_model_program_returns_none_without_sandbox():
+    bedrock = FakeBedrock(program="   ")
+    called = {"n": 0}
+
+    def factory(region):
+        called["n"] += 1
+        return FakeCodeInterpreter(region)
+
+    result = code_interpreter.resolve_date_phrase(
+        "next Friday",
+        reference_date="2024-05-15",
+        region="us-east-1",
+        bedrock_client=bedrock,
+        client_factory=factory,
+    )
+    assert result is None
+    assert called["n"] == 0
+
+
+def test_strips_code_fences_from_model_output():
+    """A model that wraps its code in ```python fences is tolerated."""
+    fenced = "```python\nprint('2024-06-03')\n```"
+    bedrock = FakeBedrock(program=fenced)
+    captured: list[FakeCodeInterpreter] = []
+
+    def factory(region):
+        c = FakeCodeInterpreter(region)
+        captured.append(c)
+        return c
+
+    result = code_interpreter.resolve_date_phrase(
+        "next month, the first Monday",
+        reference_date="2024-05-15",
+        region="us-east-1",
+        bedrock_client=bedrock,
+        client_factory=factory,
+    )
+    assert result == "2024-06-03"
+    code = captured[0].invocations[0][1]["code"]
+    assert "```" not in code
+    assert "print('2024-06-03')" in code
+
+
+def test_empty_phrase_short_circuits_without_model_or_session():
+    bedrock = FakeBedrock()
+    called = {"n": 0}
+
+    def factory(region):
+        called["n"] += 1
+        return FakeCodeInterpreter(region)
+
+    result = code_interpreter.resolve_date_phrase(
+        "   ",
+        reference_date="2024-05-15",
+        region="us-east-1",
+        bedrock_client=bedrock,
+        client_factory=factory,
+    )
+    assert result is None
+    # No model call and no session is started for an empty phrase.
+    assert bedrock.calls == []
     assert called["n"] == 0

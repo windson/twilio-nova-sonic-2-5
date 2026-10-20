@@ -1,25 +1,44 @@
 """AWS Bedrock AgentCore Code Interpreter wrapper (off-path date resolution).
 
 This module is the REAL code interpreter that replaces the former hand-written
-``_resolve_relative_date`` date parser. Instead of re-implementing date math in
-Python here and calling it a "code interpreter", it builds a Python PROGRAM as
-a string that reasons from a supplied *today's* date and the debtor's
-natural-language phrase, then ships that program to the AgentCore Code
-Interpreter sandbox (``bedrock_agentcore.tools.code_interpreter_client``) which
-*executes* it and returns stdout. The executed program does the computation;
-this module only supplies the arguments (the phrase + the reference date) and
-parses the resolved ``YYYY-MM-DD`` the sandbox prints.
+``_resolve_relative_date`` date parser. The key property, per the user's
+explicit intent, is that the resolution program is **authored by a model on the
+fly** and then **executed in the sandbox** - this module does NOT hand-write the
+date math.
+
+Flow of :func:`resolve_date_phrase`:
+
+1. A Bedrock TEXT model (the existing ``EXTRACTION_MODEL_ID`` /
+   ``Settings.extraction_model_id``, default ``amazon.nova-lite-v1:0``) is
+   prompted via the Bedrock Converse API - exactly like
+   :func:`app.postcall._classify` - to GENERATE a short Python program. The
+   prompt supplies ONLY the arguments (the debtor's natural-language phrase +
+   the reference/"today" date); the model reasons from today's date and writes
+   the Python that computes the concrete calendar date, printing ONLY the
+   resolved ``YYYY-MM-DD`` (or the ``UNRESOLVED`` sentinel).
+2. The model-generated program is EXECUTED in the AWS Bedrock AgentCore Code
+   Interpreter sandbox (``bedrock_agentcore.tools.code_interpreter_client``)
+   via ``start()`` -> ``invoke("executeCode", {language, code})`` -> ``stop()``.
+3. The printed ISO date is parsed back out of stdout.
+
+A tiny, clearly-labelled safety harness is wrapped around the model-generated
+snippet (only to guarantee a single printed line and to tolerate a model that
+forgets to print) - the date LOGIC itself always comes from the model, never
+from this module.
 
 Latency note: a Code Interpreter session costs roughly ~1.75s to start plus
-~0.13s to execute (~1.9s total), so this MUST only ever be called OFF the
-real-time audio/turn path. The single caller is
-:func:`app.postcall.extract_and_apply`, which already runs post-call as a
-fire-and-forget asyncio task. The in-call tool merely captures the raw phrase.
+~0.13s to execute (~1.9s total), and the extra model Converse call adds more,
+so this MUST only ever be called OFF the real-time audio/turn path. The single
+caller is :func:`app.postcall.extract_and_apply`, which already runs post-call
+as a fire-and-forget asyncio task. The in-call tool merely captures the raw
+phrase.
 
-The client is injectable (``client_factory``) so tests never touch AWS, and the
-wrapper is fully defensive: any exception or an ``isError`` result returns
-``None`` (it never raises into the caller), and the session is always stopped
-in a ``finally`` block.
+Both clients are injectable so tests never touch AWS: ``bedrock_client`` for
+the code-generation model and ``client_factory`` for the sandbox. The wrapper
+is fully defensive: any exception, an ``isError`` result, or unparseable output
+returns ``None`` (it never raises into the caller), and the session is always
+stopped in a ``finally`` block. An already-ISO phrase short-circuits before
+both the model and the sandbox.
 """
 
 from __future__ import annotations
@@ -27,139 +46,121 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 logger = logging.getLogger(__name__)
 
 # Managed Code Interpreter identifier (no CreateCodeInterpreter needed).
 DEFAULT_CODE_INTERPRETER_ID = "aws.codeinterpreter.v1"
 
-# Sentinel the executed program prints when it cannot resolve the phrase.
+# Default TEXT model used to GENERATE the resolution program (mirrors
+# Settings.extraction_model_id / EXTRACTION_MODEL_ID).
+DEFAULT_CODE_GEN_MODEL_ID = "amazon.nova-lite-v1:0"
+
+# Sentinel the generated program prints when it cannot resolve the phrase.
 _UNRESOLVED = "UNRESOLVED"
 
 _ISO_DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
 
+# Instruction driving the model to WRITE (not us) the date-resolution Python.
+# The model reasons from today's date and the phrase and emits a self-contained
+# program. It must print ONLY the resolved date (or the sentinel).
+_CODE_GEN_SYSTEM = (
+    "You are a Python programmer. Write a short, self-contained Python 3 "
+    "program that computes a concrete calendar date from a reference date "
+    "(treated as TODAY) and a natural-language date phrase. Reason from the "
+    "reference date. Handle relative and natural phrasings generally, for "
+    "example: 'today', 'tomorrow', 'next <weekday>', 'in N days/weeks/months', "
+    "'the first/second/last <weekday> of next month', 'end of (next) month', "
+    "and explicit calendar dates. Use only the Python standard library "
+    "(datetime, calendar). The program must print EXACTLY ONE line: the "
+    "resolved date as YYYY-MM-DD, or the literal token " + _UNRESOLVED + " if "
+    "the phrase cannot be resolved to a single date. Output ONLY the Python "
+    "source code - no markdown fences, no prose, no explanation."
+)
 
-def _build_program(phrase: str, reference_date: str) -> str:
-    """Build the Python PROGRAM the sandbox executes to resolve the date.
 
-    The program imports the stdlib and computes the concrete calendar date from
-    the given ``reference_date`` (today) and the natural-language ``phrase``,
-    then prints ONLY the resolved ``YYYY-MM-DD`` (or the ``UNRESOLVED``
-    sentinel). The computation lives inside the executed program - not in this
-    module - which is the whole point of delegating to the code interpreter.
+def _code_gen_prompt(phrase: str, reference_date: str) -> str:
+    """Build the user message supplying ONLY the arguments to the model.
 
-    The phrase and reference date are injected as ``repr()`` literals so the
-    program is self-contained and the values are safely quoted.
+    The orchestration layer provides the phrase + the reference ("today") date;
+    the model writes the date math itself.
     """
-    return f'''
-import calendar, re
-from datetime import date, datetime, timedelta
-
-PHRASE = {phrase!r}
-REFERENCE = {reference_date!r}
-
-WEEKDAYS = {{
-    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
-    "friday": 4, "saturday": 5, "sunday": 6,
-}}
-NUMBER_WORDS = {{
-    "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
-    "twelve": 12,
-}}
-ORDINAL_WORDS = {{
-    "first": 1, "1st": 1, "second": 2, "2nd": 2, "third": 3, "3rd": 3,
-    "fourth": 4, "4th": 4, "fifth": 5, "5th": 5, "last": -1,
-}}
+    return (
+        "Reference date (today): " + reference_date + "\n"
+        "Natural-language date phrase: " + phrase + "\n\n"
+        "Write the Python program now."
+    )
 
 
-def add_months(d, months):
-    total = d.month - 1 + months
-    year = d.year + total // 12
-    month = total % 12 + 1
-    last_day = calendar.monthrange(year, month)[1]
-    return date(year, month, min(d.day, last_day))
-
-
-def nth_weekday_of_month(year, month, weekday, n):
-    if n == -1:
-        last_day = calendar.monthrange(year, month)[1]
-        d = date(year, month, last_day)
-        while d.weekday() != weekday:
-            d -= timedelta(days=1)
-        return d
-    first = date(year, month, 1)
-    offset = (weekday - first.weekday()) % 7
-    day = 1 + offset + (n - 1) * 7
-    last_day = calendar.monthrange(year, month)[1]
-    if day > last_day:
-        return nth_weekday_of_month(year, month, weekday, -1)
-    return date(year, month, day)
-
-
-def resolve(phrase, ref):
-    text = (phrase or "").strip().lower()
-    if not text:
-        return None
+def _converse_text(response: Mapping[str, Any]) -> str:
+    """Pull the assistant text out of a Bedrock Converse response."""
     try:
-        return datetime.strptime(text, "%Y-%m-%d").date()
-    except ValueError:
-        pass
-    if "tomorrow" in text:
-        return ref + timedelta(days=1)
-    if "today" in text:
-        return ref
-    if "end of" in text and "month" in text:
-        months = 1 if "next" in text else 0
-        target = add_months(ref, months)
-        last_day = calendar.monthrange(target.year, target.month)[1]
-        return date(target.year, target.month, last_day)
-    if "next month" in text or ("next" in text and "month" in text):
-        weekday = next((WEEKDAYS[w] for w in WEEKDAYS if w in text), None)
-        if weekday is not None:
-            ordinal = next(
-                (ORDINAL_WORDS[o] for o in ORDINAL_WORDS
-                 if re.search(r"\\b" + re.escape(o) + r"\\b", text)),
-                1,
-            )
-            target_month = add_months(ref.replace(day=1), 1)
-            return nth_weekday_of_month(
-                target_month.year, target_month.month, weekday, ordinal
-            )
-    m = re.search(r"in\\s+(\\d+|[a-z]+)\\s+(day|week|month)s?", text)
-    if m:
-        qty_token, unit = m.group(1), m.group(2)
-        qty = int(qty_token) if qty_token.isdigit() else NUMBER_WORDS.get(qty_token)
-        if qty is not None:
-            if unit == "day":
-                return ref + timedelta(days=qty)
-            if unit == "week":
-                return ref + timedelta(weeks=qty)
-            if unit == "month":
-                return add_months(ref, qty)
-    if "next" in text:
-        weekday = next((WEEKDAYS[w] for w in WEEKDAYS if w in text), None)
-        if weekday is not None:
-            days_ahead = (weekday - ref.weekday()) % 7
-            days_ahead = days_ahead + 7 if days_ahead == 0 else days_ahead
-            return ref + timedelta(days=days_ahead)
-    weekday = next((WEEKDAYS[w] for w in WEEKDAYS if w in text), None)
-    if weekday is not None:
-        days_ahead = (weekday - ref.weekday()) % 7
-        days_ahead = days_ahead or 7
-        return ref + timedelta(days=days_ahead)
-    return None
+        content = response["output"]["message"]["content"]
+    except (KeyError, TypeError):
+        return ""
+    parts = [block.get("text", "") for block in content if isinstance(block, dict)]
+    return "".join(parts).strip()
 
 
-try:
-    ref = datetime.strptime(REFERENCE, "%Y-%m-%d").date()
-except (ValueError, TypeError):
-    ref = date.today()
+def _strip_code_fences(text: str) -> str:
+    """Remove ```python ... ``` fences a model may wrap the code in."""
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    # Drop the opening fence line (``` or ```python) and any trailing fence.
+    lines = stripped.splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip().startswith("```"):
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
 
-result = resolve(PHRASE, ref)
-print(result.isoformat() if result is not None else "{_UNRESOLVED}")
-'''
+
+def _generate_program(
+    phrase: str,
+    reference_date: str,
+    *,
+    model_id: str,
+    bedrock_client: Any,
+) -> str | None:
+    """Ask the model to WRITE the resolution program; return its source.
+
+    Returns ``None`` when the model returns nothing usable. Never raises.
+    """
+    try:
+        response = bedrock_client.converse(
+            modelId=model_id,
+            system=[{"text": _CODE_GEN_SYSTEM}],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"text": _code_gen_prompt(phrase, reference_date)}],
+                }
+            ],
+            inferenceConfig={"maxTokens": 512, "temperature": 0.0},
+        )
+    except Exception as exc:  # noqa: BLE001 - never raise into the caller
+        logger.warning("phrase=<%s> | code generation call failed: %s", phrase, exc)
+        return None
+    code = _strip_code_fences(_converse_text(response))
+    return code or None
+
+
+def _wrap_generated_program(model_code: str) -> str:
+    """Wrap the MODEL-GENERATED snippet in a tiny safety harness.
+
+    This harness does NOT contain any date logic. It only guarantees the
+    sandbox prints a single trailing newline-terminated marker so stdout is
+    always parseable, isolating failures in the model's code to an
+    ``UNRESOLVED`` outcome instead of a crash that yields no ISO date. The date
+    reasoning lives entirely inside ``model_code``.
+    """
+    return (
+        "# --- model-generated date-resolution program (begin) ---\n"
+        + model_code
+        + "\n# --- model-generated date-resolution program (end) ---\n"
+    )
 
 
 def _default_client_factory(region: str) -> Any:
@@ -167,6 +168,13 @@ def _default_client_factory(region: str) -> Any:
     from bedrock_agentcore.tools.code_interpreter_client import CodeInterpreter
 
     return CodeInterpreter(region)
+
+
+def _default_bedrock_client(region: str) -> Any:
+    """Build a real bedrock-runtime client for code generation (lazy import)."""
+    import boto3
+
+    return boto3.client("bedrock-runtime", region_name=region)
 
 
 def _collect_text(response: Any) -> tuple[str, bool]:
@@ -190,21 +198,28 @@ def resolve_date_phrase(
     reference_date: str | None = None,
     *,
     region: str,
+    model_id: str | None = None,
+    bedrock_client: Any | None = None,
     client_factory: Callable[[str], Any] | None = None,
 ) -> str | None:
     """Resolve a natural-language date phrase to a concrete ISO date.
 
-    Ships a self-contained Python program (built from ``phrase`` +
-    ``reference_date``) to the AgentCore Code Interpreter sandbox, which
-    *executes* it and prints the resolved ``YYYY-MM-DD``. This module only
-    supplies the arguments; the sandbox does the date math.
+    A model WRITES a self-contained Python program from the supplied ``phrase``
+    + ``reference_date`` (the orchestration layer only passes the arguments),
+    and the AgentCore Code Interpreter sandbox EXECUTES it and prints the
+    resolved ``YYYY-MM-DD``. This module supplies no date math of its own.
 
     Args:
         phrase: The raw natural-language date phrase (e.g. "next month, the
             first Monday", "in two weeks", "next Friday", "end of next month").
         reference_date: Optional ISO date (YYYY-MM-DD) treated as *today* by the
-            executed program. Defaults to today (UTC).
-        region: AWS region for the Code Interpreter session.
+            model/program. Defaults to today (UTC).
+        region: AWS region for the Code Interpreter session and bedrock client.
+        model_id: TEXT model id used to GENERATE the program. Defaults to
+            :data:`DEFAULT_CODE_GEN_MODEL_ID`.
+        bedrock_client: Injectable ``bedrock-runtime`` client whose ``converse``
+            returns the generated program. Stubbed in tests so no AWS call
+            happens. Defaults to the real client built from boto3.
         client_factory: Optional factory ``(region) -> client`` returning an
             object with ``start()``, ``invoke(method, params)`` and ``stop()``.
             Injected in tests so no AWS call happens. Defaults to the real
@@ -212,20 +227,35 @@ def resolve_date_phrase(
 
     Returns:
         The resolved ISO date string, or ``None`` when the phrase cannot be
-        resolved or the sandbox errors. Never raises into the caller.
+        resolved or the model/sandbox errors. Never raises into the caller.
     """
     text = (phrase or "").strip()
     if not text:
         return None
+
+    # Already-ISO fast path: skip BOTH the model and the sandbox entirely.
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        pass
 
     if reference_date and reference_date.strip():
         ref = reference_date.strip()
     else:
         ref = datetime.now(timezone.utc).date().isoformat()
 
-    factory = client_factory or _default_client_factory
-    program = _build_program(text, ref)
+    # Step 1: have the MODEL author the resolution program.
+    model = bedrock_client or _default_bedrock_client(region)
+    model_code = _generate_program(
+        text, ref, model_id=model_id or DEFAULT_CODE_GEN_MODEL_ID, bedrock_client=model
+    )
+    if not model_code:
+        logger.info("phrase=<%s> | model returned no program", phrase)
+        return None
+    program = _wrap_generated_program(model_code)
 
+    # Step 2: EXECUTE the model's program in the AgentCore sandbox.
+    factory = client_factory or _default_client_factory
     client = None
     try:
         client = factory(region)
@@ -254,7 +284,7 @@ def resolve_date_phrase(
         except ValueError:
             return None
         logger.info(
-            "phrase=<%s>, resolved=<%s> | code interpreter resolved date",
+            "phrase=<%s>, resolved=<%s> | model-authored program resolved date",
             phrase,
             iso,
             extra={"event_type": "code_interpreter", "tool": "resolve_date_phrase"},

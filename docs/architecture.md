@@ -90,9 +90,11 @@ flowchart TB
    it adds no latency to the turn.
 6b. **AgentCore Code Interpreter (off-path).** `app/code_interpreter.py` wraps
    the AWS Bedrock AgentCore Code Interpreter (`aws.codeinterpreter.v1`). After
-   the call it writes a Python program on the fly that reasons from today's date
-   + the captured phrase and `executeCode`-runs it in the sandbox to resolve a
-   concrete `YYYY-MM-DD`. The ~1.9s session is why this runs only post-call,
+   the call, a Bedrock TEXT model (the same `EXTRACTION_MODEL_ID`) is prompted
+   with only the arguments (today's date + the captured phrase) to **author** a
+   Python program on the fly; that model-written program is then `executeCode`-run
+   in the sandbox to resolve a concrete `YYYY-MM-DD`. The ~1.9s session is why
+   this runs only post-call,
    never on the real-time turn. The task role carries a dedicated
    least-privilege `agentcore-code-interpreter` grant
    (`bedrock-agentcore:StartCodeInterpreterSession` /

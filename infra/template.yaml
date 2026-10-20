@@ -224,9 +224,13 @@ Resources:
                   - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${NovaModelId}"
         # Separate, narrowly-scoped grant for the OFF-PATH post-call intelligence
         # (app/postcall.py), which calls the Bedrock Converse API on a TEXT model
-        # (default amazon.nova-lite-v1:0, EXTRACTION_MODEL_ID). Kept distinct from
-        # the Nova Sonic bidi statement above so the extraction grant stays scoped
-        # to just the text model ARN(s) and the two policies evolve independently.
+        # (default amazon.nova-lite-v1:0, EXTRACTION_MODEL_ID). The SAME model +
+        # grant is reused by app/code_interpreter.py to GENERATE the on-the-fly
+        # date-resolution Python program (also via Converse -> bedrock:InvokeModel
+        # on the same ExtractionModelId ARN), so NO additional IAM is required for
+        # the model that authors the code. Kept distinct from the Nova Sonic bidi
+        # statement above so the extraction grant stays scoped to just the text
+        # model ARN(s) and the two policies evolve independently.
         - PolicyName: bedrock-text-extraction
           PolicyDocument:
             Version: "2012-10-17"
@@ -264,7 +268,11 @@ Resources:
                   - bedrock-agentcore:StopCodeInterpreterSession
                 # Scoped to the code-interpreter resource namespace in this
                 # account/region, which covers the managed aws.codeinterpreter.v1
-                # default the app uses (arn:...:code-interpreter/*).
+                # default the app uses (arn:...:code-interpreter/*). VERIFIED at
+                # runtime: a live end-to-end resolution ran from the deployed
+                # task role (/api/config reports code_interpreter=agentcore and a
+                # real phrase resolved in ~1.9s), confirming this account-scoped
+                # code-interpreter/* ARN authorizes the managed default.
                 Resource:
                   - !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:code-interpreter/*"
         # Note: the PTP payment-link SMS (app/twilio_client.send_sms) needs NO new

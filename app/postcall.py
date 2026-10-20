@@ -16,10 +16,12 @@ Pipeline (:func:`extract_and_apply`):
    TEXT model (default ``amazon.nova-lite-v1:0``). The bedrock client is
    injectable so tests never hit the network, and the model JSON is parsed
    defensively.
-2. Resolve any captured relative date phrase to a concrete ISO date via the
-   AWS Bedrock AgentCore Code Interpreter (:func:`app.code_interpreter.resolve_date_phrase`),
-   which writes-and-executes Python in a sandbox. This ~1.9s call is safe here
-   because this whole pipeline runs OFF the real-time audio path.
+2. Resolve any captured relative date phrase to a concrete ISO date via
+   :func:`app.code_interpreter.resolve_date_phrase`, where a model WRITES a
+   Python program on the fly (reasoning from today's date) and the AWS Bedrock
+   AgentCore Code Interpreter EXECUTES it in a sandbox. The same injected
+   ``bedrock_client`` is reused to generate that program. This ~1.9s+ call is
+   safe here because this whole pipeline runs OFF the real-time audio path.
 3. Apply downstream triggers (PTP -> pause collection + payment-link SMS;
    Dispute -> escalate to a human specialist).
 4. Persist the intelligence onto the stored call record with
@@ -165,13 +167,16 @@ def _resolve_date_phrase(
     reference_date,
     settings: Settings,
     code_interpreter_factory: Any | None,
+    bedrock_client: Any | None,
 ) -> str | None:
     """Resolve a date ``phrase`` to a concrete ISO date.
 
-    Fast path: an already-ISO date is parsed with ``strptime`` and the code
-    interpreter is skipped entirely. Otherwise the natural-language phrase is
-    handed to the AWS Bedrock AgentCore Code Interpreter (off the real-time
-    path) which writes-and-executes Python to compute the date.
+    Fast path: an already-ISO date is parsed with ``strptime`` and both the
+    code-generation model and the code interpreter are skipped entirely.
+    Otherwise the natural-language phrase is handed to
+    :func:`app.code_interpreter.resolve_date_phrase` (off the real-time path),
+    where a model WRITES a Python program on the fly and the AWS Bedrock
+    AgentCore Code Interpreter EXECUTES it to compute the date.
     """
     text = (phrase or "").strip()
     if not text:
@@ -184,6 +189,8 @@ def _resolve_date_phrase(
         text,
         reference_date=reference_date.isoformat(),
         region=settings.aws_region,
+        model_id=settings.extraction_model_id,
+        bedrock_client=bedrock_client,
         client_factory=code_interpreter_factory,
     )
 
@@ -193,6 +200,7 @@ def _build_structured_data(
     reference_date,
     settings: Settings,
     code_interpreter_factory: Any | None,
+    bedrock_client: Any | None,
 ) -> dict[str, Any]:
     """Map the parsed model JSON to the stored structured_data shape.
 
@@ -214,7 +222,7 @@ def _build_structured_data(
     resolved_date = None
     if isinstance(agreed, str) and agreed.strip():
         resolved_date = _resolve_date_phrase(
-            agreed, reference_date, settings, code_interpreter_factory
+            agreed, reference_date, settings, code_interpreter_factory, bedrock_client
         )
     data["payment_specifics"]["agreed_date"] = resolved_date
 
@@ -417,7 +425,7 @@ async def extract_and_apply(
         disposition = _normalize_disposition(parsed.get("disposition"))
         reference_date = datetime.now(timezone.utc).date()
         structured_data = _build_structured_data(
-            parsed, reference_date, settings, code_interpreter_factory
+            parsed, reference_date, settings, code_interpreter_factory, bedrock_client
         )
         next_best_action = parsed.get("next_best_action")
 
@@ -433,7 +441,11 @@ async def extract_and_apply(
             phrase = (due or {}).get("promised_date_phrase")
             if isinstance(phrase, str) and phrase.strip():
                 resolved_promise = _resolve_date_phrase(
-                    phrase, reference_date, settings, code_interpreter_factory
+                    phrase,
+                    reference_date,
+                    settings,
+                    code_interpreter_factory,
+                    bedrock_client,
                 )
                 if resolved_promise:
                     try:
