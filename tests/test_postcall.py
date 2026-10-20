@@ -30,6 +30,7 @@ def _settings(**overrides) -> Settings:
         aws_region="us-east-1",
         app_log_group="/ecs/ar-collections-nova-sonic/app",
         extraction_model_id="amazon.nova-lite-v1:0",
+        code_interpreter_id="aws.codeinterpreter.v1",
         payment_link_base_url="https://pay.example.com/",
         twilio_trial_mode=True,
         twilio_account_sid="AC_test_sid",
@@ -58,6 +59,49 @@ class FakeBedrock:
                 }
             }
         }
+
+
+class FakeCodeInterpreter:
+    """Stub AgentCore CodeInterpreter returning a canned ISO date.
+
+    Used to resolve natural-language ``agreed_date`` phrases without touching
+    AWS. Records that it was started/invoked/stopped.
+    """
+
+    def __init__(self, region, canned_iso="2024-06-03"):
+        self.region = region
+        self.canned_iso = canned_iso
+        self.started = False
+        self.stopped = False
+        self.invoked = False
+
+    def start(self):
+        self.started = True
+
+    def invoke(self, method, params=None):
+        self.invoked = True
+        return {
+            "stream": [
+                {
+                    "result": {
+                        "isError": False,
+                        "content": [{"type": "text", "text": self.canned_iso + "\n"}],
+                    }
+                }
+            ]
+        }
+
+    def stop(self):
+        self.stopped = True
+
+
+def _ci_factory(canned_iso="2024-06-03"):
+    """Build an injectable code-interpreter factory returning a canned date."""
+
+    def factory(region):
+        return FakeCodeInterpreter(region, canned_iso=canned_iso)
+
+    return factory
 
 
 def _call_record(**overrides):
@@ -128,16 +172,17 @@ async def test_extract_and_apply_ptp_sets_fields_pauses_and_sends_sms(store):
         _settings(),
         bedrock_client=bedrock,
         twilio_client_factory=twilio_factory,
+        code_interpreter_factory=_ci_factory("2024-06-03"),
     )
 
     assert changes["disposition"] == "promise_to_pay"
     assert changes["intelligence_status"] == "ready"
     assert changes["collection_paused"] is True
     assert changes["ptp_sms_status"] == "sent"
-    # Relative date resolved to a concrete ISO date (first Monday of June 2024
-    # would depend on "today"; just assert it is a resolved ISO date string).
+    # The natural phrase ("next month 1st Monday") was resolved to a concrete
+    # ISO date by the (stubbed) AgentCore Code Interpreter, NOT a local parser.
     agreed = changes["structured_data"]["payment_specifics"]["agreed_date"]
-    assert agreed is not None and agreed.count("-") == 2
+    assert agreed == "2024-06-03"
     assert changes["structured_data"]["payment_specifics"]["promised_amount"] == 428.57
     assert changes["next_best_action"]
 
@@ -190,6 +235,7 @@ async def test_extract_and_apply_ptp_sms_blocked_trial_is_flagged_not_faked(stor
         _settings(),
         bedrock_client=bedrock,
         twilio_client_factory=twilio_factory,
+        code_interpreter_factory=_ci_factory("2024-05-16"),
     )
 
     # Blocked, NOT faked as success.
@@ -221,6 +267,7 @@ async def test_extract_and_apply_dispute_escalates(store):
         _settings(),
         bedrock_client=bedrock,
         twilio_client_factory=lambda *a: None,
+        code_interpreter_factory=_ci_factory(),
     )
 
     assert changes["disposition"] == "dispute_raised"
@@ -240,6 +287,7 @@ async def test_extract_and_apply_failed_extraction_sets_failed_status(store):
         _settings(),
         bedrock_client=BadBedrock(),
         twilio_client_factory=lambda *a: None,
+        code_interpreter_factory=_ci_factory(),
     )
 
     assert changes["intelligence_status"] == "failed"
@@ -339,6 +387,7 @@ async def test_no_added_latency_postcall_does_not_touch_call_metrics(store):
     await extract_and_apply(
         record, store, _settings(), bedrock_client=bedrock,
         twilio_client_factory=twilio_factory,
+        code_interpreter_factory=_ci_factory("2024-06-03"),
     )
 
     # The call-latency metrics are unchanged by the post-call work.
@@ -384,16 +433,53 @@ class BlockingBedrock:
         }
 
 
+class BlockingCodeInterpreter:
+    """Code-interpreter stub whose ``called`` flips only when invoked.
+
+    Proves the ~1.9s AgentCore Code Interpreter never runs on the real-time
+    audio path: a shared ``.called`` flag is set True only when the off-path
+    post-call task actually resolves a date phrase. ``start()`` sleeps to
+    simulate the costly session-start stall a wrong wiring would add to the
+    turn loop.
+    """
+
+    #: Shared across instances built by the factory so the test can observe it.
+    called = False
+
+    def __init__(self, region):
+        self.region = region
+
+    def start(self):
+        BlockingCodeInterpreter.called = True
+        time.sleep(0.5)
+
+    def invoke(self, method, params=None):
+        return {
+            "stream": [
+                {
+                    "result": {
+                        "isError": False,
+                        "content": [{"type": "text", "text": "2024-06-03\n"}],
+                    }
+                }
+            ]
+        }
+
+    def stop(self):
+        pass
+
+
 async def test_no_latency_audio_path_never_invokes_extraction(store):
     """REGRESSION GUARD (no-latency): driving the full real-time audio/turn
     path (on_session_start -> record_event(...) -> on_session_end) must NEVER
-    call the Bedrock extraction stub. The audio path has no reference to the
-    extractor; the extractor only runs post-call off-path. This fails if
-    someone wires ``extract_and_apply`` / ``converse`` into ``record_event`` or
-    the turn loop, because ``blocking.called`` would flip to True before/at
-    ``on_session_end``.
+    call the Bedrock extraction stub NOR the AgentCore Code Interpreter. The
+    audio path has no reference to either; they only run post-call off-path.
+    This fails if someone wires ``extract_and_apply`` / ``converse`` / the code
+    interpreter into ``record_event`` or the turn loop, because ``.called``
+    would flip to True before/at ``on_session_end``.
     """
     blocking = BlockingBedrock()
+    BlockingCodeInterpreter.called = False
     clock = FakeClock()
     m = CallMetrics(call_sid="CA_np", account_id="ACC-1001", clock=clock)
 
@@ -415,15 +501,21 @@ async def test_no_latency_audio_path_never_invokes_extraction(store):
     clock.set(4.0)
     m.on_session_end()
 
-    # The extraction stub was never touched by the audio/turn path.
+    # Neither heavy stub was touched by the audio/turn path.
     assert blocking.called is False
+    assert BlockingCodeInterpreter.called is False
 
-    # Only NOW (post-call, off-path) does the extractor run and call the stub.
+    # Only NOW (post-call, off-path) do the extractor AND the code interpreter
+    # run. The in-call capture tool recorded a raw phrase on the due record, so
+    # the off-path task resolves it via the (blocking) code interpreter,
+    # flipping its flag only here.
+    store.update_due("ACC-1001", promised_date_phrase="next month, the first Monday")
     record = m.to_call_analytics()
     store.save_call_analytics(record)
     await extract_and_apply(
         record, store, _settings(), bedrock_client=blocking,
         twilio_client_factory=lambda *a: None,
+        code_interpreter_factory=lambda region: BlockingCodeInterpreter(region),
     )
     assert blocking.called is True
 
@@ -459,6 +551,7 @@ async def test_ptp_sms_trial_mode_pins_to_verified_number(store):
     changes = await extract_and_apply(
         _call_record(), store, _settings(twilio_trial_mode=True),
         bedrock_client=bedrock, twilio_client_factory=twilio_factory,
+        code_interpreter_factory=_ci_factory("2024-05-16"),
     )
 
     # Trial: destination is the verified number, NOT the debtor's phone.
@@ -499,6 +592,7 @@ async def test_ptp_sms_production_mode_prefers_debtor_phone(store):
     changes = await extract_and_apply(
         _call_record(), store, _settings(twilio_trial_mode=False),
         bedrock_client=bedrock, twilio_client_factory=twilio_factory,
+        code_interpreter_factory=_ci_factory("2024-05-16"),
     )
 
     assert sent_to == ["+15559990000"]
@@ -529,6 +623,7 @@ async def test_ptp_sms_production_failure_is_failed_not_blocked_trial(store):
     changes = await extract_and_apply(
         _call_record(), store, _settings(twilio_trial_mode=False),
         bedrock_client=bedrock, twilio_client_factory=twilio_factory,
+        code_interpreter_factory=_ci_factory("2024-05-16"),
     )
 
     assert changes["ptp_sms_status"] == "failed"

@@ -28,7 +28,8 @@ flowchart TB
         end
 
         Sonic["(5) Strands BidiAgent &lt;-&gt;<br/>Bedrock Nova Sonic 2.5<br/>voice tiffany, bi-di stream<br/>mulaw&lt;-&gt;PCM transcode"]
-        Tools["(6) In-call Strands tools<br/>update_due_record +<br/>compute_future_date<br/>(fast local date math)"]
+        Tools["(6) In-call Strands tools<br/>update_due_record +<br/>capture_payment_date_phrase<br/>(captures phrase, no date math)"]
+        CI["(6b) AgentCore Code Interpreter<br/>aws.codeinterpreter.v1<br/>writes+runs Python off-path<br/>resolves date phrase (~1.9s)"]
 
         subgraph DDB["(7) DynamoDB"]
             Dues[(DuesTable)]
@@ -54,6 +55,7 @@ flowchart TB
     ECS --> Calls
 
     Calls -. after call ends .-> Extract
+    Extract -.resolve date phrase.-> CI
     Extract --> Triggers
     Triggers --> Dues
     Triggers -.->|SMS| T
@@ -63,7 +65,7 @@ flowchart TB
     ECS -. reads .- SM
 
     classDef async fill:#fde,stroke:#c39,stroke-width:2px;
-    class Extract,Triggers async;
+    class Extract,Triggers,CI async;
 ```
 
 ## Phases
@@ -83,9 +85,15 @@ flowchart TB
    Nova Sonic 2.5 (voice `tiffany`) does STT + reasoning + TTS; the app
    transcodes mulaw 8k <-> PCM on the real-time audio path.
 6. **In-call Strands tools.** `update_due_record` writes the outcome;
-   `compute_future_date` is the code-interpreter date math (deterministic,
-   local stdlib) that resolves phrases like "next month 1st Monday" on the turn
-   without adding latency.
+   `capture_payment_date_phrase` only RECORDS the debtor's raw date phrase
+   (e.g. "next month 1st Monday") on the due record and returns immediately, so
+   it adds no latency to the turn.
+6b. **AgentCore Code Interpreter (off-path).** `app/code_interpreter.py` wraps
+   the AWS Bedrock AgentCore Code Interpreter (`aws.codeinterpreter.v1`). After
+   the call it writes a Python program on the fly that reasons from today's date
+   + the captured phrase and `executeCode`-runs it in the sandbox to resolve a
+   concrete `YYYY-MM-DD`. The ~1.9s session is why this runs only post-call,
+   never on the real-time turn.
 7. **DynamoDB persistence.** `DuesTable` holds due/account records and
    `CallsTable` holds the CallAnalytics record (numeric fields stored as
    `Decimal` via float->Decimal conversion).

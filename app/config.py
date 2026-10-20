@@ -19,6 +19,10 @@ DEFAULT_EXTRACTION_MODEL_ID = "amazon.nova-lite-v1:0"
 # Base URL used to build the payment link embedded in the PTP SMS. Non-secret
 # placeholder; overridable via PAYMENT_LINK_BASE_URL.
 DEFAULT_PAYMENT_LINK_BASE_URL = "https://pay.example.com/"
+# Managed AWS Bedrock AgentCore Code Interpreter identifier used (off the
+# real-time path) to resolve natural-language payment dates. Non-secret;
+# overridable via CODE_INTERPRETER_ID. The session runs in ``aws_region``.
+DEFAULT_CODE_INTERPRETER_ID = "aws.codeinterpreter.v1"
 # Twilio TRIAL accounts may only message/dial the single verified number. When
 # trial mode is on (the default, matching the account this POC runs against),
 # the PTP payment-link SMS is pinned to TWILIO_VERIFIED_CALLER_ID regardless of
@@ -48,6 +52,7 @@ class Settings:
     aws_region: str
     app_log_group: str
     extraction_model_id: str
+    code_interpreter_id: str
     payment_link_base_url: str
     twilio_trial_mode: bool
     twilio_account_sid: str | None
@@ -66,6 +71,10 @@ class Settings:
         return {
             "nova_model_id": self.nova_model_id,
             "extraction_model_id": self.extraction_model_id,
+            # Non-secret marker that natural-language dates are resolved by the
+            # AgentCore Code Interpreter (off the real-time path).
+            "code_interpreter": "agentcore",
+            "code_interpreter_id": self.code_interpreter_id,
             "aws_region": self.aws_region,
             # Non-secret CloudWatch log group name so the dashboard UI can build
             # a per-call Logs Insights deep link client-side (no IAM needed).
@@ -88,6 +97,9 @@ def get_settings() -> Settings:
         app_log_group=os.environ.get("APP_LOG_GROUP", DEFAULT_APP_LOG_GROUP),
         extraction_model_id=os.environ.get(
             "EXTRACTION_MODEL_ID", DEFAULT_EXTRACTION_MODEL_ID
+        ),
+        code_interpreter_id=os.environ.get(
+            "CODE_INTERPRETER_ID", DEFAULT_CODE_INTERPRETER_ID
         ),
         payment_link_base_url=os.environ.get(
             "PAYMENT_LINK_BASE_URL", DEFAULT_PAYMENT_LINK_BASE_URL

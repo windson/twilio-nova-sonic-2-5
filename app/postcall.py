@@ -16,8 +16,10 @@ Pipeline (:func:`extract_and_apply`):
    TEXT model (default ``amazon.nova-lite-v1:0``). The bedrock client is
    injectable so tests never hit the network, and the model JSON is parsed
    defensively.
-2. Resolve any captured relative date phrase to a concrete ISO date using the
-   SAME deterministic date-math as the in-call ``compute_future_date`` tool.
+2. Resolve any captured relative date phrase to a concrete ISO date via the
+   AWS Bedrock AgentCore Code Interpreter (:func:`app.code_interpreter.resolve_date_phrase`),
+   which writes-and-executes Python in a sandbox. This ~1.9s call is safe here
+   because this whole pipeline runs OFF the real-time audio path.
 3. Apply downstream triggers (PTP -> pause collection + payment-link SMS;
    Dispute -> escalate to a human specialist).
 4. Persist the intelligence onto the stored call record with
@@ -33,7 +35,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
-from app.collections_agent import _resolve_relative_date
+from app import code_interpreter
 from app.config import Settings, get_settings
 from app.store import CALL_DISPOSITIONS, Store, blank_structured_data
 
@@ -158,11 +160,44 @@ def _classify(
     return parsed
 
 
-def _build_structured_data(parsed: Mapping[str, Any], reference_date) -> dict[str, Any]:
+def _resolve_date_phrase(
+    phrase: str,
+    reference_date,
+    settings: Settings,
+    code_interpreter_factory: Any | None,
+) -> str | None:
+    """Resolve a date ``phrase`` to a concrete ISO date.
+
+    Fast path: an already-ISO date is parsed with ``strptime`` and the code
+    interpreter is skipped entirely. Otherwise the natural-language phrase is
+    handed to the AWS Bedrock AgentCore Code Interpreter (off the real-time
+    path) which writes-and-executes Python to compute the date.
+    """
+    text = (phrase or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        pass
+    return code_interpreter.resolve_date_phrase(
+        text,
+        reference_date=reference_date.isoformat(),
+        region=settings.aws_region,
+        client_factory=code_interpreter_factory,
+    )
+
+
+def _build_structured_data(
+    parsed: Mapping[str, Any],
+    reference_date,
+    settings: Settings,
+    code_interpreter_factory: Any | None,
+) -> dict[str, Any]:
     """Map the parsed model JSON to the stored structured_data shape.
 
-    Resolves a relative ``agreed_date`` phrase via the same date math as the
-    in-call ``compute_future_date`` tool.
+    Resolves a relative ``agreed_date`` phrase via the AWS Bedrock AgentCore
+    Code Interpreter (off-path), keeping the already-ISO fast path.
     """
     data = blank_structured_data()
     payment = parsed.get("payment_specifics") or {}
@@ -178,12 +213,9 @@ def _build_structured_data(parsed: Mapping[str, Any], reference_date) -> dict[st
     agreed = payment.get("agreed_date")
     resolved_date = None
     if isinstance(agreed, str) and agreed.strip():
-        # Accept an already-ISO date, otherwise resolve the natural phrase.
-        try:
-            resolved_date = datetime.strptime(agreed.strip(), "%Y-%m-%d").date().isoformat()
-        except ValueError:
-            resolved = _resolve_relative_date(agreed, reference_date)
-            resolved_date = resolved.isoformat() if resolved else None
+        resolved_date = _resolve_date_phrase(
+            agreed, reference_date, settings, code_interpreter_factory
+        )
     data["payment_specifics"]["agreed_date"] = resolved_date
 
     data["contextual_data"]["reason_for_delinquency"] = contextual.get(
@@ -331,6 +363,7 @@ async def extract_and_apply(
     *,
     bedrock_client: Any | None = None,
     twilio_client_factory: Any | None = None,
+    code_interpreter_factory: Any | None = None,
 ) -> dict[str, Any]:
     """Classify disposition, extract structured data + NBA, run triggers, persist.
 
@@ -346,6 +379,10 @@ async def extract_and_apply(
             tests); built lazily from boto3 when ``None``.
         twilio_client_factory: Injectable Twilio ``Client`` factory for the SMS
             trigger (stubbed in tests).
+        code_interpreter_factory: Injectable ``(region) -> client`` factory for
+            the AgentCore Code Interpreter used to resolve natural-language
+            dates (stubbed in tests so no AWS call happens). When ``None`` the
+            real AgentCore client is built lazily by :mod:`app.code_interpreter`.
 
     Returns:
         The changes dict that was merged onto the stored call record.
@@ -379,8 +416,33 @@ async def extract_and_apply(
 
         disposition = _normalize_disposition(parsed.get("disposition"))
         reference_date = datetime.now(timezone.utc).date()
-        structured_data = _build_structured_data(parsed, reference_date)
+        structured_data = _build_structured_data(
+            parsed, reference_date, settings, code_interpreter_factory
+        )
         next_best_action = parsed.get("next_best_action")
+
+        # If the in-call capture tool recorded a raw date phrase on the due
+        # record, resolve it off-path too and write the concrete promised_date
+        # back. This runs the code interpreter once more (still off the audio
+        # path) only when a phrase was captured and not yet resolved.
+        if account_id:
+            try:
+                due = store.get_due(account_id)
+            except Exception:  # noqa: BLE001 - best effort
+                due = None
+            phrase = (due or {}).get("promised_date_phrase")
+            if isinstance(phrase, str) and phrase.strip():
+                resolved_promise = _resolve_date_phrase(
+                    phrase, reference_date, settings, code_interpreter_factory
+                )
+                if resolved_promise:
+                    try:
+                        store.update_due(account_id, promised_date=resolved_promise)
+                    except KeyError:
+                        logger.warning(
+                            "account_id=<%s> | could not write resolved promised_date",
+                            account_id,
+                        )
 
         changes["disposition"] = disposition
         changes["structured_data"] = structured_data

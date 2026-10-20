@@ -400,46 +400,59 @@ for a strict JSON object and parses it defensively). Until extraction completes
 they stay blank (`intelligence_status = pending`); the dashboard renders blank
 placeholders and fills them in when `intelligence_status` becomes `ready`.
 
-### 3. The `compute_future_date` code-interpreter tool
+### 3. Natural-language dates: capture in-call, resolve with a code interpreter
 
 To turn relative phrases the debtor speaks (e.g. "I'll pay next month, the first
-Monday") into a concrete date, the agent calls a **custom Strands `@tool`**,
-`compute_future_date(phrase, reference_date=None)` in `app/collections_agent.py`
-(same `@tool` decorator pattern as `update_due_record`, which Nova Sonic already
-invokes in-call). It does deterministic, purely-local **stdlib `datetime`** math
-(no network, no sandbox), so it returns within the turn.
+Monday") into a concrete date, the work is split so the **real-time turn stays
+fast** while the actual computation is delegated to a **real code interpreter**:
 
-**Why a custom `@tool` and not the vended `python_repl` or AgentCore:** Strands'
-vended `strands.vended_tools.python_repl` requires a configured Sandbox (local
-Docker / microVM / SSH host) to execute code. Local Docker is broken in this
-environment (podman shim) and a sandbox is heavy overkill for a tiny date
-computation; AWS Bedrock AgentCore's code interpreter is likewise unnecessary
-infrastructure here. A custom `@tool` is the correct, lowest-risk API.
+- **In-call (fast).** The agent calls a lightweight custom Strands `@tool`,
+  `capture_payment_date_phrase(phrase, account_id=None)` in
+  `app/collections_agent.py` (same `@tool` pattern as `update_due_record`). It
+  only **records the raw phrase** on the due record and returns immediately; it
+  does **no** date math and makes **no** network call, so it never adds latency
+  to the audio/turn path.
+- **Off-path (post-call).** `app/code_interpreter.py` wraps the **AWS Bedrock
+  AgentCore Code Interpreter** (`bedrock_agentcore.tools.code_interpreter_client`,
+  managed identifier `aws.codeinterpreter.v1`). `resolve_date_phrase(phrase,
+  reference_date, region, client_factory=None)` **writes a Python program on the
+  fly** that reasons from today's date and the phrase, ships it to the sandbox
+  via `invoke("executeCode", {"language": "python", "code": ...})`, and parses
+  the `YYYY-MM-DD` the program prints. The orchestration only supplies the
+  arguments (the phrase + today's date); the executed program does the date
+  math. The client is injectable so tests never hit AWS, and the wrapper is
+  fully defensive (any error / `isError` returns `None`, and the session is
+  always `stop()`-ped in a `finally`).
+
+**Why off-path:** a Code Interpreter session costs roughly **~1.9s** (~1.75s to
+start + ~0.13s to execute), which is why the heavy resolution runs only inside
+the post-call task (`extract_and_apply` in `app/postcall.py`) and never on the
+real-time turn. The already-ISO fast path (`strptime`) skips the interpreter
+entirely when the model already returned a concrete date.
 
 Example: with a reference date in May 2024, `"next month 1st Monday"` resolves to
 `2024-06-03`. Other handled phrases include `"in two weeks"`, `"next Friday"`,
 `"end of next month"`, and `"tomorrow"`.
 
-The **same date math** is reused post-call in `app/postcall.py` to resolve a
-relative `agreed_date` phrase returned by the extraction model into a concrete
-ISO date.
-
 ### Async / no-latency guarantee
 
-The in-call tools (`update_due_record`, `compute_future_date`) are cheap and
-local, but the **expensive work** (LLM disposition classification + structured
-extraction + the downstream triggers) runs **after the call ends**, off the
+The in-call tools (`update_due_record`, `capture_payment_date_phrase`) are cheap
+and local, but the **expensive work** (LLM disposition classification +
+structured extraction + the AgentCore code-interpreter date resolution + the
+downstream triggers) runs **after the call ends**, off the
 audio/turn path, as a fire-and-forget `asyncio` task launched from the `/media`
 WebSocket finally-block in `app/main.py` (`extract_and_apply` in
 `app/postcall.py`). The call-latency metrics (`total_e2e_ms`, `nova_total_ms`,
 `ttft_ms`) are computed on the audio path (`session_start`..`session_end`) and
 are frozen before the post-call task runs, so it provably cannot inflate them.
 
-This is enforced by a test:
-`tests/test_postcall.py::test_no_added_latency_postcall_does_not_touch_call_metrics`
-drives a synthetic `CallMetrics` session to fixed values, then runs
-`extract_and_apply` and asserts the three metrics are **byte-for-byte
-unchanged**.
+This is enforced by two tests in `tests/test_postcall.py`:
+`test_no_added_latency_postcall_does_not_touch_call_metrics` drives a synthetic
+`CallMetrics` session to fixed values, then runs `extract_and_apply` and asserts
+the three metrics are **byte-for-byte unchanged**; and
+`test_no_latency_audio_path_never_invokes_extraction` drives the full audio path
+with a blocking Bedrock stub **and a blocking code-interpreter stub**, asserting
+neither is touched until the off-path task runs post-call.
 
 ## Observability
 
