@@ -392,42 +392,48 @@ the Secrets-Manager Twilio credentials).
    curl -sS -o /dev/null -w '%{http_code}\n' https://$CF/healthz   # -> 200 (trusted cert, no -k)
    ```
 
-   #### Harden the origin further: CloudFront VPC origin (optional)
+   #### Origin network isolation: CloudFront VPC origin (active posture)
 
    The prefix-list allow-list above is an **IP-based** control: it filters by
    CloudFront's published source ranges, which the ALB still exposes to the
    public internet (just filtered at the security group). For stronger,
-   **network-level** isolation the template also offers a **CloudFront VPC
-   origin** (gated behind `UseVpcOrigin`, default `false`). When both
-   `EnableCloudFront=true` and `UseVpcOrigin=true`, the ALB is provisioned as an
-   **internal** load balancer in **private subnets with no public IP**, the
-   Fargate tasks run private (`AssignPublicIp=DISABLED`, egress via a NAT
-   gateway), and CloudFront reaches the origin through a service-managed
+   **network-level** isolation the reference stack runs the **CloudFront VPC
+   origin** posture (`UseVpcOrigin=true`). When both `EnableCloudFront=true` and
+   `UseVpcOrigin=true`, the ALB is provisioned as an **internal** load balancer
+   (`IpAddressType=ipv4`) in **private subnets with no public IP**, the Fargate
+   tasks run private (`AssignPublicIp=DISABLED`, egress via a NAT gateway), and
+   CloudFront reaches the origin through a service-managed
    `AWS::CloudFront::VpcOrigin` ENI — so the origin has **no public endpoint at
    all** and is reachable *only* by that distribution. This improves security
    over the prefix-list option because it removes the public IP entirely rather
-   than relying on a source-IP allow-list that changes over time. See the
-   [CloudFront VPC origins launch](https://aws.amazon.com/about-aws/whats-new/2026/10/cloudfront-vpc-origin-dualstack/)
-   and [docs/architecture.md](docs/architecture.md) for the trade-offs.
+   than relying on a source-IP allow-list that changes over time. See
+   [docs/architecture.md](docs/architecture.md) for the trade-offs.
+
+   The private subnets (internal ALB + tasks) are provisioned by the template
+   itself (IaC) when `PRIVATE_SUBNET_IDS` is left blank, so you do **not** need
+   to pre-create them; only a public subnet for NAT egress is required. The
+   subnets in use are surfaced by the `ProvisionedPrivateSubnetIds` stack output.
 
    ```bash
    export VPC_ID=<vpc-id>
    export PUBLIC_SUBNET_IDS=<subnet-id-a>,<subnet-id-b>      # still required (2 AZs)
    export ENABLE_CLOUDFRONT=true
    export USE_VPC_ORIGIN=true
-   export PRIVATE_SUBNET_IDS=<private-subnet-a>,<private-subnet-b>   # internal ALB + tasks
+   # PRIVATE_SUBNET_IDS left blank — the template provisions the private subnets.
    export NAT_GATEWAY_SUBNET_ID=<public-subnet-for-nat>             # NAT egress for private tasks
    scripts/deploy.sh deploy
    ```
 
-   > **Operational note (this sample's live demo).** The reference deployment
-   > keeps `UseVpcOrigin=false` (prefix-list Option 1). Switching an existing
-   > stack from a public ALB to an internal one **replaces** the load balancer
-   > (new DNS/ARN — not a zero-downtime change), so flip `UseVpcOrigin` on a
-   > fresh stack or during a planned maintenance window, not as an in-place
-   > update of a live stack. One-time account prerequisite: CloudFront
-   > auto-provisions the `AWSServiceRoleForCloudFrontVPCOrigins` service-linked
-   > role the first time a VPC origin is created.
+   > **Operational note (this sample's live demo).** VPC origin is the
+   > **activated** posture on the reference stack (`UseVpcOrigin=true`, the
+   > internal IPv4 ALB). Switching an existing stack from a public ALB to an
+   > internal one **replaces** the load balancer (new DNS/ARN — not a
+   > zero-downtime change), but the CloudFront **domain is unchanged** across the
+   > replacement, so flip `UseVpcOrigin` on a fresh stack or during a planned
+   > maintenance window, not as an in-place update of a live stack. One-time
+   > account prerequisite: CloudFront auto-provisions the
+   > `AWSServiceRoleForCloudFrontVPCOrigins` service-linked role the first time a
+   > VPC origin is created.
 
    ### Option 2 (custom domain): ACM certificate + HTTPS listener on the ALB
 

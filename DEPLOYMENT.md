@@ -131,25 +131,32 @@ export VPC_ID=<vpc-id>
 export PUBLIC_SUBNET_IDS=<subnet-id-a>,<subnet-id-b>
 ```
 
-**Optional — CloudFront VPC origin (stronger origin isolation).** To run the
-ALB internal (no public IP, reachable only via CloudFront's VPC origin ENI),
-also provide private subnets and a NAT subnet and set `USE_VPC_ORIGIN=true`:
+**CloudFront VPC origin (activated origin posture).** The reference stack runs
+the ALB **internal** (no public IP, reachable only via CloudFront's VPC origin
+ENI) with `USE_VPC_ORIGIN=true`. The private subnets are provisioned by the
+template itself (IaC) when `PRIVATE_SUBNET_IDS` is left blank, so you do **not**
+need to pre-create them; only a public subnet for NAT egress is required:
 
 ```bash
 export USE_VPC_ORIGIN=true
-export PRIVATE_SUBNET_IDS=<private-subnet-a>,<private-subnet-b>  # internal ALB + tasks
+# PRIVATE_SUBNET_IDS: leave blank — the template provisions the private subnets
+# (internal ALB + tasks). Supply a comma-separated list only to bring your own.
 export NAT_GATEWAY_SUBNET_ID=<public-subnet-for-nat>            # NAT egress for private tasks
 ```
 
-Notes for the VPC-origin option:
+Notes for the VPC-origin posture:
+- The private subnets that host the internal ALB and the Fargate tasks are
+  provisioned by the template when `PRIVATE_SUBNET_IDS` is left blank (no manual
+  subnet creation needed); the NAT subnet is still a **public** subnet. The
+  subnets in use are surfaced by the `ProvisionedPrivateSubnetIds` stack output.
 - The first VPC origin in an account triggers a **one-time** auto-provisioning of
   the `AWSServiceRoleForCloudFrontVPCOrigins` service-linked role (no action
   needed; just be aware it appears).
 - Switching an **existing** stack from a public ALB to an internal one
-  **replaces** the load balancer (new DNS/ARN — not zero-downtime). Prefer a
-  fresh stack or a planned window. This sample's reference deploy keeps
-  `UseVpcOrigin=false`. See [docs/architecture.md](docs/architecture.md) for the
-  security trade-off vs. the prefix-list allow-list.
+  **replaces** the load balancer (new DNS/ARN — not zero-downtime), but the
+  CloudFront **domain is unchanged** across the replacement. Prefer a fresh
+  stack or a planned window. See [docs/architecture.md](docs/architecture.md) for
+  the security trade-off vs. the prefix-list allow-list.
 
 ---
 

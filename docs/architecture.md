@@ -131,15 +131,15 @@ flowchart TB
 Two ingress postures are available when CloudFront fronts the ALB; exactly one
 is active per deploy (they are mutually exclusive in `infra/template.yaml`).
 
-- **Option 1 (default, `UseVpcOrigin=false`) — prefix-list allow-list.** The
+- **Option 1 (`UseVpcOrigin=false`) — prefix-list allow-list.** The
   public-facing ALB keeps a public IP, and its security group admits only the
   AWS-managed CloudFront origin-facing prefix list on HTTP:80. This is an
   **IP-based** control: the origin is still on the public internet, just
   filtered to CloudFront's published source ranges. Those ranges change over
   time, and the allow-list is only as current as the managed prefix list.
 
-- **Option 2 (`UseVpcOrigin=true`) — CloudFront VPC origin.** The ALB is
-  provisioned **internal** in **private subnets with no public IP**, the Fargate
+- **Option 2 (activated, `UseVpcOrigin=true`) — CloudFront VPC origin.** The ALB
+  is provisioned **internal** in **private subnets with no public IP**, the Fargate
   tasks run private (`AssignPublicIp=DISABLED`, egress via a NAT gateway to
   reach Twilio/Bedrock), and CloudFront reaches the origin through a
   service-managed `AWS::CloudFront::VpcOrigin` ENI
@@ -151,16 +151,18 @@ no public endpoint at all**, and is reachable **only** through the CloudFront
 distribution's VPC origin ENI. There is nothing on the public internet to scan,
 reach, or spoof-source-IP against — compared with the prefix-list option, which
 leaves a public ALB that merely allow-lists a set of CloudFront IP ranges that
-drift over time. The dualstack VPC origin additionally lets CloudFront reach the
-origin over IPv4 or IPv6. (See the
-[CloudFront VPC origins dualstack launch](https://aws.amazon.com/about-aws/whats-new/2026/10/cloudfront-vpc-origin-dualstack/).)
+drift over time.
 
-**Trade-off / operational note.** Switching an existing stack from a public ALB
-to an internal one **replaces** the load balancer (new DNS/ARN — not a
-zero-downtime in-place change), and the private tasks need NAT egress for their
-outbound calls. For that reason this sample ships the VPC-origin IaC
-**available but not activated** on the live reference stack (`UseVpcOrigin`
-defaults to `false`); enable it on a fresh stack or in a planned window. The
+**Activated posture / operational note.** VPC origin is the **activated** origin
+posture on the reference stack (`UseVpcOrigin=true`). The internal ALB and the
+CloudFront VPC origin are **IPv4** (`IpAddressType=ipv4`), which is sufficient
+for the private CloudFront-VPC-origin → ALB path. The private subnets and their
+NAT egress are provisioned by the template itself (IaC) when `UseVpcOrigin=true`
+and `PrivateSubnetIds` is left blank, so no manual subnet creation is needed;
+the subnets in use are surfaced by the `ProvisionedPrivateSubnetIds` stack
+output. Switching an existing stack from a public ALB to an internal one
+**replaces** the load balancer (new DNS/ARN — not a zero-downtime in-place
+change), but the CloudFront **domain is unchanged** across that replacement. The
 first VPC origin in an account also triggers a one-time auto-provisioning of the
 `AWSServiceRoleForCloudFrontVPCOrigins` service-linked role.
 
