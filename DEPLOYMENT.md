@@ -1,47 +1,49 @@
 # Deployment guide
 
 A reproducible, end-to-end runbook to deploy this AWS sample from scratch into
-**your own AWS account**. The infrastructure is provisioned by a single
-CloudFormation template (`infra/template.yaml`); the image build and rollout are
-scripted. Every step that earlier iterations did out-of-band (Bedrock model
-access, Twilio secrets, demo-data seeding, the forced ECS rollout) is called out
-explicitly below so there are **no hidden manual surprises**.
+**your own AWS account**. Deployment is **pure CloudFormation**: a single
+template (`infra/template.yaml`) provisions everything, **builds the container
+image in-stack** (AWS CodeBuild), and **seeds the demo data in-stack** (a Lambda
+custom resource). There are **no wrapper scripts** in the deploy path. A
+customer deploys with one `aws cloudformation create-stack` command (plus a
+`wait`).
 
 All commands target **`us-east-1`**, where Nova Sonic 2.5, Amazon Bedrock
 AgentCore Code Interpreter, and CloudFront VPC origins are all available. Set
 `AWS_REGION=us-east-1` or pass `--region us-east-1` throughout.
 
 > **Secrets.** Twilio credentials are stored in AWS Secrets Manager and
-> referenced by **ARN**. No secret value is ever placed in the template, the
-> scripts, or an environment-variable override passed to CloudFormation.
+> referenced by **ARN**. No secret value is ever placed in the template, in a
+> script, or in a parameter override passed to CloudFormation.
 
 ---
 
 ## 0. Overview — the shape of a deploy
 
 ```
-prerequisites  ->  store Twilio secrets  ->  build image (CodeBuild -> ECR)
-      ->  cloudformation deploy (IaC)  ->  seed demo dues  ->  force ECS rollout
+prerequisites  ->  store Twilio secrets  ->  create-stack (ONE IaC command)
+      ->  CloudFormation builds the image (CodeBuild) + seeds the dues
       ->  open the dashboard + place a call
 ```
 
-| # | Step | Automated by |
-| - | --- | --- |
-| 1 | Prerequisites + Bedrock model access | manual (one-time console/CLI) |
-| 2 | Store Twilio secrets in Secrets Manager | `aws secretsmanager create-secret` |
-| 3 | Collect VPC / subnet inputs | manual (your existing VPC) |
-| 4 | Build the container image | `scripts/codebuild_image.sh` (CodeBuild → ECR) |
-| 5 | Deploy the stack (IaC) | `scripts/deploy.sh deploy` |
-| 6 | Seed the demo dues data | `.venv/bin/python scripts/seed_dues.py` |
-| 7 | Force a new ECS deployment | `scripts/deploy.sh redeploy` |
-| 8 | Reach the dashboard + place a call | dashboard / `.venv/bin/python scripts/place_call.py` |
+The template is self-contained. On `create-stack` CloudFormation:
+
+| In-stack resource | Replaces the old script | What it does |
+| --- | --- | --- |
+| `AppEcrRepo` (`AWS::ECR::Repository`) | `scripts/codebuild_image.sh` | Holds the built image. |
+| `ImageBuildProject` (`AWS::CodeBuild::Project`) + `ImageBuildFn`/`ImageBuildTrigger` (Lambda custom resource) | `scripts/codebuild_image.sh` | Clones the **public** GitHub repo, runs `infra/buildspec.yml` to build and push the image to `AppEcrRepo`, and the custom resource **waits for the build to finish** before the ECS task definition is created (`DependsOn: ImageBuildTrigger`). |
+| `SeedDuesFn`/`SeedDuesTrigger` (Lambda custom resource) | `scripts/seed_dues.py` | `PutItem`s the demo dues `ACC-1001` / `ACC-1002` into `DuesTable` on Create (idempotent). |
+| the rest of the stack (ECS/ALB/CloudFront/DynamoDB/CloudWatch/CloudTrail) | `scripts/deploy.sh` | the service itself; `aws cloudformation create-stack`/`update-stack` is the deploy, no wrapper. |
+
+`scripts/place_call.py` and `scripts/ws_probe.py` remain — they are operator
+**test utilities**, not deploy steps.
 
 ---
 
 ## 1. Prerequisites
 
-1. **An AWS account** with permissions to create ECR, CodeBuild, S3, IAM, ECS,
-   ELBv2, DynamoDB, CloudWatch, CloudFront, CloudTrail, and Secrets Manager
+1. **An AWS account** with permissions to create ECR, CodeBuild, Lambda, IAM,
+   ECS, ELBv2, DynamoDB, CloudWatch, CloudFront, CloudTrail, and Secrets Manager
    resources, and the **AWS CLI v2** configured for `us-east-1`:
 
    ```bash
@@ -49,7 +51,8 @@ prerequisites  ->  store Twilio secrets  ->  build image (CodeBuild -> ECR)
    aws sts get-caller-identity --region us-east-1   # confirm identity
    ```
 
-2. **Python 3.12** (for the scripts and local tooling). **Not 3.13** — the audio
+2. **Python 3.12** (only for the local tooling / test utilities — **not** needed
+   to deploy, since the image is built in-stack). **Not 3.13** — the audio
    bridge uses the stdlib `audioop` module removed in 3.13. Create the venv:
 
    ```bash
@@ -83,7 +86,7 @@ prerequisites  ->  store Twilio secrets  ->  build image (CodeBuild -> ECR)
 ## 2. Store the Twilio secrets in Secrets Manager
 
 Store each value **once** and keep only the returned ARN. Never inline a secret
-value into the template, a script, or shell history you commit.
+value into the template, a command, or shell history you commit.
 
 ```bash
 export AWS_REGION=us-east-1
@@ -98,8 +101,8 @@ aws secretsmanager create-secret --region "$AWS_REGION" \
   --name ar/twilio/verified_caller_id --secret-string "$TWILIO_VERIFIED_CALLER_ID"
 ```
 
-Each `create-secret` returns an `ARN`. Capture the four ARNs (shape shown with
-placeholders — `<region>` / `<AWS_ACCOUNT_ID>` are filled by your account):
+Capture the four ARNs (shape shown with placeholders — `<region>` /
+`<AWS_ACCOUNT_ID>` are filled by your account):
 
 ```bash
 export TWILIO_ACCOUNT_SID_ARN=$(aws secretsmanager describe-secret \
@@ -133,20 +136,17 @@ export PUBLIC_SUBNET_IDS=<subnet-id-a>,<subnet-id-b>
 
 **CloudFront VPC origin (activated origin posture).** The reference stack runs
 the ALB **internal** (no public IP, reachable only via CloudFront's VPC origin
-ENI) with `USE_VPC_ORIGIN=true`. The private subnets are provisioned by the
-template itself (IaC) when `PRIVATE_SUBNET_IDS` is left blank, so you do **not**
+ENI) with `UseVpcOrigin=true`. The private subnets are provisioned by the
+template itself (IaC) when `PrivateSubnetIds` is left blank, so you do **not**
 need to pre-create them; only a public subnet for NAT egress is required:
 
 ```bash
-export USE_VPC_ORIGIN=true
-# PRIVATE_SUBNET_IDS: leave blank — the template provisions the private subnets
-# (internal ALB + tasks). Supply a comma-separated list only to bring your own.
-export NAT_GATEWAY_SUBNET_ID=<public-subnet-for-nat>            # NAT egress for private tasks
+export NAT_GATEWAY_SUBNET_ID=<public-subnet-for-nat>   # NAT egress for private tasks
 ```
 
 Notes for the VPC-origin posture:
 - The private subnets that host the internal ALB and the Fargate tasks are
-  provisioned by the template when `PRIVATE_SUBNET_IDS` is left blank (no manual
+  provisioned by the template when `PrivateSubnetIds` is left blank (no manual
   subnet creation needed); the NAT subnet is still a **public** subnet. The
   subnets in use are surfaced by the `ProvisionedPrivateSubnetIds` stack output.
 - The first VPC origin in an account triggers a **one-time** auto-provisioning of
@@ -160,124 +160,132 @@ Notes for the VPC-origin posture:
 
 ---
 
-## 4. Build the container image (CodeBuild → ECR)
+## 4. Deploy the whole stack with ONE CloudFormation command
 
-Local Docker is **not** assumed. The authoritative build path builds the
-multi-stage image (the `node:22-slim` web build + the `python:3.12-slim`
-runtime) **remotely with AWS CodeBuild** and pushes it to ECR. It is idempotent
-(creates the ECR repo, S3 source bucket, IAM role, and CodeBuild project only if
-missing) and **waits for `SUCCEEDED`**:
+The template is **under the 51,200-byte inline limit**, so you pass it directly
+with `--template-body file://infra/template.yaml` — **no S3 upload and no
+wrapper script**. `create-stack` provisions the infrastructure, the in-stack
+CodeBuild project builds and pushes the image, and the Lambda custom resources
+wait for the build and seed the demo dues, all in one operation.
 
-```bash
-export IMAGE_TAG=$(git rev-parse --short HEAD)   # or any tag you choose
-AWS_REGION=us-east-1 scripts/codebuild_image.sh
-```
-
-On success it prints the pushed image URI:
-`<AWS_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/ar-collections-nova-sonic:<IMAGE_TAG>`.
-Capture that URI for the deploy:
-
-```bash
-export CONTAINER_IMAGE=$(aws sts get-caller-identity --query Account --output text).dkr.ecr.us-east-1.amazonaws.com/ar-collections-nova-sonic:$IMAGE_TAG
-```
-
-> If a build fails, the script prints the `batch-get-builds` command to fetch
-> logs. Fix and re-run; it is safe to re-run.
-
----
-
-## 5. Deploy the CloudFormation stack (IaC)
-
-`scripts/deploy.sh deploy` runs `aws cloudformation deploy` with all parameters.
-The recommended live configuration fronts the HTTP-only ALB with CloudFront so
-Twilio gets a trusted `wss://` endpoint with **no custom domain**:
+The recommended live configuration fronts the HTTP-only internal ALB with the
+CloudFront VPC origin so Twilio gets a trusted `wss://` endpoint with **no
+custom domain**:
 
 ```bash
 export AWS_REGION=us-east-1
 export STACK_NAME=ar-collections-nova-sonic
-export IMAGE_TAG=$IMAGE_TAG            # from step 4 (deploy.sh composes the ECR URI)
-export ENABLE_CLOUDFRONT=true
-# VPC_ID / PUBLIC_SUBNET_IDS from step 3; the four TWILIO_*_ARN from step 2.
-# Observability: emit the GA Strands OTEL spans to CloudWatch via the console exporter.
-export OTEL_ENABLED=true
-export OTEL_EXPORTER=console
 
-scripts/deploy.sh deploy
+aws cloudformation create-stack \
+  --region us-east-1 \
+  --stack-name "$STACK_NAME" \
+  --template-body file://infra/template.yaml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameters \
+    ParameterKey=VpcId,ParameterValue="$VPC_ID" \
+    ParameterKey=PublicSubnetIds,ParameterValue=\"$PUBLIC_SUBNET_IDS\" \
+    ParameterKey=TwilioAccountSidArn,ParameterValue="$TWILIO_ACCOUNT_SID_ARN" \
+    ParameterKey=TwilioAuthTokenArn,ParameterValue="$TWILIO_AUTH_TOKEN_ARN" \
+    ParameterKey=TwilioFromNumberArn,ParameterValue="$TWILIO_FROM_NUMBER_ARN" \
+    ParameterKey=TwilioVerifiedCallerIdArn,ParameterValue="$TWILIO_VERIFIED_CALLER_ID_ARN" \
+    ParameterKey=EnableCloudFront,ParameterValue=true \
+    ParameterKey=UseVpcOrigin,ParameterValue=true \
+    ParameterKey=NatGatewaySubnetId,ParameterValue="$NAT_GATEWAY_SUBNET_ID"
+
+aws cloudformation wait stack-create-complete \
+  --region us-east-1 --stack-name "$STACK_NAME"
 ```
 
-Parameters passed to the stack:
+> Use `update-stack` (same parameters) to apply changes to an existing stack.
+> `CAPABILITY_NAMED_IAM` is required because the stack creates named IAM roles.
+> CloudFront takes ~5–15 min to deploy; the first in-stack image build adds a
+> few minutes. The stack reaches `CREATE_COMPLETE` once everything is live.
 
-| Parameter | Source / value |
-| --- | --- |
-| `ContainerImage` | the ECR image from step 4 |
-| `VpcId` | `VPC_ID` |
-| `PublicSubnetIds` | `PUBLIC_SUBNET_IDS` (≥ 2 AZs) |
-| `TwilioAccountSidArn` … `TwilioVerifiedCallerIdArn` | the 4 Secrets Manager ARNs (step 2) |
-| `EnableCloudFront` | `true` (CloudFront TLS front door) |
-| `OtelEnabled` / `OtelExporter` | `true` / `console` (GA OTEL spans → CloudWatch) |
-| `UseVpcOrigin` / `PrivateSubnetIds` / `NatGatewaySubnetId` | optional VPC-origin option (step 3) |
-| `CertificateArn` / `PublicHostname` | optional custom-domain (ACM) alternative to CloudFront |
-| `ExtractionModelId` | optional; defaults to `amazon.nova-lite-v1:0` |
+### Parameters
 
-> The `deploy.sh` wrapper reads these as environment variables: `VPC_ID`,
-> `PUBLIC_SUBNET_IDS`, `TWILIO_*_ARN`, `ENABLE_CLOUDFRONT`, `OTEL_ENABLED`,
-> `OTEL_EXPORTER`, and (optional) `USE_VPC_ORIGIN`, `PRIVATE_SUBNET_IDS`,
-> `NAT_GATEWAY_SUBNET_ID`, `CERTIFICATE_ARN`, `PUBLIC_HOSTNAME`.
+| Parameter | Default | Notes |
+| --- | --- | --- |
+| `VpcId` | — | target VPC |
+| `PublicSubnetIds` | — | ≥ 2 AZs |
+| `TwilioAccountSidArn` … `TwilioVerifiedCallerIdArn` | — | the 4 Secrets Manager ARNs (step 2) |
+| `GitHubRepoUrl` | `https://github.com/windson/twilio-nova-sonic-2-5.git` | **public** repo CodeBuild clones for the in-stack build |
+| `SourceVersion` | `main` | git branch/tag/sha CodeBuild builds from |
+| `ImageTag` | `latest` | tag the in-stack build pushes and the task consumes |
+| `ContainerImage` | `""` | optional explicit ECR image URI override (blank = use the in-stack built image) |
+| `EnableCloudFront` | `false` | CloudFront TLS front door |
+| `UseVpcOrigin` | `false` | internal ALB behind a CloudFront VPC origin (needs `EnableCloudFront=true` + `NatGatewaySubnetId`) |
+| `PrivateSubnetIds` | `""` | blank = stack provisions them |
+| `NatGatewaySubnetId` | `""` | public subnet for NAT egress when `UseVpcOrigin=true` |
+| `CertificateArn` / `PublicHostname` | `""` | optional custom-domain (ACM) alternative to CloudFront |
+| `OtelEnabled` / `OtelExporter` | `true` / `console` | GA OTEL spans → stdout → CloudWatch (no new IAM/infra) |
+| `ExtractionModelId` | `amazon.nova-lite-v1:0` | text model for post-call extraction |
 
-CloudFront takes ~5–15 min to deploy; the stack reaches
-`CREATE_COMPLETE`/`UPDATE_COMPLETE` once live. Read the outputs:
+Read the outputs:
 
 ```bash
 aws cloudformation describe-stacks --stack-name "$STACK_NAME" --region us-east-1 \
   --query 'Stacks[0].Outputs' --output table
 ```
 
-Key outputs: `CloudFrontDomainName` (the public URL), `DuesTableName`,
-`CallsTableName`, `DashboardUrl`, `AlbDnsName`.
+Key outputs: `CloudFrontDomainName` (the public URL), `ContainerImageUri`,
+`EcrRepositoryUri`, `DuesTableName`, `CallsTableName`, `DashboardUrl`,
+`AlbDnsName`.
+
+### How the in-stack image build works
+
+- `ImageBuildProject` is an `AWS::CodeBuild::Project` whose `Source` is the
+  **public** GitHub repo (`GitHubRepoUrl`, at `SourceVersion`). CodeBuild clones
+  it with no credentials (the repo is public) and runs `infra/buildspec.yml`,
+  which `docker build`s the multi-stage image (the `node:22-slim` web build +
+  the `python:3.12-slim` runtime) and pushes it to the stack's `AppEcrRepo` at
+  `:ImageTag`.
+- `ImageBuildFn` (an inline Lambda) is invoked by the `ImageBuildTrigger`
+  custom resource on Create/Update. It calls `codebuild:StartBuild`, then polls
+  `codebuild:BatchGetBuilds` (self-re-invoking while `IN_PROGRESS`) and signals
+  CloudFormation only when the build `SUCCEEDED`/`FAILED`.
+- The `TaskDefinition` has `DependsOn: ImageBuildTrigger`, so the ECS task is
+  only created after a successful image build, and it consumes
+  `${AppEcrRepo.RepositoryUri}:${ImageTag}` (unless you set `ContainerImage`).
+
+> **Local Docker is not required or used.** The broken local container runtime
+> in some environments is exactly why the build runs remotely in CodeBuild.
+
+### How the demo-dues seeding works
+
+`SeedDuesFn` (an inline Lambda, triggered by `SeedDuesTrigger`) `PutItem`s the
+two demo records `ACC-1001` (Jordan Rivera) and `ACC-1002` (Pavan Navule) into
+`DuesTable` with the same schema the app uses, on stack Create. It is
+idempotent (`put_item` insert-or-replace) and a no-op on Update/Delete, and its
+IAM role is scoped to `dynamodb:PutItem` on `DuesTable` only.
 
 ---
 
-## 6. Seed the demo dues data
+## 5. Force a fresh image build / roll the service
 
-A fresh stack starts with an **empty** `DuesTable`, so the dashboard shows no
-accounts until it is seeded. This was previously a manual step; it is now a
-small idempotent script that writes the demo records (`ACC-1001`, `ACC-1002`),
-parameterized by the table name from the stack output (never a hard-coded
-physical name):
+To rebuild the image and roll the service, **update the stack** with a new
+`ImageTag` (and/or `SourceVersion`):
 
 ```bash
-export DUES_TABLE=$(aws cloudformation describe-stacks \
-  --stack-name "$STACK_NAME" --region us-east-1 \
-  --query "Stacks[0].Outputs[?OutputKey=='DuesTableName'].OutputValue|[0]" --output text)
+aws cloudformation update-stack \
+  --region us-east-1 --stack-name "$STACK_NAME" \
+  --template-body file://infra/template.yaml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameters \
+    ParameterKey=ImageTag,ParameterValue=$(git rev-parse --short HEAD) \
+    ParameterKey=SourceVersion,ParameterValue=main \
+    --use-previous-value ...   # reuse the other parameters
 
-AWS_REGION=us-east-1 .venv/bin/python scripts/seed_dues.py        # or: .venv/bin/python scripts/seed_dues.py --dues-table "$DUES_TABLE" --region us-east-1
+aws cloudformation wait stack-update-complete --region us-east-1 --stack-name "$STACK_NAME"
 ```
 
-Run it with the project venv (`.venv` from the prerequisites step) because the
-script imports `app.store` (boto3); if you have the venv activated you can drop
-the `.venv/bin/` prefix. It is safe to re-run (it uses `put_item`,
-insert-or-replace). Add `--dry-run` to preview the records without writing.
+Changing `ImageTag` re-triggers the in-stack CodeBuild build (the custom
+resource property changes) and updates the ECS task definition to the new image,
+so CloudFormation rolls the service. (In practice, pass `--use-previous-value`
+for every parameter you are not changing.)
 
 ---
 
-## 7. Force a new ECS deployment
-
-When the image tag changed, step 5 already rolls the service. If you rebuilt the
-image under a **moving tag** (e.g. `latest`) or just want to roll the tasks after
-seeding, force a new deployment and wait for the service to stabilize. The
-cluster/service names are **discovered from the stack**, not hard-coded:
-
-```bash
-STACK_NAME=ar-collections-nova-sonic AWS_REGION=us-east-1 scripts/deploy.sh redeploy
-```
-
-(Equivalent raw commands: `aws ecs update-service --cluster <stack>-cluster
---service <service> --force-new-deployment --region us-east-1` then
-`aws ecs wait services-stable ...`.)
-
----
-
-## 8. Reach the dashboard and place a call
+## 6. Reach the dashboard and place a call
 
 1. **Open the dashboard** at the CloudFront domain:
 
@@ -316,7 +324,10 @@ STACK_NAME=ar-collections-nova-sonic AWS_REGION=us-east-1 scripts/deploy.sh rede
   region and the OTEL markers (`otel_enabled`, `otel_exporter`).
 - **Data:** `GET /api/dues` lists the seeded records; `GET /api/calls` lists
   calls.
-- **Logs + OTEL spans:** `aws logs tail "/ecs/<stack>/app" --follow --region us-east-1`
+- **Image build logs:** the in-stack build logs to the
+  `/codebuild/<stack>-image-build` CloudWatch log group; the custom-resource
+  Lambdas log to their own `/aws/lambda/...` groups.
+- **App logs + OTEL spans:** `aws logs tail "/ecs/<stack>/app" --follow --region us-east-1`
   shows the per-call JSON lines and the GA Strands OTEL spans (session token
   usage, per-response native TTFT, tool calls).
 - **WebSocket upgrade probe (optional):**
@@ -324,13 +335,14 @@ STACK_NAME=ar-collections-nova-sonic AWS_REGION=us-east-1 scripts/deploy.sh rede
   `wss://<cloudfront-domain>/media` 101 handshake end-to-end (uses the
   `websockets` dependency from the project venv).
 
-## Updating a running deployment
+## Validate the template before deploying (optional)
 
-1. Commit changes and rebuild: `IMAGE_TAG=$(git rev-parse --short HEAD) scripts/codebuild_image.sh`.
-2. Re-run `scripts/deploy.sh deploy` with the new `IMAGE_TAG` (updates
-   `ContainerImage`), **or** if the tag is unchanged, `scripts/deploy.sh redeploy`.
-3. Smoke-test `https://<cloudfront-domain>/healthz` and the `/api/*` endpoints.
-   If a deploy regresses the app, roll back by deploying the prior image tag.
+```bash
+.venv/bin/cfn-lint infra/template.yaml          # expect 0 findings
+wc -c infra/template.yaml                        # expect < 51200 bytes
+aws cloudformation validate-template --region us-east-1 \
+  --template-body file://infra/template.yaml
+```
 
 ## Teardown
 
@@ -339,5 +351,7 @@ aws cloudformation delete-stack --stack-name ar-collections-nova-sonic --region 
 aws cloudformation wait stack-delete-complete --stack-name ar-collections-nova-sonic --region us-east-1
 ```
 
-Also remove the Secrets Manager secrets, the ECR repository, and the CodeBuild
-source S3 bucket / project / role if you no longer need them.
+Also remove the Secrets Manager secrets if you no longer need them. The ECR
+repository, CodeBuild project, and custom-resource Lambdas/roles are part of the
+stack and are deleted with it (the ECR repo is emptied by CloudFormation only if
+empty; delete remaining images first if deletion is blocked).

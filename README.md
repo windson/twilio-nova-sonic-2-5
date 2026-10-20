@@ -127,9 +127,10 @@ audio path:
 | `app/postcall.py` | Async post-call intelligence (disposition, structured data, NBA, date resolution) |
 | `frontend/` | shadcn/ui React + Tailwind + Vite dashboard source (built at image-build time) |
 | `web/` | Compiled dashboard bundle served by FastAPI at `/` + `/static/assets/` (git-ignored; produced by the Docker node build stage) |
-| `scripts/place_call.py` | CLI to initiate an outbound collections call |
-| `scripts/deploy.sh` | Operator wrapper for build/lint/push/deploy |
-| `infra/template.yaml` | AWS CloudFormation IaC (ECS Fargate + ALB + DynamoDB + CloudWatch + CloudTrail) |
+| `scripts/place_call.py` | CLI to initiate an outbound collections call (operator test utility) |
+| `scripts/ws_probe.py` | CLI to probe the `wss://.../media` WebSocket upgrade (operator test utility) |
+| `infra/template.yaml` | AWS CloudFormation IaC — the whole deploy: ECS Fargate + ALB + DynamoDB + CloudWatch + CloudTrail, **plus the in-stack CodeBuild image build and the demo-dues seeding** (Lambda custom resources) |
+| `infra/buildspec.yml` | CodeBuild buildspec the in-stack `ImageBuildProject` runs to build + push the image |
 
 ## Requirements
 
@@ -232,16 +233,22 @@ few seconds, so a call updates live.
   then the `python:3.12-slim` runtime stage `COPY --from=web-build`s the emitted
   `web/` bundle. Because the node build runs inside `docker build`, the CodeBuild
   environment only needs Docker - no host node toolchain and no local
-  `docker build` (the image is built remotely via `scripts/codebuild_image.sh`).
+  `docker build` (the image is built remotely, **in-stack**, by the
+  `ImageBuildProject` CodeBuild project the CloudFormation template creates).
 
 ## AWS deploy
 
 > **For a from-scratch, step-by-step deployment, follow
-> [DEPLOYMENT.md](DEPLOYMENT.md).** It is a reproducible, fully
-> IaC/scripted runbook (prerequisites → Bedrock model access → Twilio secrets
-> → CodeBuild image → CloudFormation deploy → seed demo data → force ECS
-> rollout → place a call) with no hidden manual steps. The section below is the
-> reference explanation of what the IaC provisions and the TLS options.
+> [DEPLOYMENT.md](DEPLOYMENT.md).** Deployment is **pure CloudFormation**: a
+> single `infra/template.yaml` that is under the 51,200-byte inline limit, so
+> one `aws cloudformation create-stack --template-body file://infra/template.yaml
+> --capabilities CAPABILITY_NAMED_IAM --region us-east-1` command (plus a `wait`)
+> provisions everything, **builds the container image in-stack** (an
+> `AWS::CodeBuild::Project` the stack creates, triggered by a Lambda custom
+> resource that waits for the build) and **seeds the demo dues in-stack** (a
+> Lambda custom resource). There are **no wrapper scripts** in the deploy path.
+> The section below is the reference explanation of what the IaC provisions and
+> the TLS options.
 
 The IaC (`infra/template.yaml`) provisions an **ECS Fargate** service behind an
 **Application Load Balancer** (WebSocket/WSS capable, idle timeout 120s), two
@@ -279,23 +286,31 @@ the Secrets-Manager Twilio credentials).
 > `EXTRACTION_MODEL_ID` out of band, or the Converse call will be access-denied
 > at runtime (surfacing as `intelligence_status = failed`).
 
-`scripts/deploy.sh` wraps the steps (run the pieces yourself as needed):
+The deploy is a single CloudFormation command (see [DEPLOYMENT.md](DEPLOYMENT.md)
+for the full copy-pasteable runbook):
 
 1. **Validate the template (no AWS mutation):**
 
    ```bash
-   scripts/deploy.sh lint       # cfn-lint + aws cloudformation validate-template
+   .venv/bin/cfn-lint infra/template.yaml          # expect 0 findings
+   wc -c infra/template.yaml                        # expect < 51200 bytes
+   aws cloudformation validate-template --region us-east-1 \
+     --template-body file://infra/template.yaml
    ```
 
-2. **Build and push the image to ECR:**
-
-   ```bash
-   scripts/deploy.sh build
-   scripts/deploy.sh push       # creates the ECR repo if missing, logs in, pushes
-   ```
+2. **The image is built in-stack — nothing to build/push by hand.** The template
+   creates an `AWS::ECR::Repository`, an `AWS::CodeBuild::Project`
+   (`ImageBuildProject`) whose source is the **public** GitHub repo
+   (`GitHubRepoUrl`, at `SourceVersion`), and an inline Lambda custom resource
+   (`ImageBuildFn`/`ImageBuildTrigger`) that runs `StartBuild`, waits for it to
+   finish, and signals CloudFormation. `infra/buildspec.yml` does the
+   `docker build` + ECR push. The ECS task definition `DependsOn` that trigger,
+   so it consumes the freshly-built `${EcrRepositoryUri}:${ImageTag}`. Set the
+   `ContainerImage` parameter only if you want to point at an externally-built
+   image instead.
 
 3. **Provide the Twilio secrets via Secrets Manager or SSM (never inline).**
-   Store each value once and pass the **ARNs** to the deploy. For example:
+   Store each value once and pass the **ARNs** as stack parameters. For example:
 
    ```bash
    aws secretsmanager create-secret --name ar/twilio/account_sid --secret-string "$TWILIO_ACCOUNT_SID"
@@ -313,13 +328,30 @@ the Secrets-Manager Twilio credentials).
    ECS execution role is granted `secretsmanager:GetSecretValue` / `ssm:GetParameter`
    on exactly those ARNs. **No secret value is ever written into the template.**
 
-4. **Deploy:**
+4. **Deploy with one CloudFormation command:**
 
    ```bash
-   export VPC_ID=vpc-xxxxxxxx
-   export PUBLIC_SUBNET_IDS=subnet-aaaa,subnet-bbbb   # >= 2 AZs
-   scripts/deploy.sh deploy
+   aws cloudformation create-stack \
+     --region us-east-1 --stack-name ar-collections-nova-sonic \
+     --template-body file://infra/template.yaml \
+     --capabilities CAPABILITY_NAMED_IAM \
+     --parameters \
+       ParameterKey=VpcId,ParameterValue=vpc-xxxxxxxx \
+       ParameterKey=PublicSubnetIds,ParameterValue=\"subnet-aaaa,subnet-bbbb\" \
+       ParameterKey=TwilioAccountSidArn,ParameterValue="$TWILIO_ACCOUNT_SID_ARN" \
+       ParameterKey=TwilioAuthTokenArn,ParameterValue="$TWILIO_AUTH_TOKEN_ARN" \
+       ParameterKey=TwilioFromNumberArn,ParameterValue="$TWILIO_FROM_NUMBER_ARN" \
+       ParameterKey=TwilioVerifiedCallerIdArn,ParameterValue="$TWILIO_VERIFIED_CALLER_ID_ARN"
+   aws cloudformation wait stack-create-complete --region us-east-1 \
+     --stack-name ar-collections-nova-sonic
    ```
+
+   Add `ParameterKey=EnableCloudFront,ParameterValue=true` (and, for the activated
+   posture, `UseVpcOrigin=true` + `NatGatewaySubnetId=...`) for the TLS options
+   below. The demo dues `ACC-1001`/`ACC-1002` are seeded by the `SeedDuesFn`
+   custom resource on Create — no separate seeding step. To rebuild the image /
+   roll the service later, `update-stack` with a new `ImageTag` (and/or
+   `SourceVersion`).
 
 5. **Enable TLS for live calls (required by Twilio).** Twilio Media Streams
    only connect over `wss://` (TLS); a plaintext `ws://` endpoint is refused.
@@ -334,10 +366,10 @@ the Secrets-Manager Twilio credentials).
    `EnableCloudFront` parameter:
 
    ```bash
-   export VPC_ID=vpc-xxxxxxxx
-   export PUBLIC_SUBNET_IDS=subnet-aaaa,subnet-bbbb   # >= 2 AZs
-   export ENABLE_CLOUDFRONT=true
-   scripts/deploy.sh deploy     # adds EnableCloudFront=true to the stack
+   # Add to the create-stack/update-stack --parameters list in step 4:
+   #   ParameterKey=VpcId,ParameterValue=vpc-xxxxxxxx
+   #   ParameterKey=PublicSubnetIds,ParameterValue=\"subnet-aaaa,subnet-bbbb\"   # >= 2 AZs
+   #   ParameterKey=EnableCloudFront,ParameterValue=true
    ```
 
    With `EnableCloudFront=true` the stack creates an `AWS::CloudFront::Distribution`
@@ -415,13 +447,13 @@ the Secrets-Manager Twilio credentials).
    subnets in use are surfaced by the `ProvisionedPrivateSubnetIds` stack output.
 
    ```bash
-   export VPC_ID=<vpc-id>
-   export PUBLIC_SUBNET_IDS=<subnet-id-a>,<subnet-id-b>      # still required (2 AZs)
-   export ENABLE_CLOUDFRONT=true
-   export USE_VPC_ORIGIN=true
-   # PRIVATE_SUBNET_IDS left blank — the template provisions the private subnets.
-   export NAT_GATEWAY_SUBNET_ID=<public-subnet-for-nat>             # NAT egress for private tasks
-   scripts/deploy.sh deploy
+   # Add to the create-stack/update-stack --parameters list in step 4:
+   #   ParameterKey=VpcId,ParameterValue=<vpc-id>
+   #   ParameterKey=PublicSubnetIds,ParameterValue=\"<subnet-id-a>,<subnet-id-b>\"   # still required (2 AZs)
+   #   ParameterKey=EnableCloudFront,ParameterValue=true
+   #   ParameterKey=UseVpcOrigin,ParameterValue=true
+   #   ParameterKey=NatGatewaySubnetId,ParameterValue=<public-subnet-for-nat>   # NAT egress for private tasks
+   # PrivateSubnetIds left unset — the template provisions the private subnets.
    ```
 
    > **Operational note (this sample's live demo).** VPC origin is the
@@ -448,9 +480,9 @@ the Secrets-Manager Twilio credentials).
      points `PUBLIC_BASE_URL` at the TLS hostname:
 
      ```bash
-     export CERTIFICATE_ARN=arn:aws:acm:<region>:<AWS_ACCOUNT_ID>:certificate/XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
-     export PUBLIC_HOSTNAME=collections.example.com
-     scripts/deploy.sh deploy   # pass CertificateArn / PublicHostname params
+     # Add to the create-stack/update-stack --parameters list in step 4:
+     #   ParameterKey=CertificateArn,ParameterValue=arn:aws:acm:<region>:<AWS_ACCOUNT_ID>:certificate/XXXX...
+     #   ParameterKey=PublicHostname,ParameterValue=collections.example.com
      ```
 
    With `CertificateArn` set the stack creates an HTTPS:443 listener

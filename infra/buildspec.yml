@@ -3,12 +3,14 @@
 # Why this exists: the sandbox's local container runtime (podman/docker shim)
 # has a broken conmon and cannot run `docker build`, so the image is built
 # remotely by AWS CodeBuild, which provides its own Docker daemon, and pushed
-# to ECR. Driven by scripts/codebuild_image.sh (S3-zip source).
+# to ECR. Run in-stack by the ImageBuildProject (AWS::CodeBuild::Project) in
+# infra/template.yaml, which clones the public GitHub repo as its source and is
+# triggered on deploy by the ImageBuildTrigger custom resource (no script).
 #
-# Required environment variables (set on the CodeBuild project):
-#   AWS_DEFAULT_REGION - e.g. us-east-1
+# Required environment variables (set on the CodeBuild project by the template):
+#   AWS_DEFAULT_REGION - set automatically by CodeBuild (e.g. us-east-1)
 #   AWS_ACCOUNT_ID     - the target account id
-#   ECR_REPO           - ECR repository name (ar-collections-nova-sonic)
+#   ECR_REPO           - ECR repository name (the stack's ${AWS::StackName}-app)
 #   IMAGE_TAG          - image tag to push (e.g. latest or a git sha)
 version: 0.2
 
