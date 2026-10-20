@@ -18,22 +18,23 @@ ordered streams this collector computes the metrics the user asked for:
 Approximations (documented here and in FEAT-003 findings):
 
 - A conversational "turn" is one side of the user<->assistant alternation,
-  derived from ``BidiTranscriptStreamEvent`` roles (see
-  :meth:`CallMetrics._build_conversation_turns`). This is the headline
+  derived from GA ``BidiTranscriptBlockEvent`` roles (a block event IS a
+  completed utterance; there is no ``is_final`` flag in GA). See
+  :meth:`CallMetrics._build_conversation_turns`. This is the headline
   ``turn_count``. The response_id-based grouping below is kept as a secondary
   Nova-response timing signal and surfaced as ``nova_response_count``.
 - A Nova response window is a matched ``BidiResponseStartEvent`` /
-  ``BidiResponseCompleteEvent`` pair keyed by ``response_id``. Per-response
-  duration = complete_time - start_time.
+  ``BidiResponseStopEvent`` pair keyed by ``response_id``. Per-response
+  duration = stop_time - start_time.
 - TTFT for a turn = time from that turn's ``response_start`` to the first
-  ``BidiAudioStreamEvent`` of the same response. The conversation-level TTFT is
+  ``BidiAudioDeltaEvent`` of the same response. The conversation-level TTFT is
   the first turn's TTFT.
 - Per-turn latency = time from when the user finished speaking to the turn's
   ``response_start``. "User finished speaking" is approximated as the timestamp
   of the last inbound Twilio media frame seen before ``response_start`` (or, if
   present, the last final user transcript before it).
 - ``nova_total_ms`` = the wall-clock time Nova Sonic was actively producing
-  speech, computed as the sum of outbound ``BidiAudioStreamEvent`` PCM
+  speech, computed as the sum of outbound ``BidiAudioDeltaEvent`` PCM
   durations (see the ``nova_total_ms`` property for why the old
   response_start..complete window sum under-counted). The legacy window sum is
   retained as ``nova_response_window_ms`` for diagnostics.
@@ -53,18 +54,19 @@ import logging
 import time
 from typing import Any, Callable
 
-from strands.experimental.bidi.types.events import (
-    BidiAudioStreamEvent,
-    BidiConnectionCloseEvent,
+from strands.bidi.types.events import (
+    BidiAudioDeltaEvent,
+    BidiBargeInEvent,
     BidiConnectionRestartEvent,
     BidiConnectionStartEvent,
-    BidiErrorEvent,
-    BidiInterruptionEvent,
-    BidiResponseCompleteEvent,
+    BidiConnectionStopEvent,
+    BidiConnectionWarningEvent,
     BidiResponseStartEvent,
-    BidiTranscriptStreamEvent,
+    BidiResponseStopEvent,
+    BidiToolUseBlocksEvent,
+    BidiTranscriptBlockEvent,
+    BidiTranscriptDeltaEvent,
     BidiUsageEvent,
-    ToolUseStreamEvent,
 )
 
 # Dedicated logger that emits one JSON object per line to stdout. FEAT-005 ships
@@ -259,22 +261,26 @@ class CallMetrics:
 
         if isinstance(event, BidiResponseStartEvent):
             self._on_response_start(event, now)
-        elif isinstance(event, BidiAudioStreamEvent):
+        elif isinstance(event, BidiAudioDeltaEvent):
             self._on_audio(event, now)
-        elif isinstance(event, BidiResponseCompleteEvent):
+        elif isinstance(event, BidiResponseStopEvent):
             self._on_response_complete(event, now)
-        elif isinstance(event, BidiTranscriptStreamEvent):
-            self._on_transcript(event, now)
+        elif isinstance(event, BidiTranscriptBlockEvent):
+            # A GA block event IS a completed (final) utterance.
+            self._on_transcript_final(event, now)
+        elif isinstance(event, BidiTranscriptDeltaEvent):
+            # GA partial transcript delta -> fallback (previously non-final).
+            self._on_transcript_delta(event, now)
         elif isinstance(event, BidiUsageEvent):
             self._on_usage(event)
-        elif isinstance(event, BidiInterruptionEvent):
+        elif isinstance(event, BidiBargeInEvent):
+            # GA BidiBargeInEvent carries no .reason attribute.
             self.barge_in_count += 1
-            self._emit("barge_in", reason=getattr(event, "reason", None))
-        elif isinstance(event, ToolUseStreamEvent):
-            self._emit(
-                "tool_invocation",
-                tool=_tool_name(event),
-            )
+            self._emit("barge_in")
+        elif isinstance(event, BidiToolUseBlocksEvent):
+            # GA groups tool calls: emit one tool_invocation per ToolUse.
+            for tool_use in getattr(event, "tool_uses", None) or []:
+                self._emit("tool_invocation", tool=_tool_name(tool_use))
         elif isinstance(event, BidiConnectionStartEvent):
             self._emit(
                 "connection_start",
@@ -286,18 +292,18 @@ class CallMetrics:
                 "connection_restart",
                 timeout_error=getattr(event, "timeout_error", None),
             )
-        elif isinstance(event, BidiConnectionCloseEvent):
+        elif isinstance(event, BidiConnectionStopEvent):
             self._emit(
-                "connection_close",
+                "connection_stop",
                 connection_id=getattr(event, "connection_id", None),
                 reason=getattr(event, "reason", None),
             )
-        elif isinstance(event, BidiErrorEvent):
+        elif isinstance(event, BidiConnectionWarningEvent):
+            # GA replaced the former error branch with a proactive restart
+            # warning; record it for diagnostics (informational only).
             self._emit(
-                "error",
-                error=getattr(event, "error", None),
-                code=getattr(event, "code", None),
-                error_message=getattr(event, "message", None),
+                "connection_warning",
+                time_left_s=getattr(event, "time_left_s", None),
             )
 
     # -- per-event handlers ---------------------------------------------------
@@ -319,7 +325,7 @@ class CallMetrics:
             turn_latency_ms=self._open_turns[response_id]["turn_latency_ms"],
         )
 
-    def _on_audio(self, event: BidiAudioStreamEvent, now: float) -> None:
+    def _on_audio(self, event: BidiAudioDeltaEvent, now: float) -> None:
         # HEADLINE Nova speaking time: accumulate the real duration of each
         # outbound audio frame. Nova Sonic emits PCM16 mono at 24 kHz, so the
         # frame duration (ms) = decoded_bytes / (2 * sample_rate * channels) *
@@ -340,8 +346,9 @@ class CallMetrics:
 
         # Attribute first audio to the most-recently-started still-open turn.
         #
-        # The installed BidiAudioStreamEvent carries no response_id (only
-        # ``audio``/``format``/``sample_rate``/``channels``), so audio cannot be
+        # The GA BidiAudioDeltaEvent carries no response_id (only
+        # ``audio``/``format``/``sample_rate``/``channels``/``content_id``), so
+        # audio cannot be
         # matched to its turn by id. Under normal sequencing only one turn is
         # open at a time. Under a barge-in that opens turn N+1 while turn N is
         # still finishing, the freshest audio belongs to the newest turn, so we
@@ -357,8 +364,9 @@ class CallMetrics:
                 self._emit("ttft_measured", response_id=turn["response_id"], ttft_ms=ttft_ms)
                 break
 
-    def _on_response_complete(self, event: BidiResponseCompleteEvent, now: float) -> None:
+    def _on_response_complete(self, event: BidiResponseStopEvent, now: float) -> None:
         response_id = getattr(event, "response_id", None)
+        # GA BidiResponseStopEvent only carries response_id; stop_reason is gone.
         stop_reason = getattr(event, "stop_reason", None)
         if response_id is None or response_id not in self._open_turns:
             # Unmatched complete; pick the oldest open turn if any.
@@ -393,38 +401,78 @@ class CallMetrics:
         self.turns.append(record)
         self._emit("turn_complete", **record)
 
-    def _on_transcript(self, event: BidiTranscriptStreamEvent, now: float) -> None:
+    def _on_transcript_final(self, event: BidiTranscriptBlockEvent, now: float) -> None:
+        """Record a GA completed-utterance transcript (``BidiTranscriptBlockEvent``).
+
+        GA has no ``is_final`` flag: a block event IS the completed utterance, so
+        it maps to what the per-utterance/conversation turn model treats as a
+        final transcript (``is_final=True``). The transcript text lives on
+        ``.transcript`` (not ``.text``).
+        """
         role = getattr(event, "role", None)
-        text = getattr(event, "text", None)
-        is_final = bool(getattr(event, "is_final", False))
+        text = getattr(event, "transcript", None)
         if role == "user":
-            if is_final:
-                self._last_user_final_wall = now
-            elif text:
-                # Retain the latest partial user transcript as a fallback so the
-                # chat view is not empty when Nova only emits non-final user
-                # transcripts (observed in some live calls).
-                self._last_user_partial_text = text
-                self._last_user_partial_t_ms = self._rel_ms(now)
+            self._last_user_final_wall = now
         self.transcripts.append(
             {
                 "role": role,
                 "text": text,
-                "is_final": is_final,
+                "is_final": True,
                 "t_ms": self._rel_ms(now),
             }
         )
-        if is_final:
-            self._emit("transcript", role=role, text=text)
+        self._emit("transcript", role=role, text=text)
+
+    def _on_transcript_delta(self, event: BidiTranscriptDeltaEvent, now: float) -> None:
+        """Record a GA partial transcript delta (``BidiTranscriptDeltaEvent``).
+
+        Deltas are the GA equivalent of the old non-final transcripts. We keep
+        the latest partial user text as a fallback so the chat view is not empty
+        when a call only yields partial user transcripts, and we record the
+        partial in the transcript log with ``is_final=False`` so the turn model
+        continues to key off final (block) transcripts.
+        """
+        role = getattr(event, "role", None)
+        delta = getattr(event, "delta", None)
+        if role == "user" and delta:
+            # Accumulate consecutive user deltas so the fallback reflects the
+            # full partial utterance, not just the last chunk.
+            self._last_user_partial_text = (self._last_user_partial_text or "") + delta
+            self._last_user_partial_t_ms = self._rel_ms(now)
+            text: str | None = self._last_user_partial_text
+        else:
+            text = delta
+        self.transcripts.append(
+            {
+                "role": role,
+                "text": text,
+                "is_final": False,
+                "t_ms": self._rel_ms(now),
+            }
+        )
 
     def _on_usage(self, event: BidiUsageEvent) -> None:
+        # GA BidiUsageEvent keeps input/output/total tokens top-level but moved
+        # the cache + modality breakdowns under input_token_details /
+        # output_token_details (TokenDetails with text/audio/cache_read/
+        # reasoning). Rebuild the dashboard usage dict from the new fields:
+        # cache_read_input_tokens comes from the input detail map, and a
+        # modality_details-equivalent is assembled from both detail maps so the
+        # usage display keeps working.
+        input_details = dict(getattr(event, "input_token_details", None) or {})
+        output_details = dict(getattr(event, "output_token_details", None) or {})
+        modality_details = (
+            {"input": input_details, "output": output_details}
+            if (input_details or output_details)
+            else None
+        )
         self.usage = {
             "input_tokens": getattr(event, "input_tokens", None),
             "output_tokens": getattr(event, "output_tokens", None),
             "total_tokens": getattr(event, "total_tokens", None),
-            "cache_read_input_tokens": getattr(event, "cache_read_input_tokens", None),
-            "cache_write_input_tokens": getattr(event, "cache_write_input_tokens", None),
-            "modality_details": getattr(event, "modality_details", None),
+            "cache_read_input_tokens": input_details.get("cache_read"),
+            "cache_write_input_tokens": None,
+            "modality_details": modality_details,
         }
         self._emit("usage", **self.usage)
 
@@ -436,16 +484,18 @@ class CallMetrics:
     # The user's observation: a turn is one back-and-forth in the conversation
     # (the user says something, Nova Sonic answers), not an internal grouping of
     # Nova's output. The ORIGINAL implementation counted a turn as a matched
-    # BidiResponseStartEvent/BidiResponseCompleteEvent pair keyed by
+    # response-start / response-stop pair keyed by
     # ``response_id``. In live calls Nova Sonic REUSED a single ``response_id``
     # for an entire multi-exchange conversation, so that count collapsed to 1
     # even though the user and the agent alternated several times. That is the
     # bug this method fixes.
     #
-    # Reliable signal: BidiTranscriptStreamEvent carries ``role`` in
-    # {"user", "assistant"} with ``is_final`` and a timestamp. We derive
-    # conversational turns from that alternation: group consecutive FINAL
-    # transcripts of the same role into one segment; each segment is one
+    # Reliable signal: the GA BidiTranscriptBlockEvent is a completed utterance
+    # carrying ``role`` in {"user", "assistant"} and a timestamp (there is no
+    # is_final flag in GA; a block event IS a final transcript, recorded with
+    # is_final=True). We derive conversational turns from that alternation:
+    # group consecutive FINAL transcripts of the same role into one segment;
+    # each segment is one
     # conversational turn (speaker = that role). This agent is AI-initiated and
     # speaks first (the kickoff), so a leading assistant-only segment is counted
     # as the opening turn. The old response_id-based count is preserved intact
@@ -761,8 +811,8 @@ class CallMetrics:
         ``response_id`` for the entire call and emits MANY
         ``BidiResponseStartEvent`` (one per speech burst), each overwriting the
         previous open-turn start time, while only ONE
-        ``BidiResponseCompleteEvent`` fires at call end
-        (``stop_reason=incomplete``). ``_finalize_turn`` therefore measured only
+        ``BidiResponseStopEvent`` fires at call end. ``_finalize_turn``
+        therefore measured only
         the final "Goodbye" window (~6 s) instead of the ~30 s Nova actually
         spoke, badly under-counting. Summing the duration of every audio frame
         Nova emitted is the trustworthy measure. The old window sum is kept as
@@ -858,8 +908,13 @@ def _blank_structured_data() -> dict[str, Any]:
     return blank_structured_data()
 
 
-def _tool_name(event: Any) -> Any:
-    current = getattr(event, "current_tool_use", None)
-    if isinstance(current, dict):
-        return current.get("name")
-    return getattr(current, "name", None)
+def _tool_name(tool_use: Any) -> Any:
+    """Derive the tool name from a GA ``ToolUse``.
+
+    GA ``BidiToolUseBlocksEvent`` carries a list of ``ToolUse`` TypedDicts
+    (``{"name", "input", "toolUseId"}``). Fall back to attribute access for any
+    object-style tool use.
+    """
+    if isinstance(tool_use, dict):
+        return tool_use.get("name")
+    return getattr(tool_use, "name", None)

@@ -16,12 +16,26 @@ from app.config import Settings
 from app.metrics import CallMetrics
 from app.postcall import extract_and_apply
 from app.store import InMemoryStore
-from strands.experimental.bidi.types.events import (
-    BidiAudioStreamEvent,
-    BidiResponseCompleteEvent,
+import itertools
+
+from strands.bidi.types.events import (
+    BidiAudioDeltaEvent,
     BidiResponseStartEvent,
-    BidiTranscriptStreamEvent,
+    BidiResponseStopEvent,
+    BidiTranscriptBlockEvent,
 )
+
+# Monotonic content-id generator for the GA events used by the no-latency tests.
+_content_ids = itertools.count()
+
+
+def _cid() -> str:
+    return f"c{next(_content_ids)}"
+
+
+def _final_transcript(text: str, role: str) -> BidiTranscriptBlockEvent:
+    """GA completed-utterance transcript (the old is_final=True transcript)."""
+    return BidiTranscriptBlockEvent(transcript=text, role=role, content_id=_cid())
 
 
 def _settings(**overrides) -> Settings:
@@ -307,8 +321,10 @@ class FakeClock:
         self.t = seconds
 
 
-def _audio_event() -> BidiAudioStreamEvent:
-    return BidiAudioStreamEvent(audio="AAAA", format="pcm", sample_rate=24000, channels=1)
+def _audio_event() -> BidiAudioDeltaEvent:
+    return BidiAudioDeltaEvent(
+        audio="AAAA", format="pcm", sample_rate=24000, channels=1, content_id=_cid()
+    )
 
 
 async def test_no_added_latency_postcall_does_not_touch_call_metrics(store):
@@ -327,21 +343,11 @@ async def test_no_added_latency_postcall_does_not_touch_call_metrics(store):
     clock.set(1.3)
     m.record_event(_audio_event())
     clock.set(1.8)
-    m.record_event(
-        BidiTranscriptStreamEvent(
-            delta=None, text="You owe 428.57 dollars.", role="assistant",
-            is_final=True, current_transcript="You owe 428.57 dollars.",
-        )
-    )
+    m.record_event(_final_transcript("You owe 428.57 dollars.", role="assistant"))
     clock.set(2.5)
-    m.record_event(BidiResponseCompleteEvent(response_id="r1", stop_reason="complete"))
+    m.record_event(BidiResponseStopEvent(response_id="r1"))
     clock.set(2.8)
-    m.record_event(
-        BidiTranscriptStreamEvent(
-            delta=None, text="I can pay next month, the first Monday.", role="user",
-            is_final=True, current_transcript="I can pay next month, the first Monday.",
-        )
-    )
+    m.record_event(_final_transcript("I can pay next month, the first Monday.", role="user"))
     clock.set(4.0)
     m.on_session_end()
 
@@ -490,14 +496,9 @@ async def test_no_latency_audio_path_never_invokes_extraction(store):
     clock.set(1.3)
     m.record_event(_audio_event())
     clock.set(1.8)
-    m.record_event(
-        BidiTranscriptStreamEvent(
-            delta=None, text="You owe 428.57 dollars.", role="assistant",
-            is_final=True, current_transcript="You owe 428.57 dollars.",
-        )
-    )
+    m.record_event(_final_transcript("You owe 428.57 dollars.", role="assistant"))
     clock.set(2.5)
-    m.record_event(BidiResponseCompleteEvent(response_id="r1", stop_reason="complete"))
+    m.record_event(BidiResponseStopEvent(response_id="r1"))
     clock.set(4.0)
     m.on_session_end()
 
