@@ -2,11 +2,13 @@
 
 AR Collections Nova Sonic 2.5 Agent: an AI-initiated outbound collections voice
 agent. Twilio carries the audio, Amazon Bedrock Nova Sonic 2.5 is the
-speech-to-speech brain (Strands bi-di), DynamoDB persists state, and the
-intelligence (disposition + structured data + next-best-action) is extracted
-**asynchronously after the call ends** so it never adds to call latency.
+speech-to-speech brain (via the GA `strands.bidi` API), DynamoDB persists
+state, and the intelligence (disposition + structured data + next-best-action)
+is extracted **asynchronously after the call ends** so it never adds to call
+latency.
 
-Live app: https://d3k3puelhq4ike.cloudfront.net/
+The public entry point is the CloudFront distribution domain, published as the
+`CloudFrontDomainName` stack output (`https://<cloudfront-domain>/`).
 
 The numbered labels (1..10) in the diagram map one-to-one to the phase
 explanations below it.
@@ -21,13 +23,13 @@ flowchart TB
 
     subgraph AWS["AWS (us-east-1)"]
         CF["(2) Amazon CloudFront<br/>*.cloudfront.net wss TLS<br/>front door (managed cert)"]
-        ALB["(3) ALB ingress<br/>locked to CloudFront prefix list<br/>pl-3b927c52 (HTTP:80)"]
+        ALB["(3) ALB ingress<br/>locked to CloudFront origin-facing<br/>managed prefix list (HTTP:80)<br/>or internal via VPC origin"]
 
-        subgraph VPC["VPC vpc-0f002ebd48cdfc707 (public subnets)"]
+        subgraph VPC["VPC (public subnets; private subnets for VPC-origin option)"]
             ECS["(4) ECS Fargate<br/>FastAPI bridge (app)"]
         end
 
-        Sonic["(5) Strands BidiAgent &lt;-&gt;<br/>Bedrock Nova Sonic 2.5<br/>voice tiffany, bi-di stream<br/>mulaw&lt;-&gt;PCM transcode"]
+        Sonic["(5) Strands GA BidiAgent &lt;-&gt;<br/>Bedrock Nova Sonic 2.5<br/>voice tiffany, bidi stream<br/>mulaw&lt;-&gt;PCM transcode"]
         Tools["(6) In-call Strands tools<br/>update_due_record +<br/>capture_payment_date_phrase<br/>(captures phrase, no date math)"]
         CI["(6b) AgentCore Code Interpreter<br/>aws.codeinterpreter.v1<br/>writes+runs Python off-path<br/>resolves date phrase (~1.9s)"]
 
@@ -40,7 +42,7 @@ flowchart TB
         Triggers["(9) Downstream triggers<br/>PTP -&gt; Twilio SMS + pause<br/>Dispute -&gt; human escalation"]
 
         subgraph Obs["(10) Observability + secrets"]
-            CW["CloudWatch Logs<br/>/ecs/ar-collections-nova-sonic/app<br/>+ dashboard + CloudTrail"]
+            CW["CloudWatch Logs<br/>/ecs/&lt;stack&gt;/app (JSON + OTEL spans)<br/>+ dashboard + CloudTrail"]
             SM["Secrets Manager<br/>Twilio creds"]
         end
     end
@@ -75,15 +77,22 @@ flowchart TB
    WebSocket carrying base64 G.711 mulaw, 8 kHz, mono.
 2. **CloudFront TLS front door.** Amazon CloudFront (`*.cloudfront.net`,
    free managed cert) terminates viewer TLS at the edge so Twilio connects over
-   `wss://`. Live: https://d3k3puelhq4ike.cloudfront.net/
-3. **ALB ingress.** The Application Load Balancer accepts only CloudFront
-   origin-facing edge IPs via managed prefix list `pl-3b927c52` on HTTP:80, so
-   the raw ALB DNS is not directly reachable.
-4. **ECS Fargate bridge.** The FastAPI app runs as a Fargate task in the public
-   subnets of VPC `vpc-0f002ebd48cdfc707`, bridging the Twilio WebSocket to Nova.
-5. **Strands BidiAgent + Nova Sonic 2.5.** Bi-directional streaming to Bedrock
-   Nova Sonic 2.5 (voice `tiffany`) does STT + reasoning + TTS; the app
-   transcodes mulaw 8k <-> PCM on the real-time audio path.
+   `wss://`. The public domain is the `CloudFrontDomainName` stack output
+   (`https://<cloudfront-domain>/`).
+3. **ALB ingress.** By default (Option 1) the Application Load Balancer accepts
+   only CloudFront origin-facing edge IPs via the AWS-managed
+   `com.amazonaws.global.cloudfront.origin-facing` prefix list on HTTP:80
+   (region-specific id; resolve with `aws ec2 describe-managed-prefix-lists`), so
+   the raw ALB DNS is not directly reachable. The optional CloudFront **VPC
+   origin** (Option 2, `UseVpcOrigin=true`) goes further: the ALB is internal in
+   private subnets with no public IP (see the security note below).
+4. **ECS Fargate bridge.** The FastAPI app runs as a Fargate task (in public
+   subnets by default, or private subnets with NAT egress under the VPC-origin
+   option), bridging the Twilio WebSocket to Nova.
+5. **Strands GA BidiAgent + Nova Sonic 2.5.** Bidirectional streaming to Bedrock
+   Nova Sonic 2.5 (voice `tiffany`) via the GA `strands.bidi`
+   `BedrockNovaSonicModel` does STT + reasoning + TTS; the app transcodes mulaw
+   8k <-> PCM on the real-time audio path.
 6. **In-call Strands tools.** `update_due_record` writes the outcome;
    `capture_payment_date_phrase` only RECORDS the debtor's raw date phrase
    (e.g. "next month 1st Monday") on the due record and returns immediately, so
@@ -112,10 +121,48 @@ flowchart TB
 9. **Downstream triggers.** Driven by the disposition: Promise to Pay (PTP)
    sends a Twilio SMS payment link and pauses automated collection; Dispute
    Raised escalates the account to a human specialist (flag/event).
-10. **Observability + secrets.** CloudWatch Logs
-    (`/ecs/ar-collections-nova-sonic/app`), the
-    `ar-collections-nova-sonic-observability` dashboard, and a CloudTrail trail
-    record activity; Twilio credentials live in Secrets Manager.
+10. **Observability + secrets.** CloudWatch Logs (`/ecs/<stack>/app`, carrying
+    both the per-call JSON lines and the GA Strands OTEL spans), the
+    `<stack>-observability` dashboard, and a CloudTrail trail record activity;
+    Twilio credentials live in Secrets Manager.
+
+## Origin network isolation: prefix-list allow-list vs. CloudFront VPC origin
+
+Two ingress postures are available when CloudFront fronts the ALB; exactly one
+is active per deploy (they are mutually exclusive in `infra/template.yaml`).
+
+- **Option 1 (default, `UseVpcOrigin=false`) — prefix-list allow-list.** The
+  public-facing ALB keeps a public IP, and its security group admits only the
+  AWS-managed CloudFront origin-facing prefix list on HTTP:80. This is an
+  **IP-based** control: the origin is still on the public internet, just
+  filtered to CloudFront's published source ranges. Those ranges change over
+  time, and the allow-list is only as current as the managed prefix list.
+
+- **Option 2 (`UseVpcOrigin=true`) — CloudFront VPC origin.** The ALB is
+  provisioned **internal** in **private subnets with no public IP**, the Fargate
+  tasks run private (`AssignPublicIp=DISABLED`, egress via a NAT gateway to
+  reach Twilio/Bedrock), and CloudFront reaches the origin through a
+  service-managed `AWS::CloudFront::VpcOrigin` ENI
+  (`AWS::CloudFront::VpcOrigin` → the distribution's `Origins[].VpcOriginConfig`).
+
+**Why the VPC origin improves security.** It provides **network-level
+isolation** rather than source-IP filtering: the origin has **no public IP and
+no public endpoint at all**, and is reachable **only** through the CloudFront
+distribution's VPC origin ENI. There is nothing on the public internet to scan,
+reach, or spoof-source-IP against — compared with the prefix-list option, which
+leaves a public ALB that merely allow-lists a set of CloudFront IP ranges that
+drift over time. The dualstack VPC origin additionally lets CloudFront reach the
+origin over IPv4 or IPv6. (See the
+[CloudFront VPC origins dualstack launch](https://aws.amazon.com/about-aws/whats-new/2026/10/cloudfront-vpc-origin-dualstack/).)
+
+**Trade-off / operational note.** Switching an existing stack from a public ALB
+to an internal one **replaces** the load balancer (new DNS/ARN — not a
+zero-downtime in-place change), and the private tasks need NAT egress for their
+outbound calls. For that reason this sample ships the VPC-origin IaC
+**available but not activated** on the live reference stack (`UseVpcOrigin`
+defaults to `false`); enable it on a fresh stack or in a planned window. The
+first VPC origin in an account also triggers a one-time auto-provisioning of the
+`AWSServiceRoleForCloudFrontVPCOrigins` service-linked role.
 
 ## Telemetry: GA Strands OTEL spans vs. CallMetrics
 

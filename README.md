@@ -1,14 +1,60 @@
-# AR Collections Nova Sonic 2.5 Agent
+# AR Collections Nova Sonic 2.5 Agent — an AWS sample
 
-AI-first-initiated **outbound** Accounts Receivable collections voice agent.
-Twilio places the outbound call and carries the audio; **Amazon Bedrock Nova
-Sonic 2.5** (model `amazon.nova-2-5-sonic`, female voice **`tiffany`**) does the
-speech understanding, reasoning, and speech generation; **Strands bi-di agents**
-orchestrate the real-time session. The agent greets the debtor by name, states
-the exact amount due and due date, converses, and writes the outcome back to the
-due record via a tool. Every call is tagged with detailed metrics shown on a
-built-in analytics dashboard (a **shadcn/ui** React + Tailwind + Vite SPA,
-compiled at image-build time and served by the same FastAPI app).
+An AWS reference sample showing how to build a **real-time, speech-to-speech
+voice agent** on AWS by combining **Twilio** telephony with **Amazon Bedrock
+Nova Sonic 2.5** and the **Strands Bidi Agents** GA API, then layering on
+**post-call intelligence** and **observability**. The use case is an
+AI-initiated **outbound** Accounts Receivable (AR) collections call, but the
+architecture is a general blueprint for any phone-based conversational agent.
+
+## What this sample demonstrates
+
+- **Twilio telephony + Amazon Bedrock Nova Sonic 2.5 speech-to-speech.** Twilio
+  places the outbound call and carries the audio over a Media Streams
+  WebSocket; **Amazon Bedrock Nova Sonic 2.5** (model `amazon.nova-2-5-sonic`,
+  voice **`tiffany`**) performs speech understanding, reasoning, and speech
+  generation in a single bidirectional stream.
+- **Strands GA Bidi Agents.** The real-time session is orchestrated with the
+  **generally-available** `strands.bidi` API (`BidiAgent` +
+  `BedrockNovaSonicModel`), replacing the earlier experimental
+  `strands.experimental.bidi` interface. In-call Strands `@tool`s let the model
+  update the due record and capture spoken payment dates mid-conversation.
+- **Post-call intelligence.** After the call, an asynchronous pipeline (off the
+  real-time path) extracts the **call disposition**, **structured conversation
+  data**, and the **next-best-action** via the Bedrock Converse API, resolves
+  spoken relative dates with **Amazon Bedrock AgentCore Code Interpreter**, and
+  fires downstream automation (payment-link SMS, human escalation).
+- **Observability.** Per-call metrics (end-to-end time, TTFT, turn count,
+  Twilio-vs-Nova split) feed a built-in analytics dashboard, and the GA Strands
+  **OpenTelemetry (OTEL) spans** (per session, per model response, and per tool
+  call, including reported token usage) are emitted to CloudWatch Logs.
+- **AWS reference architecture.** CloudFront → Application Load Balancer → ECS
+  Fargate → Amazon Bedrock, with Amazon DynamoDB persistence, AWS Secrets
+  Manager for credentials, CloudWatch for logs/metrics, and CloudTrail for
+  audit — all provisioned by a single CloudFormation template.
+
+The analytics dashboard is a **shadcn/ui** React + Tailwind + Vite SPA, compiled
+at image-build time and served by the same FastAPI app.
+
+> **Deploying this sample?** Follow [DEPLOYMENT.md](DEPLOYMENT.md) — a
+> reproducible, fully-automated (IaC + scripted) runbook that takes an AWS
+> account from zero to a live, callable demo with no hidden manual steps.
+
+## AWS services used
+
+| Service | Role in the sample |
+| --- | --- |
+| **Amazon Bedrock** (Nova Sonic 2.5) | Real-time speech-to-speech model over a bidirectional stream |
+| **Amazon Bedrock** (Converse, Nova Lite/Micro) | Post-call disposition + structured-data extraction |
+| **Amazon Bedrock AgentCore Code Interpreter** | Off-path resolution of spoken relative dates |
+| **Amazon ECS on AWS Fargate** | Runs the FastAPI real-time bridge |
+| **Elastic Load Balancing (ALB)** | WebSocket/WSS-capable ingress (idle timeout ≥ 120s) |
+| **Amazon CloudFront** | TLS front door for Twilio `wss://` (managed cert) |
+| **Amazon DynamoDB** | Dues/account records + per-call analytics |
+| **AWS Secrets Manager** | Twilio credentials (referenced by ARN, never inline) |
+| **Amazon CloudWatch** | JSON logs, dashboard, and GA OTEL spans |
+| **AWS CloudTrail** | Management-event audit trail |
+| **AWS CloudFormation** | Single-template IaC for the whole stack |
 
 ## Architecture
 
@@ -61,8 +107,9 @@ audio path:
     single `response_id` across the call.
 
 > **Verified AWS fact:** `amazon.nova-2-5-sonic` is available in Amazon Bedrock
-> in **us-east-1** with **streaming = true**. The bi-di operation to grant in
-> IAM is `bedrock:InvokeModelWithBidirectionalStream` (plus `bedrock:InvokeModel`).
+> in **us-east-1** with **streaming = true**. The bidirectional operation to
+> grant in IAM is `bedrock:InvokeModelWithBidirectionalStream` (plus
+> `bedrock:InvokeModel`).
 
 ## Components
 
@@ -70,7 +117,8 @@ audio path:
 | --- | --- |
 | `app/main.py` | FastAPI app: `/healthz`, `/` dashboard, `/api/*` REST, `/media` WebSocket |
 | `app/audio.py` | mu-law <-> PCM resample helpers (`audioop`) |
-| `app/sonic_bridge.py` | Strands `BidiAgent` + Nova Sonic model wiring and Twilio I/O bridge |
+| `app/sonic_bridge.py` | Strands GA `strands.bidi` `BidiAgent` + `BedrockNovaSonicModel` wiring and Twilio I/O bridge |
+| `app/telemetry.py` | One-time GA Strands OTEL (`StrandsTelemetry`) setup (console/OTLP exporter) |
 | `app/collections_agent.py` | System prompt + `update_due_record` tool |
 | `app/metrics.py` | Per-call / per-turn metrics + JSON-line logging |
 | `app/store.py` | Pluggable store: in-memory by default, **DynamoDB on AWS** |
@@ -188,6 +236,13 @@ few seconds, so a call updates live.
 
 ## AWS deploy
 
+> **For a from-scratch, step-by-step deployment, follow
+> [DEPLOYMENT.md](DEPLOYMENT.md).** It is a reproducible, fully
+> IaC/scripted runbook (prerequisites → Bedrock model access → Twilio secrets
+> → CodeBuild image → CloudFormation deploy → seed demo data → force ECS
+> rollout → place a call) with no hidden manual steps. The section below is the
+> reference explanation of what the IaC provisions and the TLS options.
+
 The IaC (`infra/template.yaml`) provisions an **ECS Fargate** service behind an
 **Application Load Balancer** (WebSocket/WSS capable, idle timeout 120s), two
 **DynamoDB** tables (dues + call analytics), a **CloudWatch** log group and
@@ -245,11 +300,14 @@ the Secrets-Manager Twilio credentials).
    ```bash
    aws secretsmanager create-secret --name ar/twilio/account_sid --secret-string "$TWILIO_ACCOUNT_SID"
    # ...repeat for auth_token, from_number, verified_caller_id...
-   export TWILIO_ACCOUNT_SID_ARN=arn:aws:secretsmanager:us-east-1:920487201358:secret:ar/twilio/account_sid-XXXXX
+   # Capture the ARN that create-secret returns (shape shown with placeholders):
+   export TWILIO_ACCOUNT_SID_ARN=arn:aws:secretsmanager:<region>:<AWS_ACCOUNT_ID>:secret:ar/twilio/account_sid-XXXXXX
    export TWILIO_AUTH_TOKEN_ARN=...
    export TWILIO_FROM_NUMBER_ARN=...
    export TWILIO_VERIFIED_CALLER_ID_ARN=...
    ```
+
+   See [DEPLOYMENT.md](DEPLOYMENT.md) for the exact, copy-pasteable commands.
 
    The template references these ARNs in the task definition `Secrets` block; the
    ECS execution role is granted `secretsmanager:GetSecretValue` / `ssm:GetParameter`
@@ -301,9 +359,12 @@ the Secrets-Manager Twilio credentials).
    **ALB ingress is locked to CloudFront when `EnableCloudFront=true`.** To make
    the CloudFront TLS front door the *only* ingress path (so a plaintext
    `ws://<alb-dns>/media` can no longer bypass CloudFront), the ALB security
-   group's `:80` ingress is restricted to the AWS-managed CloudFront prefix list
-   `com.amazonaws.global.cloudfront.origin-facing` (us-east-1 id `pl-3b927c52`,
-   passed via the `CloudFrontOriginFacingPrefixListId` parameter) instead of
+   group's `:80` ingress is restricted to the AWS-managed CloudFront
+   origin-facing managed prefix list
+   `com.amazonaws.global.cloudfront.origin-facing` (region-specific; resolve the
+   id for your region with the `aws ec2 describe-managed-prefix-lists` command
+   below and pass it via the `CloudFrontOriginFacingPrefixListId` parameter,
+   which defaults to the current us-east-1 id) instead of
    `0.0.0.0/0`. CloudFront talks to the origin over `http-only:80`, so only the
    `:80` rule is needed; adding a second `:443` prefix-list rule is unnecessary
    and would exceed the 60-rule-per-SG limit (the managed prefix list has ~49
@@ -331,6 +392,43 @@ the Secrets-Manager Twilio credentials).
    curl -sS -o /dev/null -w '%{http_code}\n' https://$CF/healthz   # -> 200 (trusted cert, no -k)
    ```
 
+   #### Harden the origin further: CloudFront VPC origin (optional)
+
+   The prefix-list allow-list above is an **IP-based** control: it filters by
+   CloudFront's published source ranges, which the ALB still exposes to the
+   public internet (just filtered at the security group). For stronger,
+   **network-level** isolation the template also offers a **CloudFront VPC
+   origin** (gated behind `UseVpcOrigin`, default `false`). When both
+   `EnableCloudFront=true` and `UseVpcOrigin=true`, the ALB is provisioned as an
+   **internal** load balancer in **private subnets with no public IP**, the
+   Fargate tasks run private (`AssignPublicIp=DISABLED`, egress via a NAT
+   gateway), and CloudFront reaches the origin through a service-managed
+   `AWS::CloudFront::VpcOrigin` ENI — so the origin has **no public endpoint at
+   all** and is reachable *only* by that distribution. This improves security
+   over the prefix-list option because it removes the public IP entirely rather
+   than relying on a source-IP allow-list that changes over time. See the
+   [CloudFront VPC origins launch](https://aws.amazon.com/about-aws/whats-new/2026/10/cloudfront-vpc-origin-dualstack/)
+   and [docs/architecture.md](docs/architecture.md) for the trade-offs.
+
+   ```bash
+   export VPC_ID=<vpc-id>
+   export PUBLIC_SUBNET_IDS=<subnet-id-a>,<subnet-id-b>      # still required (2 AZs)
+   export ENABLE_CLOUDFRONT=true
+   export USE_VPC_ORIGIN=true
+   export PRIVATE_SUBNET_IDS=<private-subnet-a>,<private-subnet-b>   # internal ALB + tasks
+   export NAT_GATEWAY_SUBNET_ID=<public-subnet-for-nat>             # NAT egress for private tasks
+   scripts/deploy.sh deploy
+   ```
+
+   > **Operational note (this sample's live demo).** The reference deployment
+   > keeps `UseVpcOrigin=false` (prefix-list Option 1). Switching an existing
+   > stack from a public ALB to an internal one **replaces** the load balancer
+   > (new DNS/ARN — not a zero-downtime change), so flip `UseVpcOrigin` on a
+   > fresh stack or during a planned maintenance window, not as an in-place
+   > update of a live stack. One-time account prerequisite: CloudFront
+   > auto-provisions the `AWSServiceRoleForCloudFrontVPCOrigins` service-linked
+   > role the first time a VPC origin is created.
+
    ### Option 2 (custom domain): ACM certificate + HTTPS listener on the ALB
 
    If you own a hostname, terminate TLS directly on the ALB with an ACM
@@ -344,7 +442,7 @@ the Secrets-Manager Twilio credentials).
      points `PUBLIC_BASE_URL` at the TLS hostname:
 
      ```bash
-     export CERTIFICATE_ARN=arn:aws:acm:us-east-1:920487201358:certificate/XXXX
+     export CERTIFICATE_ARN=arn:aws:acm:<region>:<AWS_ACCOUNT_ID>:certificate/XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
      export PUBLIC_HOSTNAME=collections.example.com
      scripts/deploy.sh deploy   # pass CertificateArn / PublicHostname params
      ```
@@ -506,6 +604,21 @@ neither is touched until the off-path task runs post-call.
 
 ## Observability
 
+- **GA Strands OTEL spans.** Because the session is orchestrated with the GA
+  `strands.bidi` API, the agent loop automatically emits OpenTelemetry spans
+  once `StrandsTelemetry` is configured **before** the agent runs — one span per
+  **session** (with `gen_ai.usage.*` token totals), per **model response** (with
+  native time-to-first-audio), and per **tool call**, including reported token
+  usage. The app wires this once at startup (`app/telemetry.py`, guarded so a
+  setup failure never crashes the app or touches the real-time audio path) and
+  defaults to the **console exporter**, so spans are written to stdout and the
+  ECS `awslogs` driver ships them to CloudWatch Logs with **no new IAM and no
+  new infrastructure**. Set `OTEL_EXPORTER=otlp` (+ `OTEL_EXPORTER_OTLP_ENDPOINT`)
+  to send to a collector, or `OTEL_ENABLED=false` to disable. These non-secret
+  knobs are surfaced via `GET /api/config`. See
+  [docs/architecture.md](docs/architecture.md) for how OTEL reconciles with the
+  dashboard's `CallMetrics`.
+
 - **CloudWatch Logs.** App logs are one JSON object per line (call placed, stream
   start, per-turn start/stop, TTFT, tool calls, barge-in, errors, call-end
   summary) in the log group `/ecs/<stack>/app`:
@@ -535,9 +648,10 @@ neither is touched until the off-path task runs post-call.
 
 - **Conversational turns (what `turn_count` means).** A turn is one side of the
   user<->Nova Sonic alternation: a caller utterance answered by a Sonic utterance
-  is the back-and-forth. `turn_count` is derived from the
-  `BidiTranscriptStreamEvent` `role` (`user`/`assistant`) + `is_final` alternation,
-  not from Nova response IDs. This **replaced the earlier `response_id`-based
+  is the back-and-forth. `turn_count` is derived from the GA
+  `BidiTranscriptBlockEvent` `role` (`user`/`assistant`) alternation — each block
+  event is a completed utterance — not from Nova response IDs. This **replaced
+  the earlier `response_id`-based
   grouping** because in live calls Nova Sonic reused a single `response_id` for
   the entire exchange, so counting matched response-start/response-complete pairs
   reported `turn_count = 1` even when there were several user<->Sonic
@@ -576,9 +690,12 @@ neither is touched until the off-path task runs post-call.
   `InvokeModelWithBidirectionalStream`, which that feature does not cover, so it
   would not record any turn/TTFT ground truth here (and there is no
   CloudFormation resource for it — it is an account-level API). Turn semantics
-  are therefore derived from the Strands `BidiTranscriptStreamEvent`
+  are therefore derived from the GA Strands `BidiTranscriptBlockEvent`
   user/assistant alternation plus response-start/first-audio timing. See the
-  comment near the turn-counting logic in `app/metrics.py`.
+  comment near the turn-counting logic in `app/metrics.py`. The GA
+  `strands.bidi` agent loop also emits authoritative OTEL spans (session token
+  usage, per-response native TTFT, tool calls) — see the Observability notes
+  below and `docs/architecture.md`.
 
 - **CloudTrail.** A multi-region management-event trail writes to the encrypted,
   private S3 bucket created by the stack. Use it (and CloudWatch) to diagnose
