@@ -143,3 +143,9 @@ requirements and review current regional service availability, pricing and
 applicable AWS terms. AWS names and logos are trademarks of Amazon.com, Inc.
 or its affiliates. Other product names and logos belong to their respective
 owners.
+
+## License
+
+Source code is available under the [MIT No Attribution (MIT-0) license](LICENSE).
+Third-party dependencies, icons and logos retain their original licenses and
+usage terms; see [Icon provenance and terms](docs/diagrams/README.md#icon-provenance-and-terms).
