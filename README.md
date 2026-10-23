@@ -122,3 +122,24 @@ npm --prefix frontend run build
 The tests cover lifecycle ordering, audio and asynchronous tools, usage
 accounting, date resolution, post-call admission, API behavior and dashboard
 data presentation.
+
+## References
+
+- [Amazon Nova 2.5 Sonic responsible AI overview](https://docs.aws.amazon.com/ai/responsible-ai/nova-2-5-sonic/overview.html)
+- [Amazon Nova speech-to-speech code examples](https://docs.aws.amazon.com/nova/latest/userguide/s2s-example.html)
+- [Amazon Nova 2.5 Sonic announcement](https://aws.amazon.com/about-aws/whats-new/2026/10/amazon-nova-2.5-Sonic/)
+- [Amazon Nova pricing](https://aws.amazon.com/nova/pricing/)
+- [Amazon CloudFront VPC origin dual-stack announcement](https://aws.amazon.com/about-aws/whats-new/2026/10/cloudfront-vpc-origin-dualstack/)
+
+## AWS disclaimer
+
+This repository is a community example, not an official AWS product or support
+offering. The code and documentation are provided "as is", without warranties
+or guarantees. References to AWS services, documentation and architecture icons
+do not imply AWS endorsement.
+
+Before deployment, validate the code against your security and operational
+requirements and review current regional service availability, pricing and
+applicable AWS terms. AWS names and logos are trademarks of Amazon.com, Inc.
+or its affiliates. Other product names and logos belong to their respective
+owners.
