@@ -1,0 +1,21 @@
+title = "Twilio Nova Sonic secret detection"
+
+[extend]
+useDefault = true
+
+# Provider-specific assignments supplement the upstream rules. Test fixtures
+# use explicitly synthetic text, so no path or historical-commit exemptions
+# are required.
+[[rules]]
+id = "twilio-auth-token-assignment"
+description = "Twilio auth token assigned as a literal"
+regex = '''(?i)twilio_auth_token[\t ]*["']?[\t ]*[:=][\t ]*["']?([a-f0-9]{32})(?:["'\s]|$)'''
+secretGroup = 1
+keywords = ["twilio_auth_token"]
+
+[[rules]]
+id = "aws-secret-key-assignment"
+description = "AWS secret access key assigned as a literal"
+regex = '''(?i)aws_secret_access_key[\t ]*["']?[\t ]*[:=][\t ]*["']?([A-Za-z0-9/+=]{40})(?:["'\s]|$)'''
+secretGroup = 1
+keywords = ["aws_secret_access_key"]

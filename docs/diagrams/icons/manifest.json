@@ -1,0 +1,192 @@
+{
+  "retrieved": "2026-10-22",
+  "aws_archive_sha256": "d2d166c453526471749d520e0db022c459abef759d2946cf2dd1d1c992dc6526",
+  "icons": [
+    {
+      "file": "cloudfront.svg",
+      "source": "https://d1.awsstatic.com/onedam/marketing-channels/website/public/shared/architecture-icon-release/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92.zip",
+      "archive_member": "Architecture-Service-Icons_07312026/Arch_Networking-Content-Delivery/64/Arch_Amazon-CloudFront_64.svg",
+      "sha256": "664919982792a69058077eaf39240afd320bbcbd082d36a9148184ec32708cd5",
+      "provider": "AWS official architecture icons, 2026-07-31"
+    },
+    {
+      "file": "alb.svg",
+      "source": "https://d1.awsstatic.com/onedam/marketing-channels/website/public/shared/architecture-icon-release/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92.zip",
+      "archive_member": "Resource-Icons_07312026/Res_Networking-Content-Delivery/Res_Elastic-Load-Balancing_Application-Load-Balancer_48.svg",
+      "sha256": "27bea44fffd83cc42ce68411e659761a114d41d6b89efc556afef969f96414aa",
+      "provider": "AWS official architecture icons, 2026-07-31"
+    },
+    {
+      "file": "ecs.svg",
+      "source": "https://d1.awsstatic.com/onedam/marketing-channels/website/public/shared/architecture-icon-release/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92.zip",
+      "archive_member": "Architecture-Service-Icons_07312026/Arch_Containers/64/Arch_Amazon-Elastic-Container-Service_64.svg",
+      "sha256": "768688ef725e0e02c5817b218d2cb9dda45c1b76921872f607253da91d881552",
+      "provider": "AWS official architecture icons, 2026-07-31"
+    },
+    {
+      "file": "fargate.svg",
+      "source": "https://d1.awsstatic.com/onedam/marketing-channels/website/public/shared/architecture-icon-release/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92.zip",
+      "archive_member": "Architecture-Service-Icons_07312026/Arch_Containers/64/Arch_AWS-Fargate_64.svg",
+      "sha256": "003cc5280deebfdd044db0a393be0cd7c35fd376013dd72950d7e5b60c7c1917",
+      "provider": "AWS official architecture icons, 2026-07-31"
+    },
+    {
+      "file": "bedrock.svg",
+      "source": "https://d1.awsstatic.com/onedam/marketing-channels/website/public/shared/architecture-icon-release/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92.zip",
+      "archive_member": "Architecture-Service-Icons_07312026/Arch_Artificial-Intelligence/64/Arch_Amazon-Bedrock_64.svg",
+      "sha256": "80fa4190bb55bde5c3004ed8d2f16bf25db28d230cf46760813f2171636ea105",
+      "provider": "AWS official architecture icons, 2026-07-31"
+    },
+    {
+      "file": "agentcore.svg",
+      "source": "https://d1.awsstatic.com/onedam/marketing-channels/website/public/shared/architecture-icon-release/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92.zip",
+      "archive_member": "Architecture-Service-Icons_07312026/Arch_Artificial-Intelligence/64/Arch_Amazon-Bedrock-AgentCore_64.svg",
+      "sha256": "09596bda3e7cd42288deec94d3b4647bcc951c3b8855236e8a88d31e1766636f",
+      "provider": "AWS official architecture icons, 2026-07-31"
+    },
+    {
+      "file": "dynamodb.svg",
+      "source": "https://d1.awsstatic.com/onedam/marketing-channels/website/public/shared/architecture-icon-release/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92.zip",
+      "archive_member": "Architecture-Service-Icons_07312026/Arch_Databases/64/Arch_Amazon-DynamoDB_64.svg",
+      "sha256": "ed169f049cc24c954cfbe3d14695d5b022558c45e5605936a565d1347c14b664",
+      "provider": "AWS official architecture icons, 2026-07-31"
+    },
+    {
+      "file": "secrets.svg",
+      "source": "https://d1.awsstatic.com/onedam/marketing-channels/website/public/shared/architecture-icon-release/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92.zip",
+      "archive_member": "Architecture-Service-Icons_07312026/Arch_Security-Identity/64/Arch_AWS-Secrets-Manager_64.svg",
+      "sha256": "c3941b75fe0ad1181696c1dbbd5f9d1fe4561879e195b1e68bb6dc35a99da6b3",
+      "provider": "AWS official architecture icons, 2026-07-31"
+    },
+    {
+      "file": "cloudwatch.svg",
+      "source": "https://d1.awsstatic.com/onedam/marketing-channels/website/public/shared/architecture-icon-release/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92.zip",
+      "archive_member": "Architecture-Service-Icons_07312026/Arch_Management-Tools/64/Arch_Amazon-CloudWatch_64.svg",
+      "sha256": "a84b5b88172ab39170eaa6154345332d755758a37cda6a5580981cf679e01c0b",
+      "provider": "AWS official architecture icons, 2026-07-31"
+    },
+    {
+      "file": "cloudtrail.svg",
+      "source": "https://d1.awsstatic.com/onedam/marketing-channels/website/public/shared/architecture-icon-release/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92.zip",
+      "archive_member": "Architecture-Service-Icons_07312026/Arch_Management-Tools/64/Arch_AWS-CloudTrail_64.svg",
+      "sha256": "3c033073892a1a8d0fdc4fccfafa17c03939353f047ed596b08bf63e6521a9db",
+      "provider": "AWS official architecture icons, 2026-07-31"
+    },
+    {
+      "file": "s3.svg",
+      "source": "https://d1.awsstatic.com/onedam/marketing-channels/website/public/shared/architecture-icon-release/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92.zip",
+      "archive_member": "Architecture-Service-Icons_07312026/Arch_Storage/64/Arch_Amazon-Simple-Storage-Service_64.svg",
+      "sha256": "b92c5101cc6565dd12df37655802279f8fba0c719279f62f93106d26750b36c6",
+      "provider": "AWS official architecture icons, 2026-07-31"
+    },
+    {
+      "file": "cloudformation.svg",
+      "source": "https://d1.awsstatic.com/onedam/marketing-channels/website/public/shared/architecture-icon-release/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92.zip",
+      "archive_member": "Architecture-Service-Icons_07312026/Arch_Management-Tools/64/Arch_AWS-CloudFormation_64.svg",
+      "sha256": "6b49bc40b92438d199b60f35e59814264adcce3df4623cbe2bba2933dfcb9fd7",
+      "provider": "AWS official architecture icons, 2026-07-31"
+    },
+    {
+      "file": "codebuild.svg",
+      "source": "https://d1.awsstatic.com/onedam/marketing-channels/website/public/shared/architecture-icon-release/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92.zip",
+      "archive_member": "Architecture-Service-Icons_07312026/Arch_Developer-Tools/64/Arch_AWS-CodeBuild_64.svg",
+      "sha256": "4bf05b39b350a75ba7fca996644badf46919b16c46a08c1271efcd8a1515f5ff",
+      "provider": "AWS official architecture icons, 2026-07-31"
+    },
+    {
+      "file": "ecr.svg",
+      "source": "https://d1.awsstatic.com/onedam/marketing-channels/website/public/shared/architecture-icon-release/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92.zip",
+      "archive_member": "Architecture-Service-Icons_07312026/Arch_Containers/64/Arch_Amazon-Elastic-Container-Registry_64.svg",
+      "sha256": "bec34a867cb424de91592470a14e82556dd9b041231b5e070ca846752d1c719f",
+      "provider": "AWS official architecture icons, 2026-07-31"
+    },
+    {
+      "file": "lambda.svg",
+      "source": "https://d1.awsstatic.com/onedam/marketing-channels/website/public/shared/architecture-icon-release/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92.zip",
+      "archive_member": "Architecture-Service-Icons_07312026/Arch_Compute/64/Arch_AWS-Lambda_64.svg",
+      "sha256": "5818c80cd8e7d08891a2492c7694f472ca914fb3a99d9ef8e597db0b37ad7f13",
+      "provider": "AWS official architecture icons, 2026-07-31"
+    },
+    {
+      "file": "vpc.svg",
+      "source": "https://d1.awsstatic.com/onedam/marketing-channels/website/public/shared/architecture-icon-release/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92.zip",
+      "archive_member": "Architecture-Service-Icons_07312026/Arch_Networking-Content-Delivery/64/Arch_Amazon-Virtual-Private-Cloud_64.svg",
+      "sha256": "4a2c292527ce28a95d9038ab7e6be818751ffef0a91aabb5de2e61045150a98d",
+      "provider": "AWS official architecture icons, 2026-07-31"
+    },
+    {
+      "file": "aws.svg",
+      "source": "https://d1.awsstatic.com/onedam/marketing-channels/website/public/shared/architecture-icon-release/Icon-package_07312026.5846e92413caa21490223536cc97f1269e44fa92.zip",
+      "archive_member": "Architecture-Group-Icons_07312026/AWS-Cloud-logo_32.svg",
+      "sha256": "63d73df1aac59dab323df732f82e196e359fb7b6370c0ca8e51e7b897cd350be",
+      "provider": "AWS official architecture icons, 2026-07-31"
+    },
+    {
+      "file": "openai.svg",
+      "source": "https://raw.githubusercontent.com/simple-icons/simple-icons/13.21.0/icons/openai.svg",
+      "sha256": "2b4a04ddc2395b20d168694d3850ce2050a702c4a0cdeb4d8b31b9a970481a8c",
+      "provider": "Simple Icons 13.21.0, CC0, brand marks subject to trademark terms"
+    },
+    {
+      "file": "twilio.svg",
+      "source": "https://raw.githubusercontent.com/simple-icons/simple-icons/13.21.0/icons/twilio.svg",
+      "sha256": "52dcf3b6cea65fdc9b5b525aa2bb9517f405a58c68d464f207f0ddf60c0114ea",
+      "provider": "Simple Icons 13.21.0, CC0, brand marks subject to trademark terms"
+    },
+    {
+      "file": "react.svg",
+      "source": "https://raw.githubusercontent.com/simple-icons/simple-icons/13.21.0/icons/react.svg",
+      "sha256": "ab9136a1a4a8be72ac6743e1bdd1912d878bd68d57787ea7a6c6838e3b23c01c",
+      "provider": "Simple Icons 13.21.0, CC0, brand marks subject to trademark terms"
+    },
+    {
+      "file": "fastapi.svg",
+      "source": "https://raw.githubusercontent.com/simple-icons/simple-icons/13.21.0/icons/fastapi.svg",
+      "sha256": "af0bdd5fd3f16a49e341089049418af7b02a04eefdc088b2e26c4524fa8b75d1",
+      "provider": "Simple Icons 13.21.0, CC0, brand marks subject to trademark terms"
+    },
+    {
+      "file": "python.svg",
+      "source": "https://raw.githubusercontent.com/simple-icons/simple-icons/13.21.0/icons/python.svg",
+      "sha256": "ad9468e1c4903f73ae7eebfbe980f0f727a10db695be3d914e7d8bd25356a862",
+      "provider": "Simple Icons 13.21.0, CC0, brand marks subject to trademark terms"
+    },
+    {
+      "file": "docker.svg",
+      "source": "https://raw.githubusercontent.com/simple-icons/simple-icons/13.21.0/icons/docker.svg",
+      "sha256": "65571291c261ef869c31540a38f3ca0f0ee3bb73f179c172211c8860f19a6359",
+      "provider": "Simple Icons 13.21.0, CC0, brand marks subject to trademark terms"
+    },
+    {
+      "file": "github.svg",
+      "source": "https://raw.githubusercontent.com/simple-icons/simple-icons/13.21.0/icons/github.svg",
+      "sha256": "3bf8cceead820aec50d4ee825a3fd02c5a1cd6665cc9cf4cbf3d9c8861a204bb",
+      "provider": "Simple Icons 13.21.0, CC0, brand marks subject to trademark terms"
+    },
+    {
+      "file": "gitlab.svg",
+      "source": "https://raw.githubusercontent.com/simple-icons/simple-icons/13.21.0/icons/gitlab.svg",
+      "sha256": "c7c39058bd1b6f9f40334383bd5136bb8c5ba5e6a24200f2d1f18365e2526e28",
+      "provider": "Simple Icons 13.21.0, CC0, brand marks subject to trademark terms"
+    },
+    {
+      "file": "vite.svg",
+      "source": "https://raw.githubusercontent.com/simple-icons/simple-icons/13.21.0/icons/vite.svg",
+      "sha256": "122e0da12525245e3fdf6bd448cadb2f6b6ffea86e8bfa3377cd42a4490d0b2d",
+      "provider": "Simple Icons 13.21.0, CC0, brand marks subject to trademark terms"
+    },
+    {
+      "file": "opentelemetry.svg",
+      "source": "https://raw.githubusercontent.com/simple-icons/simple-icons/13.21.0/icons/opentelemetry.svg",
+      "sha256": "1e93836eeedaf02fb985130ed05c4d692c66ff56269f50af8478a219645ee741",
+      "provider": "Simple Icons 13.21.0, CC0, brand marks subject to trademark terms"
+    },
+    {
+      "file": "strands.svg",
+      "source": "https://strandsagents.com/favicon.svg",
+      "sha256": "b463b6ab2c9e64317862681a882278360ce0ea90387a136c5f1a2d0375eaff18",
+      "provider": "Strands Agents official site",
+      "verified_upstream_source": "https://raw.githubusercontent.com/strands-agents/harness-sdk/main/site/public/favicon.svg"
+    }
+  ]
+}

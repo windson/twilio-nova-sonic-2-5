@@ -1,0 +1,75 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: light;
+    --background: 214 32% 96%;
+    --foreground: 222 40% 16%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 40% 16%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 40% 16%;
+    --primary: 221 75% 44%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 214 30% 93%;
+    --secondary-foreground: 222 32% 25%;
+    --muted: 214 28% 93%;
+    --muted-foreground: 215 18% 38%;
+    --accent: 214 65% 94%;
+    --accent-foreground: 221 75% 34%;
+    --destructive: 0 72% 44%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 214 24% 80%;
+    --border-strong: 215 22% 68%;
+    --input: 215 22% 68%;
+    --ring: 221 75% 44%;
+    --radius: 0.6rem;
+  }
+
+  :root.dark {
+    color-scheme: dark;
+    --background: 222 24% 7%;
+    --foreground: 220 20% 92%;
+    --card: 225 20% 12%;
+    --card-foreground: 220 20% 92%;
+    --popover: 225 22% 10%;
+    --popover-foreground: 220 20% 92%;
+    --primary: 220 83% 70%;
+    --primary-foreground: 222 40% 12%;
+    --secondary: 222 20% 18%;
+    --secondary-foreground: 220 20% 92%;
+    --muted: 222 20% 16%;
+    --muted-foreground: 220 12% 70%;
+    --accent: 222 22% 20%;
+    --accent-foreground: 220 20% 92%;
+    --destructive: 0 65% 45%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 225 18% 28%;
+    --border-strong: 220 18% 42%;
+    --input: 220 18% 42%;
+    --ring: 220 83% 70%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}

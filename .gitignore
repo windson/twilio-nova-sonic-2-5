@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+.pytest_cache/
+# Secret scanner output can contain sensitive evidence; keep it local.
+gitleaks-report.*
+cdk.out/
+*.log
+
+# Frontend (React/Vite/shadcn) toolchain + generated bundle.
+# The dashboard source lives in frontend/; the compiled bundle is emitted into
+# web/ at image-build time by the multi-stage Dockerfile (node build stage) and
+# is NOT committed. node_modules and build caches are never committed.
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.tsbuildinfo
+web/index.html
+web/assets/

@@ -1,0 +1,15 @@
+export const METRIC_HELP = {
+  total: "Time from opening the call's audio connection until the phone call ended. It includes both people talking, pauses and service work.",
+  nova: "The length of the audio Nova generated. Think of adding the lengths of its audio clips. This is not a stopwatch of what finished playing on the phone, especially if someone interrupted.",
+  nonnova: "The call's total time minus the audio Nova generated. This remainder can include the caller talking, pauses and service work; it is not just network delay.",
+  twilio: "An estimate of how late incoming audio frames arrived, based on Twilio's timestamps. It is not a direct measurement of the entire phone network.",
+  ttfa: "Time to first audio: start the stopwatch when the app receives the SDK's response-start event, and stop it when the first audio arrives. This is not the caller's silence or the time until sound plays on the phone. TTFA and TTFT use the same start, so do not add them together.",
+  textTtft: "Time to first token (TTFT): time from the SDK's response-start event to the first preview text received by the app. A token is a small piece of a word. Nova can revise this speculative text before its final spoken transcript. This is not a measurement of when internal reasoning started. A dash means text timing was not recorded.",
+  turns: "One turn is one finished utterance from the caller or Nova. Each speaker can have several turns in a row.",
+  barge: "How many times the caller interrupted while Nova was replying. An interruption does not, by itself, mean there was echo.",
+  callerReplyGap: "Time from receiving the caller's finished transcript to receiving the reply's first audio. This is an observed gap, not the exact silence heard on the phone: the transcript can arrive after the caller stopped speaking. A dash means these two events could not be matched safely.",
+  transcriptInterval: "Time from receiving this finished transcript to the next finished transcript, or the end of the call for the last row. It can include speech, pauses and the next speaker's turn. It is not this speaker's speaking time or total duration, and is separate from TTFT and TTFA.",
+  responseTimeline: "Both rows use the same clock: zero is the SDK response start, and the axis ends when that response ends, including an interrupted end. TTFT stops at first preview text; TTFA stops at first audio. These intervals overlap, so do not add them. The rest of the axis is time until the response ends, not measured encoding, speaking duration or phone playback. A missing or unmatched response end cannot supply a total-duration axis.",
+  utterance: "The words recorded for this speaker. For an interrupted Nova reply, this may include words generated before the interruption that were never heard on the phone.",
+  tools: "Jobs the assistant requested, such as saving a payment arrangement. The row match is estimated from recorded event times; it does not prove these exact words caused the job. Async jobs can run while audio continues, so their times do not add to TTFA. Jobs without a usable turn match remain listed below the table.",
+} as const;

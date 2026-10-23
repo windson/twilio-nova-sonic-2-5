@@ -1,0 +1,30 @@
+# Keep the build context small and never ship local state or secrets.
+.venv/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.gitignore
+.env
+.env.*
+!.env.example
+gitleaks-report.*
+*.log
+cdk.out/
+infra/
+docs/
+tests/
+.agents/
+*.md
+!README.md
+
+# Frontend: INCLUDE the source (the multi-stage Dockerfile's node stage builds
+# it) but EXCLUDE node_modules and build caches/output so the build context
+# stays small and the image's `npm ci` resolves deps from the lockfile.
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+# The compiled bundle is produced inside the image by the node build stage, so
+# never ship a locally-built copy from the host.
+web/assets/
+web/index.html

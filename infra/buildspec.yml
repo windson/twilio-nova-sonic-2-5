@@ -1,0 +1,9 @@
+# Reference buildspec for an authenticated source archive. ImageBuildProject
+# uses the inline bootstrap in template.yaml so no archive-supplied script runs
+# before the independently pinned manifest and verifier digest are checked.
+# build_image.sh verifies the full file set before contacting ECR.
+version: 0.2
+phases:
+  build:
+    commands:
+      - bash infra/build_image.sh
